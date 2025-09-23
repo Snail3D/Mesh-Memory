@@ -249,6 +249,23 @@ The Meshtastic logo trademark is the trademark of Meshtastic LLC.
 6. **Access the WebUI Dashboard:**  
    - Open your browser and navigate to [http://localhost:5000/dashboard](http://localhost:5000/dashboard).
 
+### Optional: Enable Auto-Start on Boot (Headless / systemd)
+
+On a headless Raspberry Pi (or any Linux without a GUI session), use the included systemd installer to run MESH-AI at boot:
+
+```bash
+cd /path/to/mesh-ai
+sudo ./scripts/install-systemd-service.sh .
+sudo systemctl start mesh-ai
+sudo systemctl status mesh-ai
+```
+
+- The service is installed as `mesh-ai.service` and enabled to start on boot.
+- Logs go to `mesh-ai.log` and the internal `script.log` for detailed events.
+  - View via: `journalctl -u mesh-ai -e -f`
+
+If you prefer using a Desktop environment autostart, the WebUI includes a toggle that manages a `.desktop` file. For reliable boot on headless devices, systemd is recommended.
+
 
 ## Quick Start (Docker)
 

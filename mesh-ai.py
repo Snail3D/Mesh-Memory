@@ -11,6 +11,7 @@ import os
 import smtplib
 from email.mime.text import MIMEText
 import logging
+from collections import deque
 import traceback
 from flask import Flask, request, jsonify, redirect, url_for, stream_with_context, Response
 import sys
@@ -19,6 +20,7 @@ import re
 from twilio.rest import Client  # for Twilio SMS support
 from unidecode import unidecode   # Added unidecode import for Ollama text normalization
 from google.protobuf.message import DecodeError
+import queue  # For async message processing
 # Make sure DEBUG_ENABLED exists before any logger/filter classes use it
 # -----------------------------
 # Global Debug & Noise Patterns
@@ -133,6 +135,40 @@ last_error_message = ""
 reset_event = threading.Event()  # Global event to signal a fatal error and trigger reconnect
 
 # -----------------------------
+# RX De-duplication cache
+# -----------------------------
+RECENT_RX_MAX = 500
+recent_rx_keys = deque()  # FIFO of recent keys
+recent_rx_keys_set = set()
+recent_rx_lock = threading.Lock()
+
+def _rx_make_key(packet, text, ch_idx):
+  try:
+    pid = packet.get('id') if isinstance(packet, dict) else None
+  except Exception:
+    pid = None
+  try:
+    fr = (packet.get('fromId') if isinstance(packet, dict) else None) or (packet.get('from') if isinstance(packet, dict) else None)
+    to = (packet.get('toId') if isinstance(packet, dict) else None) or (packet.get('to') if isinstance(packet, dict) else None)
+  except Exception:
+    fr, to = None, None
+  base = f"{pid}|{fr}|{to}|{ch_idx}|{text}"
+  # Bound the key length to keep memory small
+  return base[-512:]
+
+def _rx_seen_before(key: str) -> bool:
+  with recent_rx_lock:
+    if key in recent_rx_keys_set:
+      return True
+    recent_rx_keys.append(key)
+    recent_rx_keys_set.add(key)
+    # Trim if over capacity
+    while len(recent_rx_keys) > RECENT_RX_MAX:
+      old = recent_rx_keys.popleft()
+      recent_rx_keys_set.discard(old)
+    return False
+
+# -----------------------------
 # Meshtastic and Flask Setup
 # -----------------------------
 try:
@@ -232,21 +268,42 @@ OPENAI_TIMEOUT = config.get("openai_timeout", 30)
 OLLAMA_URL = config.get("ollama_url", "http://localhost:11434/api/generate")
 OLLAMA_MODEL = config.get("ollama_model", "llama2")
 OLLAMA_TIMEOUT = config.get("ollama_timeout", 60)
-OLLAMA_CONTEXT_CHARS = int(config.get("ollama_context_chars", 4000))
+# Max characters of conversation history to include in prompts for Ollama
+try:
+    OLLAMA_CONTEXT_CHARS = int(config.get("ollama_context_chars", 4000))
+except (ValueError, TypeError):
+    OLLAMA_CONTEXT_CHARS = 4000
+# Ollama model context window (tokens). Set this to match your model's context (e.g., 128000 for 128k)
+try:
+    OLLAMA_NUM_CTX = int(config.get("ollama_num_ctx", 8192))
+except (ValueError, TypeError):
+    OLLAMA_NUM_CTX = 8192
+# Max messages to include in conversation context (limits to recent exchanges for performance)
+try:
+    OLLAMA_MAX_MESSAGES = int(config.get("ollama_max_messages", 20))
+except (ValueError, TypeError):
+    OLLAMA_MAX_MESSAGES = 20
 HOME_ASSISTANT_URL = config.get("home_assistant_url", "")
 HOME_ASSISTANT_TOKEN = config.get("home_assistant_token", "")
 HOME_ASSISTANT_TIMEOUT = config.get("home_assistant_timeout", 30)
 HOME_ASSISTANT_ENABLE_PIN = bool(config.get("home_assistant_enable_pin", False))
 HOME_ASSISTANT_SECURE_PIN = str(config.get("home_assistant_secure_pin", "1234"))
 HOME_ASSISTANT_ENABLED = bool(config.get("home_assistant_enabled", False))
-HOME_ASSISTANT_CHANNEL_INDEX = int(config.get("home_assistant_channel_index", -1))
+try:
+    HOME_ASSISTANT_CHANNEL_INDEX = int(config.get("home_assistant_channel_index", -1))
+except (ValueError, TypeError):
+    HOME_ASSISTANT_CHANNEL_INDEX = -1
 MAX_CHUNK_SIZE = config.get("chunk_size", 200)
 MAX_CHUNKS = 5
-CHUNK_DELAY = config.get("chunk_delay", 10)
+CHUNK_DELAY = config.get("chunk_delay", 8)
 MAX_RESPONSE_LENGTH = MAX_CHUNK_SIZE * MAX_CHUNKS
 LOCAL_LOCATION_STRING = config.get("local_location_string", "Unknown Location")
 AI_NODE_NAME = config.get("ai_node_name", "AI-Bot")
 FORCE_NODE_NUM = config.get("force_node_num", None)
+try:
+    MAX_MESSAGE_LOG = int(config.get("max_message_log", 100))  # 0 or less means unlimited
+except (ValueError, TypeError):
+    MAX_MESSAGE_LOG = 100
 
 ENABLE_DISCORD = config.get("enable_discord", False)
 DISCORD_WEBHOOK_URL = config.get("discord_webhook_url", None)
@@ -258,7 +315,10 @@ DISCORD_RECEIVE_ENABLED = config.get("discord_receive_enabled", True)
 # New variable for inbound routing
 DISCORD_INBOUND_CHANNEL_INDEX = config.get("discord_inbound_channel_index", None)
 if DISCORD_INBOUND_CHANNEL_INDEX is not None:
-    DISCORD_INBOUND_CHANNEL_INDEX = int(DISCORD_INBOUND_CHANNEL_INDEX)
+    try:
+        DISCORD_INBOUND_CHANNEL_INDEX = int(DISCORD_INBOUND_CHANNEL_INDEX)
+    except (ValueError, TypeError):
+        DISCORD_INBOUND_CHANNEL_INDEX = None
 # For polling Discord messages (optional)
 DISCORD_BOT_TOKEN = config.get("discord_bot_token", None)
 DISCORD_CHANNEL_ID = config.get("discord_channel_id", None)
@@ -276,18 +336,117 @@ SMTP_PASS = config.get("smtp_pass", None)
 ALERT_EMAIL_TO = config.get("alert_email_to", None)
 
 SERIAL_PORT = config.get("serial_port", "")
-SERIAL_BAUD = int(config.get("serial_baud", 921600))  # ← NEW ● default 921600
+try:
+    SERIAL_BAUD = int(config.get("serial_baud", 921600))  # ← NEW ● default 921600
+except (ValueError, TypeError):
+    SERIAL_BAUD = 921600
 USE_WIFI = bool(config.get("use_wifi", False))
 WIFI_HOST = config.get("wifi_host", None)
-WIFI_PORT = int(config.get("wifi_port", 4403))
+try:
+    WIFI_PORT = int(config.get("wifi_port", 4403))
+except (ValueError, TypeError):
+    WIFI_PORT = 4403
 USE_MESH_INTERFACE = bool(config.get("use_mesh_interface", False))
 
 app = Flask(__name__)
 messages = []
+messages_lock = threading.Lock()
 interface = None
 
 lastDMNode = None
 lastChannelIndex = None
+
+# -----------------------------
+# Async Message Processing
+# -----------------------------
+# Queue for pending AI responses to process asynchronously
+response_queue = queue.Queue(maxsize=10)  # Limit queue size to prevent memory issues
+response_worker_running = False
+
+def process_responses_worker():
+    """Background worker thread to process AI responses without blocking new message reception."""
+    global response_worker_running
+    response_worker_running = True
+    
+    while response_worker_running:
+        try:
+            # Wait for a response task (timeout to allow clean shutdown)
+            task = response_queue.get(timeout=1.0)
+            if task is None:  # Shutdown signal
+                break
+                
+            # Unpack the task
+            text, sender_node, is_direct, ch_idx, thread_root_ts, interface_ref = task
+            
+            info_print(f"[AsyncAI] Processing response for: {text[:50]}... (queue: {response_queue.qsize()})")
+            start_time = time.time()
+            
+            # Generate AI response (this can take a long time)
+            resp = parse_incoming_text(text, sender_node, is_direct, ch_idx, thread_root_ts=thread_root_ts)
+            
+            processing_time = time.time() - start_time
+            
+            if resp:
+                info_print(f"[AsyncAI] Generated response in {processing_time:.1f}s, preparing to send...")
+                
+                # Reduced collision delay for async processing
+                time.sleep(1)
+
+                # Log AI reply and mark it as coming from the forced AI node (if configured)
+                ai_force = FORCE_NODE_NUM if FORCE_NODE_NUM is not None else None
+                log_message(
+                    AI_NODE_NAME,
+                    resp,
+                    reply_to=thread_root_ts,
+                    direct=is_direct,
+                    channel_idx=(None if is_direct else ch_idx),
+                    force_node=ai_force,
+                    is_ai=True,
+                )
+
+                # If message originated on Discord inbound channel, send back to Discord
+                if ENABLE_DISCORD and DISCORD_SEND_AI and DISCORD_INBOUND_CHANNEL_INDEX is not None and ch_idx == DISCORD_INBOUND_CHANNEL_INDEX:
+                    disc_msg = f"🤖 **{AI_NODE_NAME}**: {resp}"
+                    send_discord_message(disc_msg)
+                    try:
+                        log_message("Discord", disc_msg, direct=False, channel_idx=DISCORD_INBOUND_CHANNEL_INDEX, is_ai=True)
+                    except Exception:
+                        pass
+
+                # Send the response via mesh
+                if interface_ref and resp:
+                    if is_direct:
+                        send_direct_chunks(interface_ref, resp, sender_node)
+                    else:
+                        send_broadcast_chunks(interface_ref, resp, ch_idx)
+                        
+                total_time = time.time() - start_time
+                info_print(f"[AsyncAI] Completed response for {sender_node} (total: {total_time:.1f}s)")
+            else:
+                info_print(f"[AsyncAI] No response generated for {sender_node} ({processing_time:.1f}s)")
+                
+            response_queue.task_done()
+            
+        except queue.Empty:
+            continue  # Timeout, check if we should continue
+        except Exception as e:
+            info_print(f"[AsyncAI] Error processing response: {e}")
+            try:
+                response_queue.task_done()
+            except ValueError:
+                pass  # task_done() called more times than get()
+
+def start_response_worker():
+    """Start the background response worker thread."""
+    worker_thread = threading.Thread(target=process_responses_worker, daemon=True)
+    worker_thread.start()
+    info_print("[AsyncAI] Response worker thread started")
+
+def stop_response_worker():
+    """Stop the background response worker thread."""
+    global response_worker_running
+    response_worker_running = False
+    response_queue.put(None)  # Signal shutdown
 
 # -----------------------------
 # Location Lookup Function
@@ -302,13 +461,35 @@ def get_node_location(node_id):
     return None, None, None
 
 def load_archive():
+    """Load archive and normalize old entries to include `is_ai` and canonical fields.
+
+    Older archives may not have the `is_ai` flag or consistent `channel_idx`/`direct` fields.
+    Normalize in-place so history-building can reliably detect AI replies.
+    """
     global messages
     if os.path.exists(ARCHIVE_FILE):
         try:
             with open(ARCHIVE_FILE, "r", encoding="utf-8") as f:
                 arr = json.load(f)
             if isinstance(arr, list):
-                messages = arr
+                # Normalize entries
+                norm = []
+                for m in arr:
+                    if not isinstance(m, dict):
+                        continue
+                    # Ensure expected keys exist
+                    if 'direct' not in m:
+                        m['direct'] = bool(m.get('direct', False))
+                    if 'channel_idx' not in m:
+                        m['channel_idx'] = m.get('channel_idx', None)
+                    # Detect AI replies conservatively: node string contains AI_NODE_NAME
+                    if 'is_ai' not in m:
+                        node_field = str(m.get('node', '') or '')
+                        m['is_ai'] = (AI_NODE_NAME and AI_NODE_NAME in node_field) or (m.get('node_id') == FORCE_NODE_NUM)
+                    norm.append(m)
+                with messages_lock:
+                    messages.clear()
+                    messages.extend(norm)
                 print(f"Loaded {len(messages)} messages from archive.")
         except Exception as e:
             print(f"⚠️ Could not load archive {ARCHIVE_FILE}: {e}")
@@ -316,11 +497,13 @@ def load_archive():
         print("No archive found; starting fresh.")
 
 def save_archive():
-    try:
-        with open(ARCHIVE_FILE, "w", encoding="utf-8") as f:
-            json.dump(messages, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"⚠️ Could not save archive to {ARCHIVE_FILE}: {e}")
+  try:
+    with messages_lock:
+      snapshot = list(messages)
+    with open(ARCHIVE_FILE, "w", encoding="utf-8") as f:
+      json.dump(snapshot, f, ensure_ascii=False, indent=2)
+  except Exception as e:
+    print(f"⚠️ Could not save archive to {ARCHIVE_FILE}: {e}")
 
 def parse_node_id(node_str_or_int):
     if isinstance(node_str_or_int, int):
@@ -357,25 +540,87 @@ def get_node_shortname(node_id):
         return user_dict.get("shortName", f"Node_{node_id}")
     return f"Node_{node_id}"
 
-def log_message(node_id, text, is_emergency=False, reply_to=None, direct=False, channel_idx=None):
-    if node_id != "WebUI":
-        display_id = f"{get_node_shortname(node_id)} ({node_id})"
-    else:
-        display_id = "WebUI"
+def _to_int_node(x):
+  try:
+    if isinstance(x, int):
+      return x
+    if isinstance(x, str):
+      if x.startswith('!'):
+        return int(x[1:], 16)
+      return int(x)
+  except Exception:
+    return None
+  return None
+
+def same_node_id(a, b):
+  """Return True if two node identifiers refer to the same node.
+  Accepts int node numbers, '!hex' strings, or other string representations.
+  """
+  if a == b:
+    return True
+  ai = _to_int_node(a)
+  bi = _to_int_node(b)
+  if ai is not None and bi is not None:
+    return ai == bi
+  # Fallback string compare
+  return str(a) == str(b)
+
+def log_message(node_id, text, is_emergency=False, reply_to=None, direct=False, channel_idx=None, force_node=None, is_ai=False):
+    """Append a message entry to the in-memory list and persist.
+
+    `force_node` optionally forces the numeric node_id used for lookups (useful for tagging AI replies
+    with the device node number when the human-readable node name is used as `node_id`).
+    """
+    # Determine who to show as the display name and what numeric node_id to store
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    # If force_node is provided (and not None), prefer it as the numeric node id
+    stored_node_id = None
+    display_id = "WebUI" if node_id == "WebUI" else None
+    try:
+        if force_node is not None:
+            stored_node_id = force_node
+            display_id = f"{get_node_shortname(force_node)} ({force_node})"
+        else:
+            # If node_id looks numeric, keep it; else preserve string id (except WebUI)
+            if isinstance(node_id, int):
+                stored_node_id = node_id
+                display_id = f"{get_node_shortname(node_id)} ({node_id})"
+            else:
+                # non-numeric node_id (e.g. '!abcd1234'), keep the string for matching in history
+                stored_node_id = None if node_id == "WebUI" else node_id
+                display_id = f"{get_node_shortname(node_id)} ({node_id})" if node_id != "WebUI" else "WebUI"
+    except Exception:
+        # Fallback if get_node_shortname raises
+        display_id = str(node_id)
+
+    # Flag messages that originate from the AI so they can be included in history
+    is_ai_msg = bool(is_ai)
+    try:
+        if not is_ai_msg:
+            if force_node is not None and FORCE_NODE_NUM is not None and force_node == FORCE_NODE_NUM:
+                is_ai_msg = True
+            elif isinstance(node_id, str) and node_id == AI_NODE_NAME:
+                is_ai_msg = True
+    except Exception:
+        is_ai_msg = is_ai_msg
+
     entry = {
         "timestamp": timestamp,
         "node": display_id,
-        "node_id": None if node_id == "WebUI" else node_id,
+        "node_id": stored_node_id,
         "message": text,
         "emergency": is_emergency,
         "reply_to": reply_to,
         "direct": direct,
-        "channel_idx": channel_idx
+        "channel_idx": channel_idx,
+        "is_ai": is_ai_msg,
     }
-    messages.append(entry)
-    if len(messages) > 100:
-        messages.pop(0)
+    with messages_lock:
+        messages.append(entry)
+        if MAX_MESSAGE_LOG and MAX_MESSAGE_LOG > 0 and len(messages) > MAX_MESSAGE_LOG:
+            # keep only the last MAX_MESSAGE_LOG entries
+            del messages[:-MAX_MESSAGE_LOG]
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as logf:
             logf.write(f"{timestamp} | {display_id} | EMERGENCY={is_emergency} | {text}\n")
@@ -526,36 +771,72 @@ def send_to_openai(user_message):
         print(f"⚠️ OpenAI request failed: {e}")
         return None
 
-def build_ollama_history(sender_id=None, is_direct=False, channel_idx=None, max_chars=OLLAMA_CONTEXT_CHARS):
+def build_ollama_history(sender_id=None, is_direct=False, channel_idx=None, thread_root_ts=None, max_chars=OLLAMA_CONTEXT_CHARS):
   """Build a short conversation history string for Ollama based on recent messages.
 
   - For direct messages: include recent direct exchanges between `sender_id` and the AI node.
   - For channel messages: include recent channel messages for `channel_idx`.
-  Returns a string (possibly empty) truncated to `max_chars` characters.
+  Limits to the last N messages (configurable via ollama_max_messages, default 20) for performance.
+  This means ~10 back-and-forth exchanges to keep the model fast.
   """
   try:
-    if not messages:
+    with messages_lock:
+        snapshot = list(messages)
+    if not snapshot:
       return ""
     # Collect candidate messages in chronological order
     candidates = []
-    for m in messages:
-      try:
-        if is_direct:
-          # include direct messages that are between the sender and AI (node_id matches sender) or AI responses
-          if m.get('direct') and (m.get('node_id') == sender_id or (m.get('node') and AI_NODE_NAME in m.get('node'))):
+    if is_direct:
+      # Build a per-DM-thread history scoped strictly to the given sender_id.
+      # Include only:
+      #  - direct human messages from this sender, and
+      #  - direct AI replies whose reply_to points to one of those human messages.
+      sender_human_ts = set()
+      for m in snapshot:
+        try:
+          if m.get('direct') is True and same_node_id(m.get('node_id'), sender_id):
             candidates.append(m)
-        else:
-          # channel messages for this channel
-          if (not m.get('direct')) and (m.get('channel_idx') == channel_idx):
-            candidates.append(m)
-      except Exception:
-        continue
+            ts = m.get('timestamp')
+            if ts:
+              sender_human_ts.add(ts)
+          elif m.get('direct') is True and m.get('is_ai') is True:
+            if m.get('reply_to') in sender_human_ts:
+              candidates.append(m)
+        except Exception:
+          continue
+    else:
+      # Channel history scoped by channel_idx and optionally by a thread root timestamp.
+      if thread_root_ts:
+        for m in snapshot:
+          try:
+            if (m.get('direct') is False) and (m.get('channel_idx') == channel_idx):
+              # Include the root human message and any AI replies linked to it
+              if m.get('timestamp') == thread_root_ts:
+                candidates.append(m)
+              elif m.get('is_ai') and m.get('reply_to') == thread_root_ts:
+                candidates.append(m)
+          except Exception:
+            continue
+      else:
+        # Fallback: include recent messages for the whole channel (legacy behavior)
+        for m in snapshot:
+          try:
+            if (m.get('direct') is False) and (m.get('channel_idx') == channel_idx):
+              candidates.append(m)
+            elif m.get('is_ai') and (m.get('channel_idx') == channel_idx):
+              candidates.append(m)
+          except Exception:
+            continue
     if not candidates:
       return ""
-    # Start from newest and build backwards until we reach max_chars
+    
+  # Limit to last N messages (configurable exchanges) for performance
+    # Take from the end (most recent) of the candidates list
+    recent_candidates = candidates[-OLLAMA_MAX_MESSAGES:] if len(candidates) > OLLAMA_MAX_MESSAGES else candidates
+    
+    # Build output lines in chronological order
     out_lines = []
-    total = 0
-    for m in reversed(candidates):
+    for m in recent_candidates:
       who = None
       nid = m.get('node_id')
       if nid is None:
@@ -567,13 +848,11 @@ def build_ollama_history(sender_id=None, is_direct=False, channel_idx=None, max_
           who = str(m.get('node', nid))
       text = str(m.get('message', ''))
       line = f"{who}: {text}"
-      # prepend lines so final order is chronological
-      out_lines.insert(0, line)
-      total = sum(len(l) for l in out_lines)
-      if total >= max_chars:
-        break
+      out_lines.append(line)
+    
     history = "\n".join(out_lines)
-    # Trim to max_chars from the end (keep most recent context)
+    
+    # Final character limit check (backup safety)
     if len(history) > max_chars:
       history = history[-max_chars:]
     return history
@@ -582,7 +861,7 @@ def build_ollama_history(sender_id=None, is_direct=False, channel_idx=None, max_
     return ""
 
 
-def send_to_ollama(user_message, sender_id=None, is_direct=False, channel_idx=None):
+def send_to_ollama(user_message, sender_id=None, is_direct=False, channel_idx=None, thread_root_ts=None):
     dprint(f"send_to_ollama: user_message='{user_message}' sender_id={sender_id} is_direct={is_direct} channel={channel_idx}")
     info_print("[Info] Routing user message to Ollama...")
 
@@ -593,7 +872,7 @@ def send_to_ollama(user_message, sender_id=None, is_direct=False, channel_idx=No
     history = ""
     try:
         if sender_id is not None:
-            history = build_ollama_history(sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx)
+            history = build_ollama_history(sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx, thread_root_ts=thread_root_ts)
     except Exception as e:
         dprint(f"Warning: failed building history for Ollama: {e}")
         history = ""
@@ -609,7 +888,18 @@ def send_to_ollama(user_message, sender_id=None, is_direct=False, channel_idx=No
     payload = {
         "prompt": combined_prompt,
         "model": OLLAMA_MODEL,
-        "stream": False  # Added to disable streaming responses
+        "stream": False,  # disable streaming responses
+        "options": {
+            # Ask Ollama to allocate a larger context window if the model supports it
+            "num_ctx": OLLAMA_NUM_CTX,
+            # Performance optimizations for faster responses
+            "num_predict": 200,    # Limit response length for mesh network
+            "temperature": 0.7,    # Slightly less random for more focused responses
+            "top_p": 0.9,         # Nucleus sampling for quality vs speed balance
+            "top_k": 40,          # Limit vocabulary consideration for speed
+            "repeat_penalty": 1.1, # Prevent repetition
+            "num_thread": 4,      # Use multiple CPU threads (adjust based on Pi)
+        },
     }
 
     try:
@@ -659,7 +949,7 @@ def send_to_home_assistant(user_message):
         print(f"⚠️ HA request failed: {e}")
         return None
 
-def get_ai_response(prompt, sender_id=None, is_direct=False, channel_idx=None):
+def get_ai_response(prompt, sender_id=None, is_direct=False, channel_idx=None, thread_root_ts=None):
   """Get AI response from configured provider. Optional context (sender/is_direct/channel_idx)
   is forwarded to the provider integration so it can include history/context when available."""
   if AI_PROVIDER == "lmstudio":
@@ -667,7 +957,7 @@ def get_ai_response(prompt, sender_id=None, is_direct=False, channel_idx=None):
   elif AI_PROVIDER == "openai":
     return send_to_openai(prompt)
   elif AI_PROVIDER == "ollama":
-    return send_to_ollama(prompt, sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx)
+    return send_to_ollama(prompt, sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx, thread_root_ts=thread_root_ts)
   elif AI_PROVIDER == "home_assistant":
     return send_to_home_assistant(prompt)
   else:
@@ -678,7 +968,7 @@ def send_discord_message(content):
     if not (ENABLE_DISCORD and DISCORD_WEBHOOK_URL):
         return
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": content})
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=10)
     except Exception as e:
         print(f"⚠️ Discord webhook error: {e}")
 
@@ -742,7 +1032,7 @@ def send_emergency_notification(node_id, user_msg, lat=None, lon=None, position_
     # Attempt to post emergency alert to Discord if enabled.
     try:
         if DISCORD_SEND_EMERGENCY and ENABLE_DISCORD and DISCORD_WEBHOOK_URL:
-            requests.post(DISCORD_WEBHOOK_URL, json={"content": full_msg})
+            requests.post(DISCORD_WEBHOOK_URL, json={"content": full_msg}, timeout=10)
             print("✅ Emergency alert posted to Discord.")
         else:
             print("Discord emergency notifications disabled or not configured.")
@@ -784,176 +1074,370 @@ def route_message_text(user_message, channel_idx):
 # -----------------------------
 # Revised Command Handler (Case-Insensitive)
 # -----------------------------
-def handle_command(cmd, full_text, sender_id):
-    cmd = cmd.lower()
-    dprint(f"handle_command => cmd='{cmd}', full_text='{full_text}', sender_id={sender_id}")
-    if cmd == "/about":
-        return "MESH-AI Off Grid Chat Bot - By: MR-TBOT.com"
-    elif cmd in ["/ai", "/bot", "/query", "/data"]:
-        user_prompt = full_text[len(cmd):].strip()
+def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None, thread_root_ts=None):
+  cmd = cmd.lower()
+  dprint(f"handle_command => cmd='{cmd}', full_text='{full_text}', sender_id={sender_id}, is_direct={is_direct}")
+  if cmd == "/about":
+    return "MESH-AI Off Grid Chat Bot - By: MR-TBOT.com"
+
+  elif cmd in ["/ai", "/bot", "/query", "/data"]:
+    user_prompt = full_text[len(cmd):].strip()
+    
+    # Special handling for DMs: if the command has no content, treat the whole message as a regular AI query
+    if is_direct and not user_prompt:
+      # User just typed "/ai" or "/query" alone in a DM - treat it as "ai" (regular message)
+      user_prompt = cmd[1:]  # Remove the "/" to make it just "ai", "bot", etc.
+      info_print(f"[Info] Converting empty {cmd} command in DM to regular AI query: '{user_prompt}'")
+    elif not user_prompt:
+      # In channels, if no prompt provided, give helpful message
+      return f"Please provide a question or prompt after {cmd}. Example: `{cmd} What's the weather?`"
+    
+    if AI_PROVIDER == "home_assistant" and HOME_ASSISTANT_ENABLE_PIN:
+      if not pin_is_valid(user_prompt):
+        return "Security code missing or invalid. Use 'PIN=XXXX'"
+      user_prompt = strip_pin(user_prompt)
+    ai_answer = get_ai_response(user_prompt, sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx, thread_root_ts=thread_root_ts)
+    return ai_answer if ai_answer else "🤖 [No AI response]"
+
+  elif cmd == "/whereami":
+    lat, lon, tstamp = get_node_location(sender_id)
+    sn = get_node_shortname(sender_id)
+    if lat is None or lon is None:
+      return f"🤖 Sorry {sn}, I have no GPS fix for your node."
+    tstr = str(tstamp) if tstamp else "Unknown"
+    return f"Node {sn} GPS: {lat}, {lon} (time: {tstr})"
+
+  elif cmd in ["/emergency", "/911"]:
+    lat, lon, tstamp = get_node_location(sender_id)
+    user_msg = full_text[len(cmd):].strip()
+    send_emergency_notification(sender_id, user_msg, lat, lon, tstamp)
+    log_message(sender_id, f"EMERGENCY TRIGGERED: {full_text}", is_emergency=True)
+    return "🚨 Emergency alert sent. Stay safe."
+
+  elif cmd == "/test":
+    sn = get_node_shortname(sender_id)
+    return f"Hello {sn}! Received {LOCAL_LOCATION_STRING} by {AI_NODE_NAME}."
+
+  elif cmd == "/help":
+    built_in = ["/about", "/query", "/whereami", "/emergency", "/911", "/test", "/motd", "/reset"]
+    custom_cmds = [c.get("command") for c in commands_config.get("commands", [])]
+    return "Commands:\n" + ", ".join(built_in + custom_cmds)
+
+  elif cmd == "/motd":
+    return motd_content
+
+  elif cmd == "/reset":
+    # Clear chat context for either this direct DM thread (sender <-> AI)
+    # or for the channel history if invoked in a channel.
+    cleared = 0
+    with messages_lock:
+      before = len(messages)
+      if is_direct:
+        # Remove only this sender's DM thread: direct human messages from sender
+        # and any direct AI replies that have reply_to pointing at those human messages.
+        sender_dm_ts = {m.get("timestamp") for m in messages if m.get("direct") is True and same_node_id(m.get("node_id"), sender_id)}
+        messages[:] = [
+          m for m in messages
+          if not (
+            (m.get("direct") is True and same_node_id(m.get("node_id"), sender_id))
+            or (m.get("direct") is True and m.get("is_ai") is True and m.get("reply_to") in sender_dm_ts)
+          )
+        ]
+      else:
+        # Channel reset: remove entries for this channel_idx
+        if channel_idx is not None:
+          if thread_root_ts:
+            # Clear only this thread root and AI replies tied to it
+            messages[:] = [
+              m for m in messages
+              if not (
+                (m.get("direct") is False and m.get("channel_idx") == channel_idx and m.get("timestamp") == thread_root_ts)
+                or (m.get("direct") is False and m.get("channel_idx") == channel_idx and m.get("is_ai") is True and m.get("reply_to") == thread_root_ts)
+              )
+            ]
+          else:
+            # Clear entire channel history
+            messages[:] = [
+              m for m in messages
+              if not (m.get("direct") is False and m.get("channel_idx") == channel_idx)
+            ]
+        else:
+          # Unknown target; do nothing
+          pass
+      after = len(messages)
+      cleared = max(0, before - after)
+      save_archive()
+    if cleared > 0:
+      if is_direct:
+        return "I seemed to have had a robot brain fart.., I guess we're starting fresh"
+      else:
+        return "🧵 Thread/channel context cleared. Starting fresh."
+    else:
+      if is_direct:
+        return "🧹 Nothing to reset in your direct chat."
+      elif channel_idx is not None:
+        ch_name = str(config.get("channel_names", {}).get(str(channel_idx), channel_idx))
+        return f"🧹 Nothing to reset for channel {ch_name}."
+      else:
+        return "🧹 Nothing to reset (unknown target)."
+
+  elif cmd == "/sms":
+    parts = full_text.split(" ", 2)
+    if len(parts) < 3:
+      return "Invalid syntax. Use: /sms <phone_number> <message>"
+    phone_number = parts[1]
+    message_text = parts[2]
+    try:
+      client = Client(TWILIO_SID, TWILIO_AUTH_TOKEN)
+      client.messages.create(
+        body=message_text,
+        from_=TWILIO_FROM_NUMBER,
+        to=phone_number,
+      )
+      print(f"✅ SMS sent to {phone_number}")
+      return "SMS sent successfully."
+    except Exception as e:
+      print(f"⚠️ Failed to send SMS: {e}")
+      return "Failed to send SMS."
+
+  for c in commands_config.get("commands", []):
+    if c.get("command").lower() == cmd:
+      if "ai_prompt" in c:
+        user_input = full_text[len(cmd):].strip()
+        custom_text = c["ai_prompt"].replace("{user_input}", user_input)
         if AI_PROVIDER == "home_assistant" and HOME_ASSISTANT_ENABLE_PIN:
-            if not pin_is_valid(user_prompt):
-                return "Security code missing or invalid. Use 'PIN=XXXX'"
-            user_prompt = strip_pin(user_prompt)
-        ai_answer = get_ai_response(user_prompt)
-        return ai_answer if ai_answer else "🤖 [No AI response]"
-    elif cmd == "/whereami":
-        lat, lon, tstamp = get_node_location(sender_id)
-        sn = get_node_shortname(sender_id)
-        if lat is None or lon is None:
-            return f"🤖 Sorry {sn}, I have no GPS fix for your node."
-        tstr = str(tstamp) if tstamp else "Unknown"
-        return f"Node {sn} GPS: {lat}, {lon} (time: {tstr})"
-    elif cmd in ["/emergency", "/911"]:
-        lat, lon, tstamp = get_node_location(sender_id)
-        user_msg = full_text[len(cmd):].strip()
-        send_emergency_notification(sender_id, user_msg, lat, lon, tstamp)
-        log_message(sender_id, f"EMERGENCY TRIGGERED: {full_text}", is_emergency=True)
-        return "🚨 Emergency alert sent. Stay safe."
-    elif cmd == "/test":
-        sn = get_node_shortname(sender_id)
-        return f"Hello {sn}! Received {LOCAL_LOCATION_STRING} by {AI_NODE_NAME}."
-    elif cmd == "/help":
-        built_in = ["/about", "/query", "/whereami", "/emergency", "/911", "/test", "/motd"]
-        custom_cmds = [c.get("command") for c in commands_config.get("commands",[])]
-        return "Commands:\n" + ", ".join(built_in + custom_cmds)
-    elif cmd == "/motd":
-        return motd_content
-    elif cmd == "/sms":
-        parts = full_text.split(" ", 2)
-        if len(parts) < 3:
-            return "Invalid syntax. Use: /sms <phone_number> <message>"
-        phone_number = parts[1]
-        message_text = parts[2]
-        try:
-            client = Client(TWILIO_SID, TWILIO_AUTH_TOKEN)
-            client.messages.create(
-                body=message_text,
-                from_=TWILIO_FROM_NUMBER,
-                to=phone_number
-            )
-            print(f"✅ SMS sent to {phone_number}")
-            return "SMS sent successfully."
-        except Exception as e:
-            print(f"⚠️ Failed to send SMS: {e}")
-            return "Failed to send SMS."
-    for c in commands_config.get("commands", []):
-        if c.get("command").lower() == cmd:
-            if "ai_prompt" in c:
-                user_input = full_text[len(cmd):].strip()
-                custom_text = c["ai_prompt"].replace("{user_input}", user_input)
-                if AI_PROVIDER == "home_assistant" and HOME_ASSISTANT_ENABLE_PIN:
-                    if not pin_is_valid(custom_text):
-                        return "Security code missing or invalid."
-                    custom_text = strip_pin(custom_text)
-                ans = get_ai_response(custom_text)
-                return ans if ans else "🤖 [No AI response]"
-            elif "response" in c:
-                return c["response"]
-            return "No configured response for this command."
-    return None
+          if not pin_is_valid(custom_text):
+            return "Security code missing or invalid."
+          custom_text = strip_pin(custom_text)
+        ans = get_ai_response(custom_text, sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx, thread_root_ts=thread_root_ts)
+        return ans if ans else "🤖 [No AI response]"
+      elif "response" in c:
+        return c["response"]
+      return "No configured response for this command."
 
-def parse_incoming_text(text, sender_id, is_direct, channel_idx):
-    dprint(f"parse_incoming_text => text='{text}' is_direct={is_direct} channel={channel_idx}")
+  return None
+
+def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=None, check_only=False):
+  dprint(f"parse_incoming_text => text='{text}' is_direct={is_direct} channel={channel_idx} check_only={check_only}")
+  if not check_only:
     info_print(f"[Info] Received from node {sender_id} (direct={is_direct}, ch={channel_idx}) => '{text}'")
-    text = text.strip()
-    if not text:
-        return None
-    if is_direct and not config.get("reply_in_directs", True):
-        return None
-    if (not is_direct) and channel_idx != HOME_ASSISTANT_CHANNEL_INDEX and not config.get("reply_in_channels", True):
-        return None
-    if text.startswith("/"):
-        cmd = text.split()[0]
-        resp = handle_command(cmd, text, sender_id)
-        return resp
-    # Non-command messages: route to AI for direct messages, or Home Assistant if configured for this channel.
-    if is_direct:
-        # Direct messages go to the AI provider
-        return get_ai_response(text, sender_id=sender_id, is_direct=True, channel_idx=channel_idx)
+  text = text.strip()
+  if not text:
+    return None if not check_only else False
+  if is_direct and not config.get("reply_in_directs", True):
+    return None if not check_only else False
+  if (not is_direct) and channel_idx != HOME_ASSISTANT_CHANNEL_INDEX and not config.get("reply_in_channels", True):
+    return None if not check_only else False
 
-    # If Home Assistant integration is enabled and this is the HA channel, route there
-    if HOME_ASSISTANT_ENABLED and channel_idx == HOME_ASSISTANT_CHANNEL_INDEX:
-        return route_message_text(text, channel_idx)
+  # Commands (start with /) should be handled and given context
+  if text.startswith("/"):
+    if check_only:
+      # Quick commands like /reset don't need AI processing
+      cmd = text.split()[0].lower()
+      if cmd in ["/reset", "/sms"]:
+        return False  # Process immediately, not async
+      # Built-in AI commands need async processing
+      if cmd in ["/ai", "/bot", "/query", "/data"]:
+        return True  # Needs AI processing
+      # Check if it's a custom AI command
+      for c in commands_config.get("commands", []):
+        if c.get("command").lower() == cmd and "ai_prompt" in c:
+          return True  # Needs AI processing
+      return False  # Other commands can be processed immediately
+    else:
+      cmd = text.split()[0]
+      resp = handle_command(cmd, text, sender_id, is_direct=is_direct, channel_idx=channel_idx, thread_root_ts=thread_root_ts)
+      return resp
 
-    # Otherwise, no automatic response
-    return None
+  # Non-command messages: route to AI for direct messages, or Home Assistant if configured for this channel.
+  if is_direct:
+    if check_only:
+      return True  # Direct messages go to AI (needs async processing)
+    # Direct messages go to the AI provider and include sender context
+    return get_ai_response(text, sender_id=sender_id, is_direct=True, channel_idx=channel_idx, thread_root_ts=thread_root_ts)
+
+  # If Home Assistant integration is enabled and this is the HA channel, route there
+  if HOME_ASSISTANT_ENABLED and channel_idx == HOME_ASSISTANT_CHANNEL_INDEX:
+    if check_only:
+      return True  # HA responses can take time, process async
+    return route_message_text(text, channel_idx)
+
+  # Otherwise, no automatic response
+  return None if not check_only else False
 
 def on_receive(packet=None, interface=None, **kwargs):
-    dprint(f"on_receive => packet={packet}")
-    if not packet or 'decoded' not in packet:
-        dprint("No decoded packet => ignoring.")
-        return
-    if packet['decoded']['portnum'] != 'TEXT_MESSAGE_APP':
-        dprint("Not TEXT_MESSAGE_APP => ignoring.")
-        return
-    try:
-        text_raw = packet['decoded']['payload']
-        text = text_raw.decode('utf-8', errors='replace')
-        sender_node = packet.get('fromId', None)
-        raw_to = packet.get('toId', None)
-        to_node_int = parse_node_id(raw_to)
-        ch_idx = packet.get('channel', 0)
-        dprint(f"[MSG] from {sender_node} to {raw_to} (ch={ch_idx}): {text}")
-        entry = log_message(sender_node, text, direct=(to_node_int != BROADCAST_ADDR), channel_idx=(None if to_node_int != BROADCAST_ADDR else ch_idx))
-        global lastDMNode, lastChannelIndex
-        if to_node_int != BROADCAST_ADDR:
-            lastDMNode = sender_node
-        else:
-            lastChannelIndex = ch_idx
+  # Entry marker to confirm callback firing
+  try:
+    pkt_keys = list(packet.keys()) if isinstance(packet, dict) else type(packet).__name__
+  except Exception:
+    pkt_keys = 'unknown'
+  info_print(f"[CB] on_receive fired. keys={pkt_keys}")
+  # Accept packets from generic receive or text-only topic
+  decoded = None
+  if isinstance(packet, dict):
+    decoded = packet.get('decoded')
+    if not decoded and 'text' in packet:
+      decoded = {'text': packet.get('text'), 'portnum': 'TEXT_MESSAGE_APP'}
+  if not decoded and 'text' in kwargs:
+    decoded = {'text': kwargs.get('text'), 'portnum': 'TEXT_MESSAGE_APP'}
+  if not decoded:
+    dprint("No decoded/text in packet => ignoring.")
+    return
 
-        # Only forward messages on the configured Discord inbound channel to Discord.
-        if ENABLE_DISCORD and DISCORD_SEND_ALL and DISCORD_INBOUND_CHANNEL_INDEX is not None and ch_idx == DISCORD_INBOUND_CHANNEL_INDEX:
-            sender_info = f"{get_node_shortname(sender_node)} ({sender_node})"
-            disc_content = f"**{sender_info}**: {text}"
-            send_discord_message(disc_content)
+  # normalize decoded to dict
+  if not isinstance(decoded, dict):
+    decoded = {'text': str(decoded), 'portnum': 'TEXT_MESSAGE_APP'}
+  
+  # continue processing
+  
+  portnum = decoded.get('portnum')
+  # Accept string or int for TEXT_MESSAGE_APP (1)
+  is_text = False
+  try:
+    if portnum == 'TEXT_MESSAGE_APP' or portnum == 'TEXT_MESSAGE':
+      is_text = True
+    elif isinstance(portnum, int) and portnum == 1:
+      is_text = True
+  except Exception:
+    is_text = False
+  if not is_text:
+    info_print(f"[Info] Ignoring non-text packet: portnum={portnum}")
+    return
 
-        my_node_num = None
-        if FORCE_NODE_NUM is not None:
-            my_node_num = FORCE_NODE_NUM
-        else:
-            if hasattr(interface, "myNode") and interface.myNode:
-                my_node_num = interface.myNode.nodeNum
-            elif hasattr(interface, "localNode") and interface.localNode:
-                my_node_num = interface.localNode.nodeNum
-        is_direct = False
-        if to_node_int == BROADCAST_ADDR:
-            is_direct = False
-        elif my_node_num is not None and to_node_int == my_node_num:
-            is_direct = True
-        else:
-            is_direct = (my_node_num == to_node_int)
-        resp = parse_incoming_text(text, sender_node, is_direct, ch_idx)
+  try:
+    # Prefer decoded text when available
+    text = decoded.get('text')
+    if text is None:
+      payload = decoded.get('payload') or decoded.get('data')
+      if isinstance(payload, bytes):
+        text = payload.decode('utf-8', errors='replace')
+      elif isinstance(payload, str):
+        text = payload
+      else:
+        text = str(payload) if payload is not None else ''
+    sender_node = (packet.get('fromId') if isinstance(packet, dict) else None) or (packet.get('from') if isinstance(packet, dict) else None) or kwargs.get('fromId') or kwargs.get('from')
+    raw_to = (packet.get('toId') if isinstance(packet, dict) else None) or (packet.get('to') if isinstance(packet, dict) else None) or kwargs.get('toId') or kwargs.get('to')
+    to_node_int = parse_node_id(raw_to)
+    if to_node_int is None:
+      to_node_int = BROADCAST_ADDR
+    ch_idx = 0
+    if isinstance(packet, dict):
+      ch_idx = packet.get('channel') if packet.get('channel') is not None else packet.get('channelIndex', 0)
+
+    # De-dup: if we have seen the same text/from/to/channel very recently, drop it
+    rx_key = _rx_make_key(packet, text, ch_idx)
+    if _rx_seen_before(rx_key):
+      info_print(f"[Info] Duplicate RX suppressed for from={sender_node} ch={ch_idx}: {text}")
+      return
+    info_print(f"[RX] from {sender_node or '?'} to {raw_to or '^all'} (ch={ch_idx}): {text}")
+
+    entry = log_message(
+        sender_node,
+        text,
+        direct=(to_node_int != BROADCAST_ADDR),
+        channel_idx=(None if to_node_int != BROADCAST_ADDR else ch_idx),
+    )
+
+    global lastDMNode, lastChannelIndex
+    if to_node_int != BROADCAST_ADDR:
+        lastDMNode = sender_node
+    else:
+        lastChannelIndex = ch_idx
+
+    # Only forward messages on the configured Discord inbound channel to Discord.
+    if ENABLE_DISCORD and DISCORD_SEND_ALL and DISCORD_INBOUND_CHANNEL_INDEX is not None and ch_idx == DISCORD_INBOUND_CHANNEL_INDEX:
+        sender_info = f"{get_node_shortname(sender_node)} ({sender_node})"
+        disc_content = f"**{sender_info}**: {text}"
+        send_discord_message(disc_content)
+
+    # Determine our node number
+    my_node_num = FORCE_NODE_NUM if FORCE_NODE_NUM is not None else None
+    if my_node_num is None:
+      if hasattr(interface, "myNode") and interface.myNode:
+        my_node_num = interface.myNode.nodeNum
+      elif hasattr(interface, "localNode") and interface.localNode:
+        my_node_num = interface.localNode.nodeNum
+
+    # Determine whether this is a direct message to us
+    if to_node_int == BROADCAST_ADDR:
+      is_direct = False
+    elif my_node_num is not None and to_node_int == my_node_num:
+      is_direct = True
+    else:
+      is_direct = (my_node_num == to_node_int)
+
+    # Decide on a response based on parsed text and context
+    # Compute a thread root for channel messages so multiple /ai commands stick to the same thread.
+    thread_root_ts = entry.get('timestamp')
+    if not is_direct:
+      # For channels, if this is a command, try to anchor to the most recent non-command human message
+      # from the same sender in this channel; otherwise, current message is the root.
+      t_text = (text or '').strip()
+      if t_text.startswith('/'):
+        try:
+          with messages_lock:
+            snapshot = list(messages)
+          for m in reversed(snapshot):
+            if m.get('direct') is False and m.get('channel_idx') == ch_idx and not m.get('is_ai'):
+              # Same sender and not a command message
+              if same_node_id(m.get('node_id'), sender_node):
+                mt = str(m.get('message') or '')
+                if not mt.strip().startswith('/'):
+                  thread_root_ts = m.get('timestamp') or thread_root_ts
+                  break
+        except Exception:
+          pass
+
+    # Check if this message should get an AI response
+    should_respond = parse_incoming_text(text, sender_node, is_direct, ch_idx, thread_root_ts=thread_root_ts, check_only=True)
+    
+    if should_respond:
+      # Queue the response for async processing instead of blocking here
+      info_print(f"[AsyncAI] Queueing response for {sender_node}: {text[:50]}...")
+      try:
+        response_queue.put((text, sender_node, is_direct, ch_idx, thread_root_ts, interface), block=False)
+        info_print(f"[AsyncAI] Queued (queue size: {response_queue.qsize()})")
+      except queue.Full:
+        info_print(f"[AsyncAI] Response queue full ({response_queue.qsize()}), processing immediately to avoid drop")
+        # Fall back to immediate processing if queue is full
+        resp = parse_incoming_text(text, sender_node, is_direct, ch_idx, thread_root_ts=thread_root_ts)
         if resp:
-            info_print("[Info] Wait 10s before responding to reduce collisions.")
-            time.sleep(10)
-            log_message(AI_NODE_NAME, resp, reply_to=entry['timestamp'])
-            # If message originated on Discord inbound channel, also send the AI response back to Discord.
-            if ENABLE_DISCORD and DISCORD_SEND_AI and DISCORD_INBOUND_CHANNEL_INDEX is not None and ch_idx == DISCORD_INBOUND_CHANNEL_INDEX:
-                disc_msg = f"🤖 **{AI_NODE_NAME}**: {resp}"
-                send_discord_message(disc_msg)
-            if is_direct:
-                send_direct_chunks(interface, resp, sender_node)
-            else:
-                send_broadcast_chunks(interface, resp, ch_idx)
-    except OSError as e:
-        error_code = getattr(e, 'errno', None) or getattr(e, 'winerror', None)
-        print(f"⚠️ OSError detected in on_receive: {e} (error code: {error_code})")
-        if error_code in (10053, 10054, 10060):
-            print("⚠️ Connection error detected. Restarting interface...")
-            global connection_status
-            connection_status = "Disconnected"
-            reset_event.set()
-        # Instead of re-raising, simply return to prevent thread crash
-        return
-    except Exception as e:
-        print(f"⚠️ Unexpected error in on_receive: {e}")
-        return
+          info_print(f"[Info] Immediate fallback response: {resp}")
+          if is_direct:
+            send_direct_chunks(interface, resp, sender_node)
+          else:
+            send_broadcast_chunks(interface, resp, ch_idx)
+    else:
+      # Non-AI messages (e.g., simple commands) can be processed immediately
+      resp = parse_incoming_text(text, sender_node, is_direct, ch_idx, thread_root_ts=thread_root_ts)
+      if resp:
+        # This should be a quick response (like /reset), so process synchronously
+        info_print(f"[Info] Immediate response: {resp}")
+        if is_direct:
+          send_direct_chunks(interface, resp, sender_node)
+        else:
+          send_broadcast_chunks(interface, resp, ch_idx)
+
+  except OSError as e:
+    error_code = getattr(e, 'errno', None) or getattr(e, 'winerror', None)
+    print(f"⚠️ OSError detected in on_receive: {e} (error code: {error_code})")
+    if error_code in (10053, 10054, 10060):
+      print("⚠️ Connection error detected. Restarting interface...")
+      global connection_status
+      connection_status = "Disconnected"
+      reset_event.set()
+    # Instead of re-raising, simply return to prevent thread crash
+    return
+  except Exception as e:
+    print(f"⚠️ Unexpected error in on_receive: {e}")
+    return
 
 @app.route("/messages", methods=["GET"])
 def get_messages_api():
-    dprint("GET /messages => returning current messages")
-    return jsonify(messages)
+  dprint("GET /messages => returning current messages")
+  with messages_lock:
+    snapshot = list(messages)
+  return jsonify(snapshot)
 
 @app.route("/nodes", methods=["GET"])
 def get_nodes_api():
@@ -1099,6 +1583,16 @@ def twilio_webhook():
     else:
         return "Invalid twilio_inbound_target config", 400
     return "SMS processed", 200
+
+@app.route("/", methods=["GET"])
+def root():
+  # Redirect to dashboard for convenience
+  return redirect("/dashboard")
+
+@app.route("/health", methods=["GET"])
+def health():
+  # Simple health endpoint for status checks
+  return jsonify({"ok": connection_status == "Connected", "status": connection_status})
 
 @app.route("/dashboard", methods=["GET"])
 def dashboard():
@@ -1288,8 +1782,9 @@ def dashboard():
     // Globals for reply targets
     var lastDMTarget = null;
     var lastChannelTarget = null;
-    let allNodes = [];
-    let allMessages = [];
+  let allNodes = [];
+  let allMessages = [];
+  let fetchIntervalId = null; // guard to avoid multiple intervals
     let lastMessageTimestamp = null;
     let tickerTimeout = null;
     let tickerLastShownTimestamp = null;
@@ -2071,7 +2566,9 @@ def dashboard():
     setInterval(pollStatus, 5000);
 
     function onPageLoad() {
-      setInterval(fetchMessagesAndNodes, 10000);
+      if (!fetchIntervalId) {
+        fetchIntervalId = setInterval(fetchMessagesAndNodes, 10000); // every 10s
+      }
       fetchMessagesAndNodes();
       toggleMode(); // Set initial mode
     }
@@ -2242,6 +2739,11 @@ def dashboard():
         </label>
         <button id="saveAutostartBtn" class="btn" style="margin-left:6px;">Save</button>
       </div>
+      <div style="color:#ccc;font-size:0.9em;margin-top:8px;max-width:420px;">
+        Note: This toggle configures Desktop (GUI) autostart via a .desktop file. On headless servers or
+        when the Desktop session doesn’t run at boot, use a systemd service instead. A helper installer
+        script is included in the repository under scripts/. 
+      </div>
     </div>
 
     <script>
@@ -2335,7 +2837,10 @@ def ui_send():
     else:
         dest_node = None
     if mode == "broadcast":
-        channel_idx = int(request.form.get("channel_index", "0"))
+        try:
+            channel_idx = int(request.form.get("channel_index", "0"))
+        except (ValueError, TypeError):
+            channel_idx = 0
     else:
         channel_idx = None
     if not message:
@@ -2465,7 +2970,11 @@ def main():
     add_script_log(f"Server restarted. Restart count: {restart_count}")
     print("Starting MESH-AI server...")
     load_archive()
-        # Additional startup info:
+    
+    # Start the async response worker
+    start_response_worker()
+    
+    # Additional startup info:
     if ENABLE_DISCORD:
         print(f"Discord configuration enabled: Inbound channel index: {DISCORD_INBOUND_CHANNEL_INDEX}, Webhook URL is {'set' if DISCORD_WEBHOOK_URL else 'not set'}, Bot Token is {'set' if DISCORD_BOT_TOKEN else 'not set'}, Channel ID is {'set' if DISCORD_CHANNEL_ID else 'not set'}.")
     else:
@@ -2484,16 +2993,32 @@ def main():
             print("SMTP is not properly configured for emergency email alerts.")
     else:
         print("SMTP is disabled.")
-    print("Launching Flask in the background on port 5000...")
+    # Determine Flask port: prefer environment `MESH_AI_PORT`, then config keys, then default 5000
+    try:
+        flask_port = int(
+            os.environ.get("MESH_AI_PORT")
+            or (config.get("web_port") if isinstance(config.get("web_port"), int) else None)
+            or (config.get("flask_port") if isinstance(config.get("flask_port"), int) else None)
+            or (config.get("port") if isinstance(config.get("port"), int) else None)
+            or 5000
+        )
+    except Exception:
+        try:
+            flask_port = int(os.environ.get("MESH_AI_PORT", "5000"))
+        except Exception:
+            flask_port = 5000
+
+    print(f"Launching Flask in the background on port {flask_port}...")
     api_thread = threading.Thread(
         target=app.run,
-        kwargs={"host": "0.0.0.0", "port": 5000, "debug": False},
-        daemon=True
+        kwargs={"host": "0.0.0.0", "port": flask_port, "debug": False},
+        daemon=True,
     )
     api_thread.start()
     # If Discord polling is configured, start that thread.
     if DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID:
         threading.Thread(target=poll_discord_channel, daemon=True).start()
+
     while True:
         try:
             print("---------------------------------------------------")
@@ -2509,6 +3034,7 @@ def main():
                 pass
             interface = connect_interface()
             print("Subscribing to on_receive callback...")
+            # Only subscribe to the main topic to avoid duplicate callbacks
             pub.subscribe(on_receive, "meshtastic.receive")
             print(f"AI provider set to: {AI_PROVIDER}")
             if HOME_ASSISTANT_ENABLED:
@@ -2567,7 +3093,7 @@ def poll_discord_channel():
             params = {"limit": 10}
             if last_message_id:
                 params["after"] = last_message_id
-            response = requests.get(url, headers=headers, params=params)
+            response = requests.get(url, headers=headers, params=params, timeout=10)
             if response.status_code == 200:
                 msgs = response.json()
                 msgs = sorted(msgs, key=lambda m: int(m["id"]))
@@ -2604,10 +3130,13 @@ if __name__ == "__main__":
             main()
         except KeyboardInterrupt:
             print("User interrupted the script. Exiting.")
+            stop_response_worker()  # Clean shutdown of worker thread
             add_script_log("Server exited via KeyboardInterrupt.")
             break
         except Exception as e:
             logging.error(f"Unhandled error in main: {e}")
+            stop_response_worker()  # Clean shutdown on error
+            break
             add_script_log(f"Unhandled error: {e}")
             print("Encountered an error. Restarting in 30 seconds...")
             time.sleep(30)

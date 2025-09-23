@@ -14,6 +14,7 @@ and prints the returned AI response (if any).
 """
 import runpy
 import sys
+import types
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / 'mesh-ai.py'
@@ -40,6 +41,79 @@ def _no_op_route(*a, **k):
     return _decorator
 
 ns['_no_op_route'] = _no_op_route
+
+# Inject lightweight mocks for optional external modules so the test harness
+# can exec the real `mesh-ai.py` source without requiring all dependencies.
+# These mocks provide only the attributes the module expects at import time.
+fake_meshtastic = types.ModuleType('meshtastic')
+fake_serial = types.ModuleType('meshtastic.serial_interface')
+
+class _FakeSerialInterface:
+    def __init__(self, *a, **k):
+        self._serial = types.SimpleNamespace(baudrate=921600)
+    def close(self):
+        pass
+
+fake_serial.SerialInterface = _FakeSerialInterface
+
+# Provide constants and submodules expected by mesh-ai.py
+fake_meshtastic.serial_interface = fake_serial
+fake_meshtastic.BROADCAST_ADDR = 0xffffffff
+
+# mesh_interface and tcp_interface mocks
+mesh_interface_mod = types.ModuleType('meshtastic.mesh_interface')
+class _FakeMeshInterface:
+    def __init__(self, *a, **k):
+        self.myNode = None
+        self.localNode = None
+        self.nodes = {}
+    def close(self):
+        pass
+mesh_interface_mod.MeshInterface = _FakeMeshInterface
+tcp_interface_mod = types.ModuleType('meshtastic.tcp_interface')
+tcp_interface_mod.TCPInterface = None
+
+# pubsub.pub mock with subscribe/unsubscribe
+pubsub_mod = types.ModuleType('pubsub')
+pub_obj = types.SimpleNamespace(subscribe=lambda *a, **k: None, unsubscribe=lambda *a, **k: None)
+pubsub_mod.pub = pub_obj
+
+# twilio.rest.Client mock
+twilio_mod = types.ModuleType('twilio')
+twilio_rest_mod = types.ModuleType('twilio.rest')
+class _FakeTwilioClient:
+    def __init__(self, *a, **k):
+        pass
+twilio_rest_mod.Client = _FakeTwilioClient
+
+# unidecode fallback
+unidecode_mod = types.ModuleType('unidecode')
+def _fake_unidecode(s):
+    return s
+unidecode_mod.unidecode = _fake_unidecode
+
+# Insert into sys.modules so imports in mesh-ai.py resolve
+sys.modules.setdefault('meshtastic', fake_meshtastic)
+sys.modules.setdefault('meshtastic.serial_interface', fake_serial)
+sys.modules.setdefault('meshtastic.mesh_interface', mesh_interface_mod)
+sys.modules.setdefault('meshtastic.tcp_interface', tcp_interface_mod)
+sys.modules.setdefault('pubsub', pubsub_mod)
+sys.modules.setdefault('pubsub.pub', pub_obj)
+sys.modules.setdefault('twilio', twilio_mod)
+sys.modules.setdefault('twilio.rest', twilio_rest_mod)
+sys.modules.setdefault('unidecode', unidecode_mod)
+
+# Provide a minimal google.protobuf.message.DecodeError exception class
+google_mod = types.ModuleType('google')
+google_protobuf = types.ModuleType('google.protobuf')
+google_message = types.ModuleType('google.protobuf.message')
+class DecodeError(Exception):
+    pass
+google_message.DecodeError = DecodeError
+google_protobuf.message = google_message
+sys.modules.setdefault('google', google_mod)
+sys.modules.setdefault('google.protobuf', google_protobuf)
+sys.modules.setdefault('google.protobuf.message', google_message)
 
 # Load project config (so OLLAMA_MODEL and related values are used)
 import json
@@ -124,3 +198,12 @@ except Exception as e:
 print('\nRunning test: channel message -> HA or AI')
 resp2 = parse_incoming_text('Status update for the channel', sender_id=99, is_direct=False, channel_idx=2)
 print('parse_incoming_text (channel) returned:', resp2)
+
+# Additional checks for /reset command behavior
+print('\nTesting /reset behavior (direct)')
+resp_reset_direct = parse_incoming_text('/reset', sender_id=42, is_direct=True, channel_idx=None)
+print('parse_incoming_text("/reset", direct) returned:', resp_reset_direct)
+
+print('\nTesting /reset behavior (channel)')
+resp_reset_channel = parse_incoming_text('/reset', sender_id=99, is_direct=False, channel_idx=2)
+print('parse_incoming_text("/reset", channel) returned:', resp_reset_channel)
