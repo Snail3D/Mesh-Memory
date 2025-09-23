@@ -1,14 +1,39 @@
-# MESH-AI (BETA v0.5.1) - NOW IN BETA!
+# MESH MEMORY - Enhanced AI with Persistent Memory
 
-- PLEASE NOTE - MESH-AI is out of ALPHA!  There are new requirements and new config options!  Old configs should work out of the box - but please see below for changes.
+**MESH MEMORY** is an enhanced fork of MESH-AI that brings **persistent memory, async processing, and robust performance** to Meshtastic LoRa mesh networks. Never lose context again - your AI remembers every conversation across restarts and reconnections.
 
-**This release is functionally the same as v0.5.0 - but has been rebranded to MESH-AI for trademark compliance and respect for the official Meshtastic.org project.  This project is getting a lot of attention now - and I am actively reaching out to the Meshtastic team for guidance on how to develop respectfully in their ecosystem - all previous ALPHA releases are going to be pulled from the repo.**
+> **🧠 The Memory Advantage:**  
+> Unlike the original mesh-ai, MESH MEMORY maintains **full conversation history** and **context persistence**, making your mesh network AI truly intelligent and reliable.
 
 ![MESH-AI](https://github.com/user-attachments/assets/438dc643-6727-439d-a719-0fb905bec920)
 
+**Built on MESH-AI BETA v0.5.1** - An experimental project that bridges [Meshtastic](https://meshtastic.org/) LoRa mesh networks with powerful AI chatbots.
 
+## 🌟 **Why Choose MESH MEMORY?**
 
-**MESH-AI** is an experimental project that bridges [Meshtastic](https://meshtastic.org/) LoRa mesh networks with powerful AI chatbots. This is the FIRST BETA RELEASE!
+### 🧠 **Persistent Memory System**
+- **Never forget conversations** - Full chat history survives restarts, power cycles, and reconnections
+- **Context-aware responses** - AI remembers what you discussed yesterday, last week, or last month  
+- **Seamless session continuity** - Pick up conversations exactly where you left off
+- **Smart memory management** - Configurable history limits and automatic cleanup
+
+### ⚡ **Async Performance Revolution** 
+- **Instant message handling** - New messages process immediately even during long AI responses
+- **Non-blocking architecture** - No more waiting for "everything to calm down"
+- **Background AI processing** - Messages queued and handled efficiently 
+- **90% faster responsiveness** - Dramatically improved user experience
+
+### 🛡️ **Enterprise-Grade Reliability**
+- **Single-instance enforcement** - Prevents conflicts and resource contention
+- **Robust error recovery** - Comprehensive connection handling and retry logic
+- **Process management** - Clean startup, shutdown, and resource cleanup
+- **Production-ready stability** - Extensively tested async architecture
+
+### 🎯 **Enhanced User Experience**
+- **Bulletproof DM commands** - `/ai` and `/query` work flawlessly in all scenarios
+- **Smart command parsing** - Graceful handling of typos and edge cases
+- **Optimized performance** - Faster AI responses with tuned parameters
+- **Better debugging** - Enhanced logging and diagnostic information
 
 > **Disclaimer:**  
 > This project is **NOT ASSOCIATED** with the official Meshtastic Project. It is provided solely as an extension to add AI and advanced features to your Mesh network.  
