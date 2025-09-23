@@ -59,7 +59,9 @@ def info_print(*args, **kwargs):
         print(*args, **kwargs)
 
 if DEBUG_ENABLED:
-    print(f"DEBUG: Loaded main config => {config}")
+  cfg = globals().get('config', None)
+  if cfg is not None:
+    print(f"DEBUG: Loaded main config => {cfg}")
 # -----------------------------
 # Verbose Logging Setup
 # -----------------------------
@@ -230,6 +232,7 @@ OPENAI_TIMEOUT = config.get("openai_timeout", 30)
 OLLAMA_URL = config.get("ollama_url", "http://localhost:11434/api/generate")
 OLLAMA_MODEL = config.get("ollama_model", "llama2")
 OLLAMA_TIMEOUT = config.get("ollama_timeout", 60)
+OLLAMA_CONTEXT_CHARS = int(config.get("ollama_context_chars", 4000))
 HOME_ASSISTANT_URL = config.get("home_assistant_url", "")
 HOME_ASSISTANT_TOKEN = config.get("home_assistant_token", "")
 HOME_ASSISTANT_TIMEOUT = config.get("home_assistant_timeout", 30)
@@ -523,23 +526,106 @@ def send_to_openai(user_message):
         print(f"⚠️ OpenAI request failed: {e}")
         return None
 
-def send_to_ollama(user_message):
-    dprint(f"send_to_ollama: user_message='{user_message}'")
+def build_ollama_history(sender_id=None, is_direct=False, channel_idx=None, max_chars=OLLAMA_CONTEXT_CHARS):
+  """Build a short conversation history string for Ollama based on recent messages.
+
+  - For direct messages: include recent direct exchanges between `sender_id` and the AI node.
+  - For channel messages: include recent channel messages for `channel_idx`.
+  Returns a string (possibly empty) truncated to `max_chars` characters.
+  """
+  try:
+    if not messages:
+      return ""
+    # Collect candidate messages in chronological order
+    candidates = []
+    for m in messages:
+      try:
+        if is_direct:
+          # include direct messages that are between the sender and AI (node_id matches sender) or AI responses
+          if m.get('direct') and (m.get('node_id') == sender_id or (m.get('node') and AI_NODE_NAME in m.get('node'))):
+            candidates.append(m)
+        else:
+          # channel messages for this channel
+          if (not m.get('direct')) and (m.get('channel_idx') == channel_idx):
+            candidates.append(m)
+      except Exception:
+        continue
+    if not candidates:
+      return ""
+    # Start from newest and build backwards until we reach max_chars
+    out_lines = []
+    total = 0
+    for m in reversed(candidates):
+      who = None
+      nid = m.get('node_id')
+      if nid is None:
+        who = m.get('node', 'Unknown')
+      else:
+        try:
+          who = get_node_shortname(nid)
+        except Exception:
+          who = str(m.get('node', nid))
+      text = str(m.get('message', ''))
+      line = f"{who}: {text}"
+      # prepend lines so final order is chronological
+      out_lines.insert(0, line)
+      total = sum(len(l) for l in out_lines)
+      if total >= max_chars:
+        break
+    history = "\n".join(out_lines)
+    # Trim to max_chars from the end (keep most recent context)
+    if len(history) > max_chars:
+      history = history[-max_chars:]
+    return history
+  except Exception as e:
+    dprint(f"build_ollama_history error: {e}")
+    return ""
+
+
+def send_to_ollama(user_message, sender_id=None, is_direct=False, channel_idx=None):
+    dprint(f"send_to_ollama: user_message='{user_message}' sender_id={sender_id} is_direct={is_direct} channel={channel_idx}")
     info_print("[Info] Routing user message to Ollama...")
+
     # Normalize text for non-ASCII characters using unidecode
     user_message = unidecode(user_message)
-    combined_prompt = f"{SYSTEM_PROMPT}\n{user_message}"
+
+    # Build optional conversation history
+    history = ""
+    try:
+        if sender_id is not None:
+            history = build_ollama_history(sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx)
+    except Exception as e:
+        dprint(f"Warning: failed building history for Ollama: {e}")
+        history = ""
+
+    # Compose final prompt: system prompt, optional context, then user message
+    if history:
+        combined_prompt = f"{SYSTEM_PROMPT}\nCONTEXT:\n{history}\n\nUSER: {user_message}\nASSISTANT:"
+    else:
+        combined_prompt = f"{SYSTEM_PROMPT}\nUSER: {user_message}\nASSISTANT:"
+    if DEBUG_ENABLED:
+        dprint(f"Ollama combined prompt:\n{combined_prompt}")
+
     payload = {
         "prompt": combined_prompt,
         "model": OLLAMA_MODEL,
         "stream": False  # Added to disable streaming responses
     }
+
     try:
         r = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT)
         if r.status_code == 200:
             jr = r.json()
             dprint(f"Ollama raw => {jr}")
-            return jr.get("response", "🤖 [No response]")[:MAX_RESPONSE_LENGTH]
+            # Ollama may return different fields depending on version; prefer 'response' then 'choices'
+            resp = jr.get("response")
+            if not resp and isinstance(jr.get("choices"), list) and jr.get("choices"):
+                # choices may contain dicts with 'text' or 'content'
+                first = jr.get("choices")[0]
+                resp = first.get('text') or first.get('content') or resp
+            if not resp:
+                resp = "🤖 [No response]"
+            return (resp or "")[:MAX_RESPONSE_LENGTH]
         else:
             print(f"⚠️ Ollama error: {r.status_code} => {r.text}")
             return None
@@ -573,18 +659,20 @@ def send_to_home_assistant(user_message):
         print(f"⚠️ HA request failed: {e}")
         return None
 
-def get_ai_response(prompt):
-    if AI_PROVIDER == "lmstudio":
-        return send_to_lmstudio(prompt)
-    elif AI_PROVIDER == "openai":
-        return send_to_openai(prompt)
-    elif AI_PROVIDER == "ollama":
-        return send_to_ollama(prompt)
-    elif AI_PROVIDER == "home_assistant":
-        return send_to_home_assistant(prompt)
-    else:
-        print(f"⚠️ Unknown AI provider: {AI_PROVIDER}")
-        return None
+def get_ai_response(prompt, sender_id=None, is_direct=False, channel_idx=None):
+  """Get AI response from configured provider. Optional context (sender/is_direct/channel_idx)
+  is forwarded to the provider integration so it can include history/context when available."""
+  if AI_PROVIDER == "lmstudio":
+    return send_to_lmstudio(prompt)
+  elif AI_PROVIDER == "openai":
+    return send_to_openai(prompt)
+  elif AI_PROVIDER == "ollama":
+    return send_to_ollama(prompt, sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx)
+  elif AI_PROVIDER == "home_assistant":
+    return send_to_home_assistant(prompt)
+  else:
+    print(f"⚠️ Unknown AI provider: {AI_PROVIDER}")
+    return None
 
 def send_discord_message(content):
     if not (ENABLE_DISCORD and DISCORD_WEBHOOK_URL):
@@ -680,18 +768,18 @@ def strip_pin(text):
     return text[:idx].strip() + " " + text[idx+8:].strip()
 
 def route_message_text(user_message, channel_idx):
-    if HOME_ASSISTANT_ENABLED and channel_idx == HOME_ASSISTANT_CHANNEL_INDEX:
-        info_print("[Info] Routing to Home Assistant channel.")
-        if HOME_ASSISTANT_ENABLE_PIN:
-            if not pin_is_valid(user_message):
-                return "Security code missing/invalid. Format: 'PIN=XXXX your msg'"
-            user_message = strip_pin(user_message)
-        ha_response = send_to_home_assistant(user_message)
-        return ha_response if ha_response else "🤖 [No response from Home Assistant]"
-    else:
-        info_print(f"[Info] Using default AI provider: {AI_PROVIDER}")
-        resp = get_ai_response(user_message)
-        return resp if resp else "🤖 [No AI response]"
+  if HOME_ASSISTANT_ENABLED and channel_idx == HOME_ASSISTANT_CHANNEL_INDEX:
+    info_print("[Info] Routing to Home Assistant channel.")
+    if HOME_ASSISTANT_ENABLE_PIN:
+      if not pin_is_valid(user_message):
+        return "Security code missing/invalid. Format: 'PIN=XXXX your msg'"
+      user_message = strip_pin(user_message)
+    ha_response = send_to_home_assistant(user_message)
+    return ha_response if ha_response else "🤖 [No response from Home Assistant]"
+  else:
+    info_print(f"[Info] Using default AI provider: {AI_PROVIDER}")
+    resp = get_ai_response(user_message, sender_id=None, is_direct=False, channel_idx=channel_idx)
+    return resp if resp else "🤖 [No AI response]"
 
 # -----------------------------
 # Revised Command Handler (Case-Insensitive)
@@ -779,10 +867,16 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx):
         cmd = text.split()[0]
         resp = handle_command(cmd, text, sender_id)
         return resp
+    # Non-command messages: route to AI for direct messages, or Home Assistant if configured for this channel.
     if is_direct:
-        return get_ai_response(text)
+        # Direct messages go to the AI provider
+        return get_ai_response(text, sender_id=sender_id, is_direct=True, channel_idx=channel_idx)
+
+    # If Home Assistant integration is enabled and this is the HA channel, route there
     if HOME_ASSISTANT_ENABLED and channel_idx == HOME_ASSISTANT_CHANNEL_INDEX:
         return route_message_text(text, channel_idx)
+
+    # Otherwise, no automatic response
     return None
 
 def on_receive(packet=None, interface=None, **kwargs):
@@ -1120,6 +1214,12 @@ def dashboard():
     .settings-toggle.active { background: #222; color: #ffa500; }
     /* Timezone selector */
     #timezoneSelect { margin-left: 10px; }
+    /* Keep settings toggle and panel fixed so they don't move */
+    .settings-toggle { position: fixed; bottom: 16px; left: 16px; z-index: 1100; box-shadow: 0 2px 6px rgba(0,0,0,0.6); }
+    .settings-panel { position: fixed; bottom: 64px; left: 16px; z-index: 1100; width: 360px; max-height: 60vh; overflow:auto; margin: 0; }
+    /* Autostart panel styles */
+    .autostart-panel { position: fixed; bottom: 16px; right: 16px; z-index: 1100; }
+    .autostart-box { display:flex;align-items:center;gap:10px;padding:10px 14px;background:#111;border:2px solid var(--theme-color);border-radius:12px; }
   </style>
 
   <script>
@@ -1291,39 +1391,68 @@ def dashboard():
       document.getElementById('modeLabel').textContent = dm ? 'Direct' : 'Broadcast';
     }
 
-    document.addEventListener("DOMContentLoaded", function() {
-      document.getElementById('modeSwitch').addEventListener('change', function() {
-        toggleMode();
-      });
-      document.getElementById('settingsToggle').addEventListener('click', function() {
+    // Defensive toggle function: ensures the settings panel can be
+    // toggled even if other JS earlier in the page throws an error
+    // and prevents the normal event listeners from being installed.
+    function toggleSettings() {
+      try {
+        console && console.debug && console.debug('toggleSettings called');
         const panel = document.getElementById('settingsPanel');
+        const toggle = document.getElementById('settingsToggle');
+        if (!panel || !toggle) return;
         if (panel.style.display === 'none' || panel.style.display === '') {
           panel.style.display = 'block';
-          this.textContent = "Hide UI Settings";
+          toggle.textContent = "Hide UI Settings";
         } else {
           panel.style.display = 'none';
-          this.textContent = "Show UI Settings";
+          toggle.textContent = "Show UI Settings";
         }
-      });
-      document.getElementById('settingsPanel').style.display = 'none'; // Hide settings panel by default
-      document.getElementById('settingsToggle').textContent = "Show UI Settings";
-      document.getElementById('nodeSearch').addEventListener('input', function() {
-        filterNodes(this.value, false);
-      });
-      document.getElementById('destNodeSearch').addEventListener('input', function() {
-        filterNodes(this.value, true);
-      });
+      } catch (e) { console && console.error && console.error('toggleSettings error', e); }
+    }
+
+    // Expose toggleSettings to the global scope so inline onclick handlers
+    // still work even if other JS errors prevent event bindings below.
+    try { window.toggleSettings = toggleSettings; } catch (e) { console && console.error && console.error('expose toggleSettings failed', e); }
+
+    // Defensive DOM wiring: run after DOMContentLoaded
+    document.addEventListener("DOMContentLoaded", function() {
+      // Defensive bindings: check elements exist before using them so one
+      // missing element doesn't break all other UI wiring.
+      const modeSwitchEl = document.getElementById('modeSwitch');
+      if (modeSwitchEl) modeSwitchEl.addEventListener('change', function() { toggleMode(); });
+
+      const settingsToggleEl = document.getElementById('settingsToggle');
+      const settingsPanelEl = document.getElementById('settingsPanel');
+      if (settingsToggleEl) {
+        settingsToggleEl.addEventListener('click', function() {
+          if (!settingsPanelEl) return;
+          if (settingsPanelEl.style.display === 'none' || settingsPanelEl.style.display === '') {
+            settingsPanelEl.style.display = 'block';
+            settingsToggleEl.textContent = "Hide UI Settings";
+          } else {
+            settingsPanelEl.style.display = 'none';
+            settingsToggleEl.textContent = "Show UI Settings";
+          }
+        });
+      }
+      if (settingsPanelEl) {
+        settingsPanelEl.style.display = 'none'; // Hide settings panel by default
+      }
+      if (settingsToggleEl) settingsToggleEl.textContent = "Show UI Settings";
+
+      const nodeSearchEl = document.getElementById('nodeSearch');
+      if (nodeSearchEl) nodeSearchEl.addEventListener('input', function() { filterNodes(this.value, false); });
+      const destNodeSearchEl = document.getElementById('destNodeSearch');
+      if (destNodeSearchEl) destNodeSearchEl.addEventListener('input', function() { filterNodes(this.value, true); });
 
       // Node sort controls
-      document.getElementById('nodeSortKey').addEventListener('change', function() {
-        setNodeSort(this.value, nodeSortDir);
-      });
-      document.getElementById('nodeSortDir').addEventListener('change', function() {
-        setNodeSort(nodeSortKey, this.value);
-      });
+      const nodeSortKeyEl = document.getElementById('nodeSortKey');
+      const nodeSortDirEl = document.getElementById('nodeSortDir');
+      if (nodeSortKeyEl) nodeSortKeyEl.addEventListener('change', function() { setNodeSort(this.value, nodeSortDir); });
+      if (nodeSortDirEl) nodeSortDirEl.addEventListener('change', function() { setNodeSort(nodeSortKey, this.value); });
 
       // --- UI Settings: Load from localStorage ---
-      loadUISettings();
+      try { loadUISettings(); } catch (e) { console && console.error && console.error('loadUISettings failed', e); }
 
       // Set initial values in settings panel
       document.getElementById('uiColorPicker').value = uiSettings.themeColor;
@@ -2061,7 +2190,26 @@ def dashboard():
     <div id="discordMessagesDiv"></div>
   </div>
 
-  <div class="settings-toggle" id="settingsToggle">Show UI Settings</div>
+    <div class="settings-toggle" id="settingsToggle" onclick="toggleSettings()">Show UI Settings</div>
+    <!-- Fallback toggleSettings: ensures the button works even if main script fails to load -->
+    <script>
+      if (typeof window.toggleSettings !== 'function') {
+        window.toggleSettings = function() {
+          try {
+            var panel = document.getElementById('settingsPanel');
+            var toggle = document.getElementById('settingsToggle');
+            if (!panel || !toggle) return;
+            if (panel.style.display === 'none' || panel.style.display === '') {
+              panel.style.display = 'block';
+              toggle.textContent = 'Hide UI Settings';
+            } else {
+              panel.style.display = 'none';
+              toggle.textContent = 'Show UI Settings';
+            }
+          } catch (e) { console && console.error && console.error('fallback toggleSettings error', e); }
+        };
+      }
+    </script>
   <div class="settings-panel" id="settingsPanel">
     <h2>UI Settings</h2>
     <label for="uiColorPicker">Theme Color:</label>
@@ -2082,10 +2230,102 @@ def dashboard():
     html += """    </select><br><br>
     <button id="applySettingsBtn" type="button">Apply Settings</button>
   </div>
+    </div>
+
+    <!-- Autostart toggle panel (fixed bottom-right) -->
+    <div class="autostart-panel">
+      <div class="autostart-box">
+        <label style="font-weight:bold;color:#fff;margin:0 6px 0 0;">Start MESH-AI on boot</label>
+        <label class="switch" style="margin:0;">
+          <input type="checkbox" id="autostartToggle">
+          <span class="slider round"></span>
+        </label>
+        <button id="saveAutostartBtn" class="btn" style="margin-left:6px;">Save</button>
+      </div>
+    </div>
+
+    <script>
+    // Autostart controls
+      async function loadAutostart() {
+        try {
+          let r = await fetch('/autostart');
+          let j = await r.json();
+          document.getElementById('autostartToggle').checked = !!j.start_on_boot;
+        } catch (e) { console.error(e); }
+      }
+      const saveAutostartBtn = document.getElementById('saveAutostartBtn');
+      const autostartToggleEl = document.getElementById('autostartToggle');
+      if (saveAutostartBtn) {
+        saveAutostartBtn.addEventListener('click', async function() {
+          try {
+            let enabled = autostartToggleEl ? autostartToggleEl.checked : false;
+            let r = await fetch('/autostart/toggle', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({start_on_boot: enabled}) });
+            let j = await r.json();
+            alert('Autostart saved: ' + (j.start_on_boot ? 'Enabled' : 'Disabled'));
+          } catch (e) { alert('Failed to save autostart: ' + e); }
+        });
+      }
+      // Load initial state
+      loadAutostart();
+
+  // Expose defensive toggle to global window in case event binding fails
+  // (already exposed earlier near the toggleSettings definition)
+    </script>
 </body>
 </html>
 """
     return html
+
+
+
+@app.route('/autostart', methods=['GET'])
+def get_autostart():
+    cfg = safe_load_json(CONFIG_FILE, {})
+    return jsonify({'start_on_boot': bool(cfg.get('start_on_boot', False))})
+
+
+@app.route('/autostart/toggle', methods=['POST'])
+def toggle_autostart():
+    data = request.get_json(force=True)
+    desired = bool(data.get('start_on_boot', False))
+    # Update config.json
+    try:
+        cfg = safe_load_json(CONFIG_FILE, {})
+        cfg['start_on_boot'] = desired
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    # Update autostart desktop file
+    try:
+        desktop_path = os.path.expanduser('~/.config/autostart/mesh-ai-autostart.desktop')
+        if os.path.exists(desktop_path):
+            # read and replace X-GNOME-Autostart-enabled
+            with open(desktop_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            out = []
+            found = False
+            for L in lines:
+                if L.strip().startswith('X-GNOME-Autostart-enabled'):
+                    out.append('X-GNOME-Autostart-enabled=' + ('true' if desired else 'false') + '\n')
+                    found = True
+                else:
+                    out.append(L)
+            if not found:
+                out.append('X-GNOME-Autostart-enabled=' + ('true' if desired else 'false') + '\n')
+            with open(desktop_path, 'w', encoding='utf-8') as f:
+                f.writelines(out)
+        else:
+            # create the file
+            desktop_dir = os.path.dirname(desktop_path)
+            os.makedirs(desktop_dir, exist_ok=True)
+            with open(desktop_path, 'w', encoding='utf-8') as f:
+                f.write('[Desktop Entry]\nType=Application\nName=MESH-AI Autostart\nExec=' + os.path.abspath('start_mesh_ai.sh') + '\nX-GNOME-Autostart-enabled=' + ('true' if desired else 'false') + '\n')
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    return jsonify({'start_on_boot': desired})
 @app.route("/ui_send", methods=["POST"])
 def ui_send():
     message = request.form.get("message", "").strip()
@@ -2164,9 +2404,26 @@ def connect_interface():
             return MeshInterface()
 
         # 3️⃣  USB serial --------------------------------------------------
+        # If a serial path is provided, retry opening it with backoff
         if SERIAL_PORT:
+            max_attempts = 10
+            attempt = 0
+            last_exc = None
             print(f"SerialInterface on '{SERIAL_PORT}' (default baud, will switch to {SERIAL_BAUD}) …")
-            iface = meshtastic.serial_interface.SerialInterface(devPath=SERIAL_PORT)
+            while attempt < max_attempts:
+                attempt += 1
+                try:
+                    iface = meshtastic.serial_interface.SerialInterface(devPath=SERIAL_PORT)
+                    break
+                except Exception as e:
+                    last_exc = e
+                    wait = min(5, 1 + attempt)
+                    print(f"⚠️ Attempt {attempt}/{max_attempts} failed to open {SERIAL_PORT}: {e} — retrying in {wait}s")
+                    add_script_log(f"Retry {attempt} failed opening serial {SERIAL_PORT}: {e}")
+                    time.sleep(wait)
+            else:
+                # All attempts failed
+                raise RuntimeError(f"Could not open serial device {SERIAL_PORT}: {last_exc}")
         else:
             print(f"SerialInterface auto‑detect (default baud, will switch to {SERIAL_BAUD}) …")
             iface = meshtastic.serial_interface.SerialInterface()
