@@ -1,0 +1,89 @@
+name: Bug Report
+description: Report a bug or issue with Mesh Memory
+title: "[BUG] "
+labels: ["bug"]
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out the information below to help us resolve the issue.
+
+  - type: input
+    id: version
+    attributes:
+      label: Mesh Memory Version
+      description: What version are you running?
+      placeholder: ex. latest main branch, specific commit hash
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      description: What operating system are you using?
+      options:
+        - Linux (Raspberry Pi)
+        - Linux (Ubuntu/Debian)
+        - Linux (Other)
+        - Windows 10/11
+        - macOS
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: device
+    attributes:
+      label: Meshtastic Device
+      description: What Meshtastic device are you using?
+      placeholder: ex. RAK4631, T-Beam, Heltec, etc.
+    validations:
+      required: true
+
+  - type: textarea
+    id: bug-description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of what the bug is.
+      placeholder: Tell us what happened!
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+      placeholder: Tell us what should have happened
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: Steps to reproduce the behavior
+      placeholder: |
+        1. Start mesh-memory with './start_mesh_ai.sh'
+        2. Send a DM with '/ai hello'
+        3. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs
+      description: Please copy and paste any relevant log output
+      render: shell
+      placeholder: Paste logs from mesh-ai.log or terminal output
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Add any other context about the problem here
+      placeholder: Any additional information that might help
