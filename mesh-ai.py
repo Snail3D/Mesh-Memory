@@ -40,6 +40,12 @@ class _ProtoNoiseFilter(logging.Filter):
     NOISY = (
         "Error while parsing FromRadio",
         "Error parsing message with type 'meshtastic.protobuf.FromRadio'",
+        "DecodeError",
+        "Traceback",
+        "_handleFromRadio",
+        "__reader",
+        "meshtastic/stream_interface.py",
+        "meshtastic/mesh_interface.py",
     )
 
     def filter(self, rec: logging.LogRecord) -> bool:
@@ -54,11 +60,141 @@ for lg in (root_log, meshtastic_log):
 
 def dprint(*args, **kwargs):
     if DEBUG_ENABLED:
-        print(*args, **kwargs)
+        message = ' '.join(str(arg) for arg in args)
+        smooth_print(message)
 
 def info_print(*args, **kwargs):
     if not DEBUG_ENABLED:
-        print(*args, **kwargs)
+        message = ' '.join(str(arg) for arg in args)
+        smooth_print(message)
+
+# Smooth scrolling logging system
+from collections import defaultdict
+
+_log_queue = queue.Queue()
+_log_thread = None
+_log_running = False
+
+def _smooth_log_worker():
+    """Worker thread that prints logs smoothly one at a time"""
+    while _log_running:
+        try:
+            message = _log_queue.get(timeout=1)
+            if message is None:  # Shutdown signal
+                break
+            print(message, flush=True)
+            time.sleep(0.1)  # Small delay for smooth scrolling
+            _log_queue.task_done()
+        except queue.Empty:
+            continue
+
+def start_smooth_logging():
+    """Start the smooth logging system"""
+    global _log_thread, _log_running
+    _log_running = True
+    _log_thread = threading.Thread(target=_smooth_log_worker, daemon=True)
+    _log_thread.start()
+
+def stop_smooth_logging():
+    """Stop the smooth logging system"""
+    global _log_running
+    _log_running = False
+    _log_queue.put(None)  # Shutdown signal
+
+def smooth_print(message):
+    """Add message to smooth printing queue"""
+    if _log_running:
+        _log_queue.put(message)
+    else:
+        print(message, flush=True)
+
+# Rate limiter for preventing log spam  
+_last_message_time = defaultdict(float)
+_message_counts = defaultdict(int)
+_rate_limit_seconds = 2.0  # Don't show same message more than once every 2 seconds
+
+def clean_log(message, emoji="📝", show_always=False, rate_limit=True):
+    """Clean, emoji-enhanced logging for better human readability with rate limiting"""
+    # Rate limiting to reduce jitter
+    if rate_limit and not DEBUG_ENABLED:
+        message_key = f"{emoji}_{message[:50]}"  # Use first 50 chars as key
+        current_time = time.time()
+        
+        if current_time - _last_message_time[message_key] < _rate_limit_seconds:
+            _message_counts[message_key] += 1
+            return  # Skip this message to reduce spam
+        
+        # If we had suppressed messages, show count
+        if _message_counts[message_key] > 0:
+            suppressed_count = _message_counts[message_key]
+            _message_counts[message_key] = 0
+            if suppressed_count > 1:
+                message += f" (suppressed {suppressed_count} similar messages)"
+        
+        _last_message_time[message_key] = current_time
+    
+    if show_always or (not DEBUG_ENABLED and CLEAN_LOGS):
+        smooth_print(f"{emoji} {message}")  # Use smooth printing for better scrolling
+    elif not CLEAN_LOGS and not DEBUG_ENABLED:
+        # Fall back to simple logging without emojis if clean_logs is disabled
+        smooth_print(f"[Info] {message}")
+
+def ai_log(message, provider="AI"):
+    """Specialized logging for AI interactions with provider-specific emojis"""
+    if CLEAN_LOGS:
+        provider_emojis = {
+            "ollama": "🦙",
+            "openai": "🤖", 
+            "lmstudio": "💻",
+            "home_assistant": "🏠"
+        }
+        emoji = provider_emojis.get(provider.lower(), "🤖")
+        clean_log(f"{provider.upper()}: {message}", emoji, show_always=True, rate_limit=False)
+    elif not DEBUG_ENABLED:
+        # Simple logging without emojis if clean_logs is disabled
+        print(f"[{provider.upper()}] {message}")
+
+# Periodic status updates to reduce log noise
+_last_status_time = 0
+_status_interval = 300  # 5 minutes between status updates
+
+def periodic_status_update():
+    """Show periodic status instead of constant chatter"""
+    global _last_status_time
+    current_time = time.time()
+    
+    if current_time - _last_status_time > _status_interval and not DEBUG_ENABLED and CLEAN_LOGS:
+        _last_status_time = current_time
+        clean_log("System running normally...", "💚", show_always=True, rate_limit=False)
+
+# Custom stderr filter to catch protobuf noise
+class FilteredStderr:
+    def __init__(self, original_stderr):
+        self.original_stderr = original_stderr
+        self.noise_patterns = [
+            "google.protobuf.message.DecodeError",
+            "Error parsing message with type 'meshtastic.protobuf.FromRadio'",
+            "Traceback (most recent call last):",
+            "meshtastic/stream_interface.py",
+            "meshtastic/mesh_interface.py", 
+            "_handleFromRadio",
+            "__reader",
+            "fromRadio.ParseFromString",
+        ]
+    
+    def write(self, text):
+        if not DEBUG_ENABLED and CLEAN_LOGS:
+            # Filter out protobuf noise
+            if any(pattern in text for pattern in self.noise_patterns):
+                return  # Don't print noisy protobuf errors
+        
+        self.original_stderr.write(text)
+    
+    def flush(self):
+        self.original_stderr.flush()
+    
+    def __getattr__(self, name):
+        return getattr(self.original_stderr, name)
 
 if DEBUG_ENABLED:
   cfg = globals().get('config', None)
@@ -250,6 +386,7 @@ except FileNotFoundError:
 # AI Provider & Other Config Vars
 # -----------------------------
 DEBUG_ENABLED = bool(config.get("debug", False))
+CLEAN_LOGS = bool(config.get("clean_logs", True))  # Enable emoji-enhanced clean logging by default
 AI_PROVIDER = config.get("ai_provider", "lmstudio").lower()
 SYSTEM_PROMPT = config.get("system_prompt", "You are a helpful assistant responding to mesh network chats.")
 LMSTUDIO_URL = config.get("lmstudio_url", "http://localhost:1234/v1/chat/completions")
@@ -378,7 +515,7 @@ def process_responses_worker():
             # Unpack the task
             text, sender_node, is_direct, ch_idx, thread_root_ts, interface_ref = task
             
-            info_print(f"[AsyncAI] Processing response for: {text[:50]}... (queue: {response_queue.qsize()})")
+            clean_log(f"Processing: {text[:50]}... (queue: {response_queue.qsize()})", "⚡")
             start_time = time.time()
             
             # Generate AI response (this can take a long time)
@@ -387,7 +524,7 @@ def process_responses_worker():
             processing_time = time.time() - start_time
             
             if resp:
-                info_print(f"[AsyncAI] Generated response in {processing_time:.1f}s, preparing to send...")
+                clean_log(f"Generated response in {processing_time:.1f}s, preparing to send...", "✅")
                 
                 # Reduced collision delay for async processing
                 time.sleep(1)
@@ -421,16 +558,16 @@ def process_responses_worker():
                         send_broadcast_chunks(interface_ref, resp, ch_idx)
                         
                 total_time = time.time() - start_time
-                info_print(f"[AsyncAI] Completed response for {sender_node} (total: {total_time:.1f}s)")
+                clean_log(f"Completed response for {sender_node} (total: {total_time:.1f}s)", "🎯")
             else:
-                info_print(f"[AsyncAI] No response generated for {sender_node} ({processing_time:.1f}s)")
+                clean_log(f"No response generated for {sender_node} ({processing_time:.1f}s)", "❌")
                 
             response_queue.task_done()
             
         except queue.Empty:
             continue  # Timeout, check if we should continue
         except Exception as e:
-            info_print(f"[AsyncAI] Error processing response: {e}")
+            clean_log(f"Error processing response: {e}", "⚠️")
             try:
                 response_queue.task_done()
             except ValueError:
@@ -440,7 +577,7 @@ def start_response_worker():
     """Start the background response worker thread."""
     worker_thread = threading.Thread(target=process_responses_worker, daemon=True)
     worker_thread.start()
-    info_print("[AsyncAI] Response worker thread started")
+    clean_log("Response worker thread started", "⚡")
 
 def stop_response_worker():
     """Stop the background response worker thread."""
@@ -636,7 +773,7 @@ def split_message(text):
 
 def send_broadcast_chunks(interface, text, channelIndex):
     dprint(f"send_broadcast_chunks: text='{text}', channelIndex={channelIndex}")
-    info_print(f"[Info] Sending broadcast on channel {channelIndex} → '{text}'")
+    clean_log(f"Broadcasting on Ch{channelIndex}: {text}", "📡")
     if interface is None:
         print("❌ Cannot send broadcast: interface is None.")
         return
@@ -655,11 +792,11 @@ def send_broadcast_chunks(interface, text, channelIndex):
                 reset_event.set()
             break
         else:
-            info_print(f"[Info] Successfully sent chunk {i+1}/{len(chunks)} on ch={channelIndex}.")
+            clean_log(f"Sent chunk {i+1}/{len(chunks)} on Ch{channelIndex}", "📡")
 
 def send_direct_chunks(interface, text, destinationId):
     dprint(f"send_direct_chunks: text='{text}', destId={destinationId}")
-    info_print(f"[Info] Sending direct message to node {destinationId} => '{text}'")
+    clean_log(f"Sending direct to {destinationId}: {text}", "📤")
     if interface is None:
         print("❌ Cannot send direct message: interface is None.")
         return
@@ -681,12 +818,12 @@ def send_direct_chunks(interface, text, destinationId):
                 reset_event.set()
             break
         else:
-            info_print(f"[Info] Direct chunk {i+1}/{len(chunks)} to {destinationId} sent.")
+            clean_log(f"Sent chunk {i+1}/{len(chunks)} to {destinationId}", "📤")
 
 def send_to_lmstudio(user_message: str):
     """Chat/completion request to LM Studio with explicit model name."""
     dprint(f"send_to_lmstudio: user_message='{user_message}'")
-    info_print("[Info] Routing user message to LMStudio…")
+    ai_log("Processing message...", "lmstudio")
     payload = {
         "model": LMSTUDIO_CHAT_MODEL,  # **mandatory when multiple models loaded**
         "messages": [
@@ -705,6 +842,10 @@ def send_to_lmstudio(user_message: str):
                  .get("message", {})
                  .get("content", "🤖 [No response]")
             )
+            # Clean response logging
+            if ai_resp and ai_resp != "🤖 [No response]":
+                clean_resp = ai_resp[:100] + "..." if len(ai_resp) > 100 else ai_resp
+                ai_log(f"Response: {clean_resp}", "lmstudio")
             return ai_resp[:MAX_RESPONSE_LENGTH]
         else:
             print(f"⚠️ LMStudio error: {response.status_code} - {response.text}")
@@ -736,7 +877,7 @@ def lmstudio_embed(text: str):
     return None
 def send_to_openai(user_message):
     dprint(f"send_to_openai: user_message='{user_message}'")
-    info_print("[Info] Routing user message to OpenAI...")
+    ai_log("Processing message...", "openai")
     if not OPENAI_API_KEY:
         print("⚠️ No OpenAI API key provided.")
         return None
@@ -763,6 +904,10 @@ def send_to_openai(user_message):
                   .get("message", {})
                   .get("content", "🤖 [No response]")
             )
+            # Clean response logging
+            if content and content != "🤖 [No response]":
+                clean_resp = content[:100] + "..." if len(content) > 100 else content
+                ai_log(f"Response: {clean_resp}", "openai")
             return content[:MAX_RESPONSE_LENGTH]
         else:
             print(f"⚠️ OpenAI error: {r.status_code} => {r.text}")
@@ -863,7 +1008,7 @@ def build_ollama_history(sender_id=None, is_direct=False, channel_idx=None, thre
 
 def send_to_ollama(user_message, sender_id=None, is_direct=False, channel_idx=None, thread_root_ts=None):
     dprint(f"send_to_ollama: user_message='{user_message}' sender_id={sender_id} is_direct={is_direct} channel={channel_idx}")
-    info_print("[Info] Routing user message to Ollama...")
+    ai_log("Processing message...", "ollama")
 
     # Normalize text for non-ASCII characters using unidecode
     user_message = unidecode(user_message)
@@ -884,6 +1029,10 @@ def send_to_ollama(user_message, sender_id=None, is_direct=False, channel_idx=No
         combined_prompt = f"{SYSTEM_PROMPT}\nUSER: {user_message}\nASSISTANT:"
     if DEBUG_ENABLED:
         dprint(f"Ollama combined prompt:\n{combined_prompt}")
+    else:
+        # Show simplified prompt info in clean mode
+        prompt_preview = user_message[:50] + "..." if len(user_message) > 50 else user_message
+        clean_log(f"Prompt: {prompt_preview}", "💭")
 
     payload = {
         "prompt": combined_prompt,
@@ -907,8 +1056,13 @@ def send_to_ollama(user_message, sender_id=None, is_direct=False, channel_idx=No
         if r.status_code == 200:
             jr = r.json()
             dprint(f"Ollama raw => {jr}")
-            # Ollama may return different fields depending on version; prefer 'response' then 'choices'
+            # Extract clean response for logging
             resp = jr.get("response")
+            if resp:
+                # Show clean response instead of technical details
+                clean_resp = resp[:100] + "..." if len(resp) > 100 else resp
+                ai_log(f"Response: {clean_resp}", "ollama")
+            # Ollama may return different fields depending on version; prefer 'response' then 'choices'
             if not resp and isinstance(jr.get("choices"), list) and jr.get("choices"):
                 # choices may contain dicts with 'text' or 'content'
                 first = jr.get("choices")[0]
@@ -925,7 +1079,7 @@ def send_to_ollama(user_message, sender_id=None, is_direct=False, channel_idx=No
 
 def send_to_home_assistant(user_message):
     dprint(f"send_to_home_assistant: user_message='{user_message}'")
-    info_print("[Info] Routing user message to Home Assistant...")
+    ai_log("Processing message...", "home_assistant")
     if not HOME_ASSISTANT_URL:
         return None
     headers = {"Content-Type": "application/json"}
@@ -940,6 +1094,9 @@ def send_to_home_assistant(user_message):
             speech = data.get("response", {}).get("speech", {})
             answer = speech.get("plain", {}).get("speech")
             if answer:
+                # Clean response logging
+                clean_resp = answer[:100] + "..." if len(answer) > 100 else answer
+                ai_log(f"Response: {clean_resp}", "home_assistant")
                 return answer[:MAX_RESPONSE_LENGTH]
             return "🤖 [No response from Home Assistant]"
         else:
@@ -1220,7 +1377,8 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
 def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=None, check_only=False):
   dprint(f"parse_incoming_text => text='{text}' is_direct={is_direct} channel={channel_idx} check_only={check_only}")
   if not check_only:
-    info_print(f"[Info] Received from node {sender_id} (direct={is_direct}, ch={channel_idx}) => '{text}'")
+    channel_type = "DM" if is_direct else f"Ch{channel_idx}"
+    clean_log(f"Message from {sender_id} ({channel_type}): {text}", "📨")
   text = text.strip()
   if not text:
     return None if not check_only else False
@@ -1502,23 +1660,116 @@ def logs():
 
     html = f"""<html>
   <head>
-    <meta http-equiv="refresh" content="1">
-    <title>MESH-AI Logs</title>
+    <title>MESH-AI Logs - Smooth Scrolling</title>
     <style>
-      body {{ background:#000; color:#fff; font-family:monospace; padding:20px; }}
-      pre {{ white-space: pre-wrap; word-break: break-word; }}
+      body {{ 
+        background:#000; 
+        color:#fff; 
+        font-family:monospace; 
+        padding:20px; 
+        margin:0;
+        overflow-x:hidden;
+      }}
+      pre {{ 
+        white-space: pre-wrap; 
+        word-break: break-word; 
+        margin:0;
+        padding-bottom:100px;
+      }}
+      .header {{
+        position:fixed;
+        top:0;
+        left:0;
+        right:0;
+        background:#000;
+        padding:10px 20px;
+        border-bottom:1px solid #333;
+        z-index:1000;
+      }}
+      .content {{
+        margin-top:80px;
+      }}
+      .scroll-indicator {{
+        position:fixed;
+        bottom:20px;
+        right:20px;
+        background:#333;
+        color:#fff;
+        padding:5px 10px;
+        border-radius:5px;
+        font-size:12px;
+      }}
     </style>
   </head>
   <body>
-    <h1>Script Logs</h1>
-    <div><strong>Uptime:</strong> {uptime_str}</div>
-    <div><strong>Restarts:</strong> {restart_count}</div>
-    <pre id="logbox">{log_text}</pre>
+    <div class="header">
+      <h1>🌊 MESH-AI Logs - Smooth Stream</h1>
+      <div><strong>Uptime:</strong> {uptime_str} | <strong>Restarts:</strong> {restart_count}</div>
+    </div>
+    <div class="content">
+      <pre id="logbox">{log_text}</pre>
+    </div>
+    <div class="scroll-indicator" id="scrollStatus">🟢 Auto-scroll ON</div>
     <script>
-      // once the page renders, scroll to the bottom
-      document.addEventListener("DOMContentLoaded", () => {{
-        window.scrollTo(0, document.body.scrollHeight);
+      let autoScroll = true;
+      let isUserScrolling = false;
+      let scrollTimeout;
+      const logbox = document.getElementById('logbox');
+      const scrollStatus = document.getElementById('scrollStatus');
+      
+      // Smooth auto-scroll function
+      function smoothScrollToBottom() {{
+        if (autoScroll && !isUserScrolling) {{
+          window.scrollTo({{
+            top: document.body.scrollHeight,
+            behavior: 'smooth'
+          }});
+        }}
+      }}
+      
+      // Detect user scrolling
+      window.addEventListener('scroll', () => {{
+        isUserScrolling = true;
+        clearTimeout(scrollTimeout);
+        
+        // Check if user scrolled to bottom
+        const isAtBottom = window.innerHeight + window.scrollY >= document.body.scrollHeight - 10;
+        
+        if (isAtBottom) {{
+          autoScroll = true;
+          scrollStatus.innerHTML = '🟢 Auto-scroll ON';
+          scrollStatus.style.background = '#333';
+        }} else {{
+          autoScroll = false;
+          scrollStatus.innerHTML = '🔴 Auto-scroll OFF (scroll to bottom to enable)';
+          scrollStatus.style.background = '#660000';
+        }}
+        
+        // Resume auto-scroll detection after user stops scrolling
+        scrollTimeout = setTimeout(() => {{
+          isUserScrolling = false;
+        }}, 1000);
       }});
+      
+      // SSE for real-time log updates
+      const eventSource = new EventSource('/logs_stream');
+      eventSource.onmessage = function(event) {{
+        logbox.textContent += event.data + '\\n';
+        smoothScrollToBottom();
+      }};
+      
+      // Initial scroll to bottom
+      document.addEventListener("DOMContentLoaded", () => {{
+        smoothScrollToBottom();
+      }});
+      
+      // Handle connection errors
+      eventSource.onerror = function(event) {{
+        console.log('SSE connection error, retrying...');
+        setTimeout(() => {{
+          location.reload();
+        }}, 5000);
+      }};
     </script>
   </body>
 </html>"""
@@ -2968,7 +3219,7 @@ def main():
     server_start_time = server_start_time or datetime.now(timezone.utc)
     restart_count += 1
     add_script_log(f"Server restarted. Restart count: {restart_count}")
-    print("Starting MESH-AI server...")
+    clean_log("Starting MESH-AI server...", "🚀", show_always=True)
     load_archive()
     
     # Start the async response worker
@@ -3008,7 +3259,7 @@ def main():
         except Exception:
             flask_port = 5000
 
-    print(f"Launching Flask in the background on port {flask_port}...")
+    clean_log(f"Launching Flask web interface on port {flask_port}...", "🌐", show_always=True)
     api_thread = threading.Thread(
         target=app.run,
         kwargs={"host": "0.0.0.0", "port": flask_port, "debug": False},
@@ -3022,7 +3273,7 @@ def main():
     while True:
         try:
             print("---------------------------------------------------")
-            print("Attempting to connect to Meshtastic device...")
+            clean_log("Connecting to Meshtastic device...", "🔗", show_always=True, rate_limit=True)
             try:
                 pub.unsubscribe(on_receive, "meshtastic.receive")
             except Exception:
@@ -3036,12 +3287,12 @@ def main():
             print("Subscribing to on_receive callback...")
             # Only subscribe to the main topic to avoid duplicate callbacks
             pub.subscribe(on_receive, "meshtastic.receive")
-            print(f"AI provider set to: {AI_PROVIDER}")
+            clean_log(f"AI provider: {AI_PROVIDER}", "🧠", show_always=True)
             if HOME_ASSISTANT_ENABLED:
                 print(f"Home Assistant multi-mode is ENABLED. Channel index: {HOME_ASSISTANT_CHANNEL_INDEX}")
                 if HOME_ASSISTANT_ENABLE_PIN:
                     print("Home Assistant secure PIN protection is ENABLED.")
-            print("Connection successful. Running until error or Ctrl+C.")
+            clean_log("Connection successful! Running until error or Ctrl+C.", "🟢", show_always=True, rate_limit=True)
             add_script_log("Connection established successfully.")
             # Inner loop: periodically check if a reset has been signaled
             while not reset_event.is_set():
@@ -3054,7 +3305,7 @@ def main():
         except OSError as e:
             error_code = getattr(e, 'errno', None) or getattr(e, 'winerror', None)
             if error_code in (10053, 10054, 10060):
-                print("⚠️ Connection was forcibly closed. Attempting to reconnect...")
+                clean_log("Connection lost! Attempting to reconnect...", "🔄", show_always=True)
                 add_script_log(f"Connection forcibly closed: {e} (error code: {error_code})")
                 time.sleep(5)
                 reset_event.clear()
@@ -3125,12 +3376,21 @@ def poll_discord_channel():
         time.sleep(10)
 
 if __name__ == "__main__":
+    # Start smooth logging system for pleasant scrolling
+    start_smooth_logging()
+    
+    # Install stderr filter to reduce protobuf noise jitter
+    if not DEBUG_ENABLED and CLEAN_LOGS:
+        sys.stderr = FilteredStderr(sys.stderr)
+        clean_log("Enabled clean logging mode with smooth scrolling", "🌊", show_always=True, rate_limit=False)
+    
     while True:
         try:
             main()
         except KeyboardInterrupt:
             print("User interrupted the script. Exiting.")
             stop_response_worker()  # Clean shutdown of worker thread
+            stop_smooth_logging()   # Clean shutdown of smooth logging
             add_script_log("Server exited via KeyboardInterrupt.")
             break
         except Exception as e:

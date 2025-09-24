@@ -1,5 +1,6 @@
 {
-  "debug": true,
+  "debug": false,
+  "clean_logs": true,
   "use_mesh_interface": false,
   "use_wifi": false,
   "wifi_host": "MESHTASTIC NODE IP HERE",
