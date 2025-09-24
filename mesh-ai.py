@@ -474,9 +474,11 @@ ALERT_EMAIL_TO = config.get("alert_email_to", None)
 
 SERIAL_PORT = config.get("serial_port", "")
 try:
-    SERIAL_BAUD = int(config.get("serial_baud", 921600))  # ← NEW ● default 921600
+    # SERIAL_BAUD = int(config.get("serial_baud", 921600))  # ← COMMENTED OUT - fast baud causing issues
+    SERIAL_BAUD = int(config.get("serial_baud", 115200))  # ← NEW ● default 115200 (slower for stability)
 except (ValueError, TypeError):
-    SERIAL_BAUD = 921600
+    # SERIAL_BAUD = 921600  # ← COMMENTED OUT - fast baud causing issues  
+    SERIAL_BAUD = 115200  # ← NEW ● default 115200 (slower for stability)
 USE_WIFI = bool(config.get("use_wifi", False))
 WIFI_HOST = config.get("wifi_host", None)
 try:
