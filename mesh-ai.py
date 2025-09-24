@@ -683,16 +683,29 @@ def send_direct_chunks(interface, text, destinationId):
         else:
             info_print(f"[Info] Direct chunk {i+1}/{len(chunks)} to {destinationId} sent.")
 
-def send_to_lmstudio(user_message: str):
+def send_to_lmstudio(user_message: str, sender_id=None, is_direct=False, channel_idx=None, thread_root_ts=None):
     """Chat/completion request to LM Studio with explicit model name."""
     dprint(f"send_to_lmstudio: user_message='{user_message}'")
     info_print("[Info] Routing user message to LMStudio…")
+    
+    # Build conversation history
+    history_messages = []
+    try:
+        if sender_id is not None:
+            history_messages = build_chat_history(sender_id=sender_id, is_direct=is_direct, 
+                                                channel_idx=channel_idx, thread_root_ts=thread_root_ts)
+    except Exception as e:
+        dprint(f"Warning: failed building history for LMStudio: {e}")
+        history_messages = []
+    
+    # Build messages array: system prompt + history + current message
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(history_messages)
+    messages.append({"role": "user", "content": user_message})
+    
     payload = {
         "model": LMSTUDIO_CHAT_MODEL,  # **mandatory when multiple models loaded**
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": user_message},
-        ],
+        "messages": messages,
         "max_tokens": MAX_RESPONSE_LENGTH,
     }
     try:
@@ -735,9 +748,25 @@ def lmstudio_embed(text: str):
     except Exception as exc:
         dprint(f"LMStudio embed exception: {exc}")
     return None
-def send_to_openai(user_message):
-    dprint(f"send_to_openai: user_message='{user_message}'")
+def send_to_openai(user_message, sender_id=None, is_direct=False, channel_idx=None, thread_root_ts=None):
+    dprint(f"send_to_openai: user_message='{user_message}' sender_id={sender_id} is_direct={is_direct}")
     info_print("[Info] Routing user message to OpenAI...")
+    
+    # Build conversation history
+    history_messages = []
+    try:
+        if sender_id is not None:
+            history_messages = build_chat_history(sender_id=sender_id, is_direct=is_direct, 
+                                                channel_idx=channel_idx, thread_root_ts=thread_root_ts)
+    except Exception as e:
+        dprint(f"Warning: failed building history for OpenAI: {e}")
+        history_messages = []
+    
+    # Build messages array: system prompt + history + current message
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(history_messages)
+    messages.append({"role": "user", "content": user_message})
+    
     if not OPENAI_API_KEY:
         print("⚠️ No OpenAI API key provided.")
         return None
@@ -748,10 +777,7 @@ def send_to_openai(user_message):
     }
     payload = {
         "model": OPENAI_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message}
-        ],
+        "messages": messages,
         "max_tokens": MAX_RESPONSE_LENGTH
     }
     try:
@@ -862,6 +888,86 @@ def build_ollama_history(sender_id=None, is_direct=False, channel_idx=None, thre
     dprint(f"build_ollama_history error: {e}")
     return ""
 
+def build_chat_history(sender_id=None, is_direct=False, channel_idx=None, thread_root_ts=None, max_messages=20):
+  """Build conversation history in chat completion format for OpenAI/LMStudio APIs.
+  
+  Returns a list of message objects in the format:
+  [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}, ...]
+  """
+  try:
+    with messages_lock:
+        snapshot = list(messages)
+    if not snapshot:
+      return []
+      
+    candidates = []
+    cutoff_time = time.time() - (3600 * 2)  # Last 2 hours
+    
+    if is_direct:
+      # DM History: Collect exchanges between the sender and the AI
+      for m in reversed(snapshot):
+        try:
+          if m.get('timestamp', 0) < cutoff_time:
+            break
+          if m.get('direct'):
+            if same_node_id(m.get('node_id'), sender_id) or m.get('is_ai'):
+              candidates.append(m)
+        except Exception:
+          continue
+    else:
+      # Channel History: Use thread_root_ts if available
+      if thread_root_ts:
+        for m in snapshot:
+          try:
+            if (m.get('direct') is False and m.get('channel_idx') == channel_idx):
+              if m.get('reply_to') == thread_root_ts or m.get('timestamp') == thread_root_ts:
+                candidates.append(m)
+          except Exception:
+            continue
+      else:
+        for m in reversed(snapshot):
+          try:
+            if m.get('timestamp', 0) < cutoff_time:
+              break
+            if not m.get('direct') and m.get('channel_idx') == channel_idx:
+              candidates.append(m)
+          except Exception:
+            continue
+    
+    if not candidates:
+      return []
+    
+    # Limit and sort chronologically
+    candidates = candidates[:max_messages]
+    candidates.sort(key=lambda x: x.get('timestamp', ''))
+    
+    # Convert to chat completion format
+    chat_messages = []
+    for m in candidates:
+      try:
+        content = str(m.get('message', ''))
+        if not content:
+          continue
+          
+        if m.get('is_ai'):
+          chat_messages.append({"role": "assistant", "content": content})
+        else:
+          # Human message - add context about who sent it if not direct
+          if is_direct:
+            chat_messages.append({"role": "user", "content": content})
+          else:
+            sender_name = get_node_shortname(m.get('node_id')) if m.get('node_id') else m.get('node', 'User')
+            contextual_content = f"{sender_name}: {content}"
+            chat_messages.append({"role": "user", "content": contextual_content})
+      except Exception:
+        continue
+    
+    return chat_messages
+    
+  except Exception as e:
+    dprint(f"build_chat_history error: {e}")
+    return []
+
 
 def send_to_ollama(user_message, sender_id=None, is_direct=False, channel_idx=None, thread_root_ts=None):
     dprint(f"send_to_ollama: user_message='{user_message}' sender_id={sender_id} is_direct={is_direct} channel={channel_idx}")
@@ -957,9 +1063,9 @@ def get_ai_response(prompt, sender_id=None, is_direct=False, channel_idx=None, t
   """Get AI response from configured provider. Optional context (sender/is_direct/channel_idx)
   is forwarded to the provider integration so it can include history/context when available."""
   if AI_PROVIDER == "lmstudio":
-    return send_to_lmstudio(prompt)
+    return send_to_lmstudio(prompt, sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx, thread_root_ts=thread_root_ts)
   elif AI_PROVIDER == "openai":
-    return send_to_openai(prompt)
+    return send_to_openai(prompt, sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx, thread_root_ts=thread_root_ts)
   elif AI_PROVIDER == "ollama":
     return send_to_ollama(prompt, sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx, thread_root_ts=thread_root_ts)
   elif AI_PROVIDER == "home_assistant":
