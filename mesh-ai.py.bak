@@ -1,0 +1,3286 @@
+import sys
+import os
+import json
+import time
+import threading
+import logging
+import fcntl
+import socket
+import re
+import traceback
+import shutil
+import subprocess
+from datetime import datetime, timezone, timedelta
+import meshtastic
+import meshtastic.serial_interface
+from queue import Queue, Empty
+try:
+  from flask import Flask, jsonify, request, Response, stream_with_context, redirect, url_for
+except Exception:
+  # If Flask is not available at import time, fail later when attempting to use the web UI
+  Flask = None
+  jsonify = None
+  request = None
+  Response = None
+  stream_with_context = None
+  redirect = None
+  url_for = None
+try:
+  import requests
+except Exception:
+  requests = None
+
+# Monkey-patch meshtastic internals to suppress noisy google.protobuf DecodeError
+# which currently prints long stack traces from the library reader thread.
+try:
+  import google.protobuf.message as _pb_msg
+  try:
+    _orig_handle = getattr(meshtastic.mesh_interface.MeshInterface, '_handleFromRadio', None)
+    if _orig_handle:
+      def _safe_handle_from_radio(self, fromRadioBytes):
+        try:
+          return _orig_handle(self, fromRadioBytes)
+        except _pb_msg.DecodeError:
+          # suppressed noisy parse error from meshtastic stream
+          logging.getLogger('meshtastic').debug('Suppressed meshtastic protobuf.DecodeError while parsing radio frame')
+          return None
+      setattr(meshtastic.mesh_interface.MeshInterface, '_handleFromRadio', _safe_handle_from_radio)
+  except Exception:
+    pass
+except Exception:
+  # protobuf not installed or other import error - nothing to patch
+  pass
+
+try:
+  from unidecode import unidecode
+except Exception:
+  # fallback no-op
+  def unidecode(x):
+    return x
+
+# (removed misplaced duplicate archive/script-log handling that caused indentation errors)
+# Redirect stdout and stderr to our log while still printing to terminal.
+class StreamToLogger(object):
+  def __init__(self, logger_func):
+    self.logger_func = logger_func
+    self.terminal = sys.__stdout__
+    # reuse noise patterns from the Proto filter
+    self.noise_patterns = _ProtoNoiseFilter.NOISY if '_ProtoNoiseFilter' in globals() else []
+
+  def write(self, buf):
+    # still print everything to the terminal
+    try:
+      self.terminal.write(buf)
+    except Exception:
+      pass
+    try:
+      text = buf.strip()
+    except Exception:
+      return
+    if not text:
+      return
+
+    # only log to script_logs if not noisy, or if debug is on
+    debug_enabled = globals().get('DEBUG_ENABLED', False)
+    try:
+      noisy = False
+      for p in self.noise_patterns:
+        try:
+          if p in text:
+            noisy = True
+            break
+        except Exception:
+          continue
+    except Exception:
+      noisy = False
+    if debug_enabled or not noisy:
+      try:
+        self.logger_func(text)
+      except Exception:
+        # best effort - don't crash logging
+        pass
+
+  def flush(self):
+    try:
+      self.terminal.flush()
+    except Exception:
+      pass
+
+# Add a logging filter to suppress noisy protobuf DecodeError parse messages
+class _ProtoDecodeFilter(logging.Filter):
+  def filter(self, record):
+    try:
+      msg = record.getMessage()
+    except Exception:
+      try:
+        msg = str(record.msg)
+      except Exception:
+        return True
+    if not msg:
+      return True
+    # Drop known noisy parse errors from meshtastic/protobuf
+    if "Error parsing message with type 'meshtastic.protobuf.FromRadio'" in msg:
+      return False
+    if 'protobuf.DecodeError' in msg or 'DecodeError' in msg:
+      return False
+    return True
+
+# Attach the filter globally to reduce log spam (best-effort)
+try:
+  logging.getLogger().addFilter(_ProtoDecodeFilter())
+  try:
+    logging.getLogger('meshtastic').setLevel(logging.WARNING)
+  except Exception:
+    pass
+except Exception:
+  pass
+
+# Defer stdout/stderr redirection until after config (and DEBUG_ENABLED) is loaded
+# sys.stdout = StreamToLogger(add_script_log)
+# sys.stderr = StreamToLogger(add_script_log)
+# -----------------------------
+# Global Connection & Reset Status
+# -----------------------------
+connection_status = "Disconnected"
+last_error_message = ""
+reset_event = threading.Event()  # Global event to signal a fatal error and trigger reconnect
+restart_count = 0
+server_start_time = None
+PIDFILE = "mesh-ai.pid"
+pidfile_fd = None
+
+# Single-instance guard using POSIX flock on a pidfile (prevents race conditions)
+def ensure_single_instance():
+  global pidfile_fd
+  try:
+    pidfile_fd = open(PIDFILE, "w+")
+    try:
+      fcntl.flock(pidfile_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+      # Another process has the lock
+      try:
+        pidfile_fd.seek(0)
+        existing = pidfile_fd.read().strip()
+      except Exception:
+        existing = ""
+      if existing:
+        print(f"Another mesh-ai instance appears to be running (PID {existing}). Exiting.")
+      else:
+        print("Another mesh-ai instance appears to be running. Exiting.")
+      sys.exit(1)
+    # Write our pid
+    try:
+      pidfile_fd.truncate(0)
+      pidfile_fd.write(str(os.getpid()))
+      pidfile_fd.flush()
+      os.fsync(pidfile_fd.fileno())
+    except Exception:
+      pass
+  except Exception:
+    # best-effort only
+    pass
+
+def remove_pidfile():
+  global pidfile_fd
+  try:
+    if pidfile_fd:
+      try:
+        fcntl.flock(pidfile_fd.fileno(), fcntl.LOCK_UN)
+      except Exception:
+        pass
+      try:
+        pidfile_fd.close()
+      except Exception:
+        pass
+    if os.path.exists(PIDFILE):
+      try:
+        os.remove(PIDFILE)
+      except Exception:
+        pass
+  except Exception:
+    pass
+
+# Simple Server-Sent Events (SSE) broadcaster for dashboard clients
+# Each connected client gets a Queue() and the server pushes new-message events
+sse_clients = []  # list of Queue()
+sse_clients_lock = threading.Lock()
+
+def broadcast_sse(payload: dict):
+  """Push a payload (will be JSON-serialized) to all connected SSE clients."""
+  dead = []
+  with sse_clients_lock:
+    for q in list(sse_clients):
+      try:
+        q.put(payload, block=False)
+      except Exception:
+        # mark for removal
+        dead.append(q)
+    for d in dead:
+      try:
+        sse_clients.remove(d)
+      except Exception:
+        pass
+  # Optionally play a local chime on the host machine when a new message arrives
+  try:
+    if isinstance(payload, dict) and payload.get('type') == 'message':
+      def _play():
+        # Try common sound players
+        for cmd in ("paplay", "aplay", "play"):
+          path = shutil.which(cmd)
+          if path:
+            try:
+              # try to play a short system beep or bundled sound if available
+              # Many systems have a default message sound at freedesktop path
+              candidate = "/usr/share/sounds/freedesktop/stereo/message.oga"
+              if os.path.exists(candidate):
+                subprocess.Popen([path, candidate], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+              # fallback to invoking player without file (some support generating tone) - best-effort
+              # avoid blocking; don't pass unknown args
+              subprocess.Popen([path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              return
+            except Exception:
+              continue
+      threading.Thread(target=_play, daemon=True).start()
+  except Exception:
+    pass
+
+# -----------------------------
+# Meshtastic and Flask Setup
+# -----------------------------
+try:
+    from meshtastic.tcp_interface import TCPInterface
+except ImportError:
+    TCPInterface = None
+
+try:
+    from meshtastic.mesh_interface import MeshInterface
+    MESH_INTERFACE_AVAILABLE = True
+except ImportError:
+    MESH_INTERFACE_AVAILABLE = False
+
+# pubsub (used by meshtastic callbacks). Provide a noop fallback when not installed
+try:
+  from pubsub import pub
+except Exception:
+  class _NoopPub:
+    def subscribe(self, *a, **k):
+      return None
+    def unsubscribe(self, *a, **k):
+      return None
+  pub = _NoopPub()
+
+log = logging.getLogger('werkzeug')
+log.disabled = True
+
+# Suppress noisy protobuf DecodeError messages coming from meshtastic internals
+class _ProtoDecodeFilter(logging.Filter):
+  def filter(self, record):
+    try:
+      msg = record.getMessage()
+      if 'DecodeError' in msg or "Error parsing message with type 'meshtastic.protobuf.FromRadio'" in msg or 'Error while parsing FromRadio bytes' in msg:
+        # suppress these noisy parse errors
+        return False
+    except Exception:
+      pass
+    return True
+
+# Attach filter to root logger and meshtastic logger
+root_logger = logging.getLogger()
+root_logger.addFilter(_ProtoDecodeFilter())
+logging.getLogger('meshtastic').setLevel(logging.WARNING)
+
+BANNER = (
+    "\033[38;5;214m"
+    """
+███╗   ███╗███████╗███████╗██╗  ██╗             █████╗ ██╗
+████╗ ████║██╔════╝██╔════╝██║  ██║            ██╔══██╗██║
+██╔████╔██║█████╗  ███████╗███████║  █████╗    ███████║██║
+██║╚██╔╝██║██╔══╝  ╚════██║██╔══██║  ╚════╝    ██╔══██║██║
+██║ ╚═╝ ██║███████╗███████║██║  ██║            ██║  ██║██║
+╚═╝     ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝            ╚═╝  ╚═╝╚═╝
+
+MESH-AI BETA v0.5.1 by: MR_TBOT (https://mr-tbot.com)
+https://mesh-ai.dev - (https://github.com/mr-tbot/mesh-ai/)
+    \033[32m 
+Messaging Dashboard Access: http://localhost:5000/dashboard \033[38;5;214m
+"""
+    "\033[0m"
+    "\033[31m"
+    """
+DISCLAIMER: This is beta software - NOT ASSOCIATED with the official Meshtastic (https://meshtastic.org/) project.
+It should not be relied upon for mission critical tasks or emergencies.
+Modification of this code for nefarious purposes is strictly frowned upon. Please use responsibly.
+
+(Use at your own risk. For feedback or issues, visit https://mesh-ai.dev or the links above.)
+"""
+    "\033[0m"
+)
+print(BANNER)
+add_script_log("Script started.")
+
+# -----------------------------
+# Load Config Files
+# -----------------------------
+CONFIG_FILE = "config.json"
+COMMANDS_CONFIG_FILE = "commands_config.json"
+MOTD_FILE = "motd.json"
+LOG_FILE = "messages.log"
+ARCHIVE_FILE = "messages_archive.json"
+
+print("Loading config files...")
+
+def safe_load_json(path, default_value):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print(f"⚠️ {path} not found. Using defaults.")
+    except Exception as e:
+        print(f"⚠️ Could not load {path}: {e}")
+    return default_value
+
+config = safe_load_json(CONFIG_FILE, {})
+commands_config = safe_load_json(COMMANDS_CONFIG_FILE, {"commands": []})
+try:
+    with open(MOTD_FILE, "r", encoding="utf-8") as f:
+        motd_content = f.read()
+except FileNotFoundError:
+    print(f"⚠️ {MOTD_FILE} not found.")
+    motd_content = "No MOTD available."
+
+
+
+# -----------------------------
+# AI Provider & Other Config Vars
+# -----------------------------
+DEBUG_ENABLED = bool(config.get("debug", False))
+AI_PROVIDER = config.get("ai_provider", "lmstudio").lower()
+SYSTEM_PROMPT = config.get("system_prompt", "You are a helpful assistant responding to mesh network chats.")
+LMSTUDIO_URL = config.get("lmstudio_url", "http://localhost:1234/v1/chat/completions")
+LMSTUDIO_TIMEOUT = config.get("lmstudio_timeout", 60)
+LMSTUDIO_CHAT_MODEL = config.get(
+    "lmstudio_chat_model",
+    "llama-3.2-1b-instruct-uncensored",
+)
+LMSTUDIO_EMBEDDING_MODEL = config.get(
+    "lmstudio_embedding_model",
+    "text-embedding-nomic-embed-text-v1.5",	
+)	
+OPENAI_API_KEY = config.get("openai_api_key", "")
+OPENAI_MODEL = config.get("openai_model", "gpt-3.5-turbo")
+OPENAI_TIMEOUT = config.get("openai_timeout", 30)
+OLLAMA_URL = config.get("ollama_url", "http://localhost:11434/api/generate")
+OLLAMA_MODEL = config.get("ollama_model", "llama2")
+OLLAMA_TIMEOUT = config.get("ollama_timeout", 60)
+OLLAMA_CONTEXT_CHARS = int(config.get("ollama_context_chars", 4000))
+HOME_ASSISTANT_URL = config.get("home_assistant_url", "")
+HOME_ASSISTANT_TOKEN = config.get("home_assistant_token", "")
+HOME_ASSISTANT_TIMEOUT = config.get("home_assistant_timeout", 30)
+HOME_ASSISTANT_ENABLE_PIN = bool(config.get("home_assistant_enable_pin", False))
+HOME_ASSISTANT_SECURE_PIN = str(config.get("home_assistant_secure_pin", "1234"))
+HOME_ASSISTANT_ENABLED = bool(config.get("home_assistant_enabled", False))
+HOME_ASSISTANT_CHANNEL_INDEX = int(config.get("home_assistant_channel_index", -1))
+MAX_CHUNK_SIZE = config.get("chunk_size", 200)
+MAX_CHUNKS = 5
+CHUNK_DELAY = config.get("chunk_delay", 10)
+MAX_RESPONSE_LENGTH = MAX_CHUNK_SIZE * MAX_CHUNKS
+LOCAL_LOCATION_STRING = config.get("local_location_string", "Unknown Location")
+
+# Redirect stdout and stderr to our script logger now that DEBUG_ENABLED and add_script_log exist
+try:
+  sys.stdout = StreamToLogger(add_script_log)
+  sys.stderr = StreamToLogger(add_script_log)
+except Exception:
+  # best-effort - if redirection fails, continue without it
+  pass
+AI_NODE_NAME = config.get("ai_node_name", "AI-Bot")
+FORCE_NODE_NUM = config.get("force_node_num", None)
+
+ENABLE_DISCORD = config.get("enable_discord", False)
+DISCORD_WEBHOOK_URL = config.get("discord_webhook_url", None)
+DISCORD_SEND_EMERGENCY = config.get("discord_send_emergency", False)
+DISCORD_SEND_AI = config.get("discord_send_ai", False)
+DISCORD_SEND_ALL = config.get("discord_send_all", False)
+DISCORD_RESPONSE_CHANNEL_INDEX = config.get("discord_response_channel_index", None)
+DISCORD_RECEIVE_ENABLED = config.get("discord_receive_enabled", True)
+# New variable for inbound routing
+DISCORD_INBOUND_CHANNEL_INDEX = config.get("discord_inbound_channel_index", None)
+if DISCORD_INBOUND_CHANNEL_INDEX is not None:
+    DISCORD_INBOUND_CHANNEL_INDEX = int(DISCORD_INBOUND_CHANNEL_INDEX)
+# For polling Discord messages (optional)
+DISCORD_BOT_TOKEN = config.get("discord_bot_token", None)
+DISCORD_CHANNEL_ID = config.get("discord_channel_id", None)
+
+ENABLE_TWILIO = config.get("enable_twilio", False)
+ENABLE_SMTP = config.get("enable_smtp", False)
+ALERT_PHONE_NUMBER = config.get("alert_phone_number", None)
+TWILIO_SID = config.get("twilio_sid", None)
+TWILIO_AUTH_TOKEN = config.get("twilio_auth_token", None)
+TWILIO_FROM_NUMBER = config.get("twilio_from_number", None)
+SMTP_HOST = config.get("smtp_host", None)
+SMTP_PORT = config.get("smtp_port", 587)
+SMTP_USER = config.get("smtp_user", None)
+SMTP_PASS = config.get("smtp_pass", None)
+ALERT_EMAIL_TO = config.get("alert_email_to", None)
+
+SERIAL_PORT = config.get("serial_port", "")
+SERIAL_BAUD = int(config.get("serial_baud", 921600))  # ← NEW ● default 921600
+USE_WIFI = bool(config.get("use_wifi", False))
+WIFI_HOST = config.get("wifi_host", None)
+WIFI_PORT = int(config.get("wifi_port", 4403))
+USE_MESH_INTERFACE = bool(config.get("use_mesh_interface", False))
+
+app = Flask(__name__)
+messages = []
+interface = None
+messages_lock = threading.Lock()
+
+lastDMNode = None
+lastChannelIndex = None
+
+# -----------------------------
+# Location Lookup Function
+# -----------------------------
+def get_node_location(node_id):
+    if interface and hasattr(interface, "nodes") and node_id in interface.nodes:
+        pos = interface.nodes[node_id].get("position", {})
+        lat = pos.get("latitude")
+        lon = pos.get("longitude")
+        tstamp = pos.get("time")
+        return lat, lon, tstamp
+    return None, None, None
+
+def load_archive():
+    global messages
+    if os.path.exists(ARCHIVE_FILE):
+        try:
+            with open(ARCHIVE_FILE, "r", encoding="utf-8") as f:
+                arr = json.load(f)
+            if isinstance(arr, list):
+                messages = arr
+                print(f"Loaded {len(messages)} messages from archive.")
+                # Normalize any historical AI entries so they use the current AI_NODE_NAME and have node_id=None
+                try:
+                    updated = 0
+                    with messages_lock:
+                        for m in messages:
+                            try:
+                                nod = m.get('node', '') or ''
+                                nid = m.get('node_id', None)
+                                # If the node string contains the AI node name but node_id is set (older format), normalize it
+                                if isinstance(nod, str) and AI_NODE_NAME and AI_NODE_NAME in nod and nid is not None:
+                                    m['node'] = AI_NODE_NAME
+                                    m['node_id'] = None
+                                    updated += 1
+                            except Exception:
+                                continue
+                    if updated > 0:
+                        print(f"Normalized {updated} historical AI messages to use '{AI_NODE_NAME}' and cleared node_id.")
+                        try:
+                            save_archive()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"⚠️ Could not load archive {ARCHIVE_FILE}: {e}")
+    else:
+        print("No archive found; starting fresh.")
+
+try:
+  from meshtastic import BROADCAST_ADDR
+except ImportError:
+  BROADCAST_ADDR = 0xffffffff
+# Simple debug helpers (used throughout)
+def dprint(msg):
+  if DEBUG_ENABLED:
+    print(f"[DEBUG] {msg}")
+
+def info_print(msg):
+  print(msg)
+
+def save_archive():
+    try:
+        with open(ARCHIVE_FILE, "w", encoding="utf-8") as f:
+            json.dump(messages, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️ Could not save archive to {ARCHIVE_FILE}: {e}")
+
+        messages = arr
+        # Normalize any historical AI entries so they match the new format
+        try:
+          normalized = False
+          for m in messages:
+            try:
+              node_val = m.get('node', '') or ''
+              node_id_val = m.get('node_id', None)
+              # Detect AI-origin entries: either the node string contains the AI node name
+              # or the node_id equals or contains the AI node name.
+              if (isinstance(node_val, str) and AI_NODE_NAME and AI_NODE_NAME.lower() in node_val.lower()) or (
+                node_id_val is not None and isinstance(node_id_val, str) and AI_NODE_NAME and AI_NODE_NAME.lower() in node_id_val.lower()
+              ):
+                # Force normalized representation
+                if m.get('node') != AI_NODE_NAME or m.get('node_id') is not None:
+                  m['node'] = AI_NODE_NAME
+                  m['node_id'] = None
+                  normalized = True
+            except Exception:
+              continue
+          if normalized:
+            # Persist corrections back to archive file
+            try:
+              with open(ARCHIVE_FILE, "w", encoding="utf-8") as f:
+                json.dump(messages, f, ensure_ascii=False, indent=2)
+              print(f"Loaded {len(messages)} messages from archive (normalized AI entries).")
+            except Exception:
+              print(f"Loaded {len(messages)} messages from archive (failed to persist normalization).")
+          else:
+            print(f"Loaded {len(messages)} messages from archive.")
+        except Exception:
+          print(f"Loaded {len(messages)} messages from archive.")
+        return node_str_or_int
+    if isinstance(node_str_or_int, str):
+        if node_str_or_int == '^all':
+            return BROADCAST_ADDR
+        if node_str_or_int.lower() in ['!ffffffff', '!ffffffffl']:
+            return BROADCAST_ADDR
+        if node_str_or_int.startswith('!'):
+            hex_part = node_str_or_int[1:]
+            try:
+                return int(hex_part, 16)
+            except ValueError:
+                dprint(f"parse_node_id: Unable to parse hex from {node_str_or_int}")
+                return None
+        try:
+            return int(node_str_or_int)
+        except ValueError:
+            dprint(f"parse_node_id: {node_str_or_int} not recognized as int or hex.")
+            return None
+    return None
+
+def get_node_fullname(node_id):
+    """Return the full (long) name if available, otherwise the short name."""
+    if interface and hasattr(interface, "nodes") and node_id in interface.nodes:
+        user_dict = interface.nodes[node_id].get("user", {})
+        return user_dict.get("longName", user_dict.get("shortName", f"Node_{node_id}"))
+    return f"Node_{node_id}"
+
+def get_node_shortname(node_id):
+    if interface and hasattr(interface, "nodes") and node_id in interface.nodes:
+        user_dict = interface.nodes[node_id].get("user", {})
+        return user_dict.get("shortName", f"Node_{node_id}")
+    return f"Node_{node_id}"
+
+def log_message(node_id, text, is_emergency=False, reply_to=None, direct=False, channel_idx=None, force_node=None):
+  """Log a message and return the created entry.
+
+  If `force_node` is provided, use it as the display name and set `node_id` to None
+  so history builders reliably treat it as an AI/system message.
+  """
+  # Allow callers to force the displayed node (used for AI/system messages)
+  if force_node is not None:
+    display_id = force_node
+  else:
+    if node_id != "WebUI":
+      display_id = f"{get_node_shortname(node_id)} ({node_id})"
+    else:
+      display_id = "WebUI"
+  timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+  entry = {
+    "timestamp": timestamp,
+    "node": display_id,
+    # If force_node was used, treat node_id as None so builders recognize it as AI/system
+    "node_id": None if (force_node is not None or node_id == "WebUI") else node_id,
+    "message": text,
+    "emergency": is_emergency,
+    "reply_to": reply_to,
+    "direct": direct,
+    "channel_idx": channel_idx
+  }
+  # Protect messages list for concurrent access
+  try:
+    with messages_lock:
+      messages.append(entry)
+      if len(messages) > 100:
+        messages.pop(0)
+  except Exception:
+    # best-effort: fallback to append without lock if something unexpected happens
+    try:
+      messages.append(entry)
+      if len(messages) > 100:
+        messages.pop(0)
+    except Exception:
+      pass
+  try:
+    with open(LOG_FILE, "a", encoding="utf-8") as logf:
+      logf.write(f"{timestamp} | {display_id} | EMERGENCY={is_emergency} | {text}\n")
+  except Exception as e:
+    print(f"⚠️ Could not write to {LOG_FILE}: {e}")
+  save_archive()
+  return entry
+
+def split_message(text):
+    if not text:
+        return []
+    return [text[i: i + MAX_CHUNK_SIZE] for i in range(0, len(text), MAX_CHUNK_SIZE)][:MAX_CHUNKS]
+
+def send_broadcast_chunks(interface, text, channelIndex):
+  dprint(f"send_broadcast_chunks: text='{text}', channelIndex={channelIndex}")
+  info_print(f"[Info] Sending broadcast on channel {channelIndex} → '{text}'")
+  if interface is None:
+    msg = f"❌ Cannot send broadcast: interface is None. Would have sent to channel {channelIndex}: {text}"
+    print(msg)
+    try:
+      add_script_log(msg)
+    except Exception:
+      pass
+    return
+  if not text:
+    return
+  chunks = split_message(text)
+  for i, chunk in enumerate(chunks):
+    try:
+      interface.sendText(chunk, destinationId=BROADCAST_ADDR, channelIndex=channelIndex, wantAck=True)
+      time.sleep(CHUNK_DELAY)
+    except Exception as e:
+      print(f"❌ Error sending broadcast chunk: {e}")
+      # Check both errno and winerror for known connection errors
+      error_code = getattr(e, 'errno', None) or getattr(e, 'winerror', None)
+      if error_code in (10053, 10054, 10060):
+        reset_event.set()
+      break
+    else:
+      info_print(f"[Info] Successfully sent chunk {i+1}/{len(chunks)} on ch={channelIndex}.")
+
+def send_direct_chunks(interface, text, destinationId):
+    dprint(f"send_direct_chunks: text='{text}', destId={destinationId}")
+    info_print(f"[Info] Sending direct message to node {destinationId} => '{text}'")
+    if interface is None:
+        msg = f"❌ Cannot send direct message: interface is None. Would have sent to {destinationId}: {text}"
+        print(msg)
+        try:
+            add_script_log(msg)
+        except Exception:
+            pass
+        return
+    if not text:
+        return
+    ephemeral_ok = hasattr(interface, "sendDirectText")
+    chunks = split_message(text)
+    for i, chunk in enumerate(chunks):
+        try:
+            if ephemeral_ok:
+                interface.sendDirectText(destinationId, chunk, wantAck=True)
+            else:
+                interface.sendText(chunk, destinationId=destinationId, wantAck=True)
+            time.sleep(CHUNK_DELAY)
+        except Exception as e:
+            print(f"❌ Error sending direct chunk: {e}")
+            error_code = getattr(e, 'errno', None) or getattr(e, 'winerror', None)
+            if error_code in (10053, 10054, 10060):
+                reset_event.set()
+            break
+        else:
+            info_print(f"[Info] Direct chunk {i+1}/{len(chunks)} to {destinationId} sent.")
+
+def send_to_lmstudio(user_message, sender_id=None, is_direct=False, channel_idx=None):
+  """Chat/completion request to LM Studio with context/history support."""
+  dprint(f"send_to_lmstudio: user_message='{user_message}' sender_id={sender_id} is_direct={is_direct} channel={channel_idx}")
+  info_print("[Info] Routing user message to LMStudio…")
+  user_message = unidecode(user_message)
+  history = ""
+  try:
+    # Build history for direct messages when sender_id is provided,
+    # or for channel/broadcast messages when a channel_idx is given.
+    if sender_id is not None or (not is_direct and channel_idx is not None):
+      history = build_ollama_history(sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx)
+  except Exception as e:
+    dprint(f"Warning: failed building history for LMStudio: {e}")
+    history = ""
+  if history:
+    combined_prompt = f"{SYSTEM_PROMPT}\nCONTEXT:\n{history}\n\nUSER: {user_message}\nASSISTANT:"
+  else:
+    combined_prompt = f"{SYSTEM_PROMPT}\nUSER: {user_message}\nASSISTANT:"
+  if DEBUG_ENABLED:
+    dprint(f"LMStudio combined prompt:\n{combined_prompt}")
+  payload = {
+    "model": LMSTUDIO_CHAT_MODEL,
+    "messages": [
+      {"role": "system", "content": SYSTEM_PROMPT},
+      {"role": "user",   "content": combined_prompt},
+    ],
+    "max_tokens": MAX_RESPONSE_LENGTH,
+  }
+  try:
+    response = requests.post(LMSTUDIO_URL, json=payload, timeout=LMSTUDIO_TIMEOUT)
+    if response.status_code == 200:
+      j = response.json()
+      dprint(f"LMStudio raw ⇒ {j}")
+      ai_resp = (
+        j.get("choices", [{}])[0]
+         .get("message", {})
+         .get("content", "🤖 [No response]")
+      )
+      return ai_resp[:MAX_RESPONSE_LENGTH]
+    else:
+      print(f"⚠️ LMStudio error: {response.status_code} - {response.text}")
+      return None
+  except Exception as e:
+    print(f"⚠️ LMStudio request failed: {e}")
+    return None
+def lmstudio_embed(text: str):
+    """Return an embedding vector (if you ever need it)."""
+    payload = {
+        "model": LMSTUDIO_EMBEDDING_MODEL,
+        "input": text,
+															   
+    }
+    try:
+        r = requests.post(
+            "http://localhost:1234/v1/embeddings",
+            json=payload,
+            timeout=LMSTUDIO_TIMEOUT,
+        )
+        if r.status_code == 200:
+            vec = r.json().get("data", [{}])[0].get("embedding")
+            return vec
+        else:
+            dprint(f"LMStudio embed error {r.status_code}: {r.text}")
+					   
+    except Exception as exc:
+        dprint(f"LMStudio embed exception: {exc}")
+    return None
+def send_to_openai(user_message, sender_id=None, is_direct=False, channel_idx=None):
+  dprint(f"send_to_openai: user_message='{user_message}' sender_id={sender_id} is_direct={is_direct} channel={channel_idx}")
+  info_print("[Info] Routing user message to OpenAI...")
+  if not OPENAI_API_KEY:
+    print("⚠️ No OpenAI API key provided.")
+    return None
+  user_message = unidecode(user_message)
+  history = ""
+  try:
+    # Build history for direct messages when sender_id is provided,
+    # or for channel/broadcast messages when a channel_idx is given.
+    if sender_id is not None or (not is_direct and channel_idx is not None):
+      history = build_ollama_history(sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx)
+  except Exception as e:
+    dprint(f"Warning: failed building history for OpenAI: {e}")
+    history = ""
+  if history:
+    combined_prompt = f"{SYSTEM_PROMPT}\nCONTEXT:\n{history}\n\nUSER: {user_message}\nASSISTANT:"
+  else:
+    combined_prompt = f"{SYSTEM_PROMPT}\nUSER: {user_message}\nASSISTANT:"
+  if DEBUG_ENABLED:
+    dprint(f"OpenAI combined prompt:\n{combined_prompt}")
+  url = "https://api.openai.com/v1/chat/completions"
+  headers = {
+    "Content-Type": "application/json",
+    "Authorization": f"Bearer {OPENAI_API_KEY}"
+  }
+  payload = {
+    "model": OPENAI_MODEL,
+    "messages": [
+      {"role": "system", "content": SYSTEM_PROMPT},
+      {"role": "user", "content": combined_prompt}
+    ],
+    "max_tokens": MAX_RESPONSE_LENGTH
+  }
+  try:
+    r = requests.post(url, headers=headers, json=payload, timeout=OPENAI_TIMEOUT)
+    if r.status_code == 200:
+      jr = r.json()
+      dprint(f"OpenAI raw => {jr}")
+      content = (
+        jr.get("choices", [{}])[0]
+          .get("message", {})
+          .get("content", "🤖 [No response]")
+      )
+      return content[:MAX_RESPONSE_LENGTH]
+    else:
+      print(f"⚠️ OpenAI error: {r.status_code} => {r.text}")
+      return None
+  except Exception as e:
+    print(f"⚠️ OpenAI request failed: {e}")
+    return None
+
+def build_ollama_history(sender_id=None, is_direct=False, channel_idx=None, max_chars=OLLAMA_CONTEXT_CHARS):
+  """Build a short conversation history string for Ollama based on recent messages.
+
+  - For direct messages: include recent direct exchanges between `sender_id` and the AI node.
+  - For channel messages: include recent channel messages for `channel_idx`.
+  Returns a string (possibly empty) truncated to `max_chars` characters.
+  """
+  try:
+    if not messages:
+      return ""
+    # Collect candidate messages in chronological order
+    candidates = []
+    for m in messages:
+      try:
+        if is_direct:
+          # include direct messages that are between the sender and AI (node_id matches sender) or AI responses
+          if m.get('direct') and (m.get('node_id') == sender_id or (m.get('node') and AI_NODE_NAME in m.get('node'))):
+            candidates.append(m)
+        else:
+          # channel messages for this channel
+          if (not m.get('direct')) and (m.get('channel_idx') == channel_idx):
+            candidates.append(m)
+      except Exception:
+        continue
+    if not candidates:
+      return ""
+    # Start from newest and build backwards until we reach max_chars
+    out_lines = []
+    total = 0
+    for m in reversed(candidates):
+      who = None
+      nid = m.get('node_id')
+      if nid is None:
+        who = m.get('node', 'Unknown')
+      else:
+        try:
+          who = get_node_shortname(nid)
+        except Exception:
+          who = str(m.get('node', nid))
+      text = str(m.get('message', ''))
+      line = f"{who}: {text}"
+      # prepend lines so final order is chronological
+      out_lines.insert(0, line)
+      total = sum(len(l) for l in out_lines)
+      if total >= max_chars:
+        break
+    history = "\n".join(out_lines)
+    # Trim to max_chars from the end (keep most recent context)
+    if len(history) > max_chars:
+      history = history[-max_chars:]
+    return history
+  except Exception as e:
+    dprint(f"build_ollama_history error: {e}")
+    return ""
+
+
+def send_to_ollama(user_message, sender_id=None, is_direct=False, channel_idx=None):
+    dprint(f"send_to_ollama: user_message='{user_message}' sender_id={sender_id} is_direct={is_direct} channel={channel_idx}")
+    info_print("[Info] Routing user message to Ollama...")
+
+    # Normalize text for non-ASCII characters using unidecode
+    user_message = unidecode(user_message)
+
+    # Build optional conversation history
+    history = ""
+    try:
+      # Build history for direct messages when sender_id is provided,
+      # or for channel/broadcast messages when a channel_idx is given.
+      if sender_id is not None or (not is_direct and channel_idx is not None):
+        history = build_ollama_history(sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx)
+    except Exception as e:
+        dprint(f"Warning: failed building history for Ollama: {e}")
+        history = ""
+
+    # Compose final prompt: system prompt, optional context, then user message
+    if history:
+        combined_prompt = f"{SYSTEM_PROMPT}\nCONTEXT:\n{history}\n\nUSER: {user_message}\nASSISTANT:"
+    else:
+        combined_prompt = f"{SYSTEM_PROMPT}\nUSER: {user_message}\nASSISTANT:"
+    if DEBUG_ENABLED:
+        dprint(f"Ollama combined prompt:\n{combined_prompt}")
+
+    payload = {
+        "prompt": combined_prompt,
+        "model": OLLAMA_MODEL,
+        "stream": False  # Added to disable streaming responses
+    }
+
+    try:
+        r = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT)
+        if r.status_code == 200:
+            jr = r.json()
+            dprint(f"Ollama raw => {jr}")
+            # Ollama may return different fields depending on version; prefer 'response' then 'choices'
+            resp = jr.get("response")
+            if not resp and isinstance(jr.get("choices"), list) and jr.get("choices"):
+                # choices may contain dicts with 'text' or 'content'
+                first = jr.get("choices")[0]
+                resp = first.get('text') or first.get('content') or resp
+            if not resp:
+                resp = "🤖 [No response]"
+            return (resp or "")[:MAX_RESPONSE_LENGTH]
+        else:
+            print(f"⚠️ Ollama error: {r.status_code} => {r.text}")
+            return None
+    except Exception as e:
+        print(f"⚠️ Ollama request failed: {e}")
+        return None
+
+def send_to_home_assistant(user_message):
+    dprint(f"send_to_home_assistant: user_message='{user_message}'")
+    info_print("[Info] Routing user message to Home Assistant...")
+    if not HOME_ASSISTANT_URL:
+        return None
+    headers = {"Content-Type": "application/json"}
+    if HOME_ASSISTANT_TOKEN:
+        headers["Authorization"] = f"Bearer {HOME_ASSISTANT_TOKEN}"
+    payload = {"text": user_message}
+    try:
+        r = requests.post(HOME_ASSISTANT_URL, json=payload, headers=headers, timeout=HOME_ASSISTANT_TIMEOUT)
+        if r.status_code == 200:
+            data = r.json()
+            dprint(f"HA raw => {data}")
+            speech = data.get("response", {}).get("speech", {})
+            answer = speech.get("plain", {}).get("speech")
+            if answer:
+                return answer[:MAX_RESPONSE_LENGTH]
+            return "🤖 [No response from Home Assistant]"
+        else:
+            print(f"⚠️ HA error: {r.status_code} => {r.text}")
+            return None
+    except Exception as e:
+        print(f"⚠️ HA request failed: {e}")
+        return None
+
+def get_ai_response(prompt, sender_id=None, is_direct=False, channel_idx=None):
+  """Get AI response from configured provider. Optional context (sender/is_direct/channel_idx)
+  is forwarded to the provider integration so it can include history/context when available."""
+  if AI_PROVIDER == "lmstudio":
+    return send_to_lmstudio(prompt, sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx)
+  elif AI_PROVIDER == "openai":
+    return send_to_openai(prompt, sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx)
+  elif AI_PROVIDER == "ollama":
+    return send_to_ollama(prompt, sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx)
+  elif AI_PROVIDER == "home_assistant":
+    return send_to_home_assistant(prompt)
+  else:
+    print(f"⚠️ Unknown AI provider: {AI_PROVIDER}")
+    return None
+
+def send_discord_message(content):
+    if not (ENABLE_DISCORD and DISCORD_WEBHOOK_URL):
+        return
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": content})
+    except Exception as e:
+        print(f"⚠️ Discord webhook error: {e}")
+
+# -----------------------------
+# Revised Emergency Notification Function
+# -----------------------------
+def send_emergency_notification(node_id, user_msg, lat=None, lon=None, position_time=None):
+    info_print("[Info] Sending emergency notification...")
+
+    sn = get_node_shortname(node_id)
+    fullname = get_node_fullname(node_id)
+    full_msg = f"EMERGENCY from {sn} ({fullname}) [Node {node_id}]:\n"
+    if lat is not None and lon is not None:
+        maps_url = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
+        full_msg += f" - Location: {maps_url}\n"
+    if position_time:
+        full_msg += f" - Last GPS time: {position_time}\n"
+    if user_msg:
+        full_msg += f" - Message: {user_msg}\n"
+    
+    # Attempt to send SMS via Twilio if configured.
+    try:
+        if ENABLE_TWILIO and TWILIO_SID and TWILIO_AUTH_TOKEN and ALERT_PHONE_NUMBER and TWILIO_FROM_NUMBER:
+            client = Client(TWILIO_SID, TWILIO_AUTH_TOKEN)
+            client.messages.create(
+                body=full_msg,
+                from_=TWILIO_FROM_NUMBER,
+                to=ALERT_PHONE_NUMBER
+            )
+            print("✅ Emergency SMS sent via Twilio.")
+        else:
+            print("Twilio not properly configured for SMS.")
+    except Exception as e:
+        print(f"⚠️ Twilio error: {e}")
+
+    # Attempt to send email via SMTP if configured.
+    try:
+        if ENABLE_SMTP and SMTP_HOST and SMTP_USER and SMTP_PASS and ALERT_EMAIL_TO:
+            if isinstance(ALERT_EMAIL_TO, list):
+                email_to = ", ".join(ALERT_EMAIL_TO)
+            else:
+                email_to = ALERT_EMAIL_TO
+            msg = MIMEText(full_msg)
+            msg["Subject"] = f"EMERGENCY ALERT from {sn} ({fullname}) [Node {node_id}]"
+            msg["From"] = SMTP_USER
+            msg["To"] = email_to
+            if SMTP_PORT == 465:
+                s = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT)
+            else:
+                s = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+                s.starttls()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.sendmail(SMTP_USER, email_to, msg.as_string())
+            s.quit()
+            print("✅ Emergency email sent via SMTP.")
+        else:
+            print("SMTP not properly configured for email alerts.")
+    except Exception as e:
+        print(f"⚠️ SMTP error: {e}")
+
+    # Attempt to post emergency alert to Discord if enabled.
+    try:
+        if DISCORD_SEND_EMERGENCY and ENABLE_DISCORD and DISCORD_WEBHOOK_URL:
+            requests.post(DISCORD_WEBHOOK_URL, json={"content": full_msg})
+            print("✅ Emergency alert posted to Discord.")
+        else:
+            print("Discord emergency notifications disabled or not configured.")
+    except Exception as e:
+        print(f"⚠️ Discord webhook error: {e}")
+
+# -----------------------------
+# Helper: Validate/Strip PIN (for Home Assistant)
+# -----------------------------
+def pin_is_valid(text):
+    lower = text.lower()
+    if "pin=" not in lower:
+        return False
+    idx = lower.find("pin=") + 4
+    candidate = lower[idx:idx+4]
+    return (candidate == HOME_ASSISTANT_SECURE_PIN.lower())
+
+def strip_pin(text):
+    lower = text.lower()
+    idx = lower.find("pin=")
+    if idx == -1:
+        return text
+    return text[:idx].strip() + " " + text[idx+8:].strip()
+
+def route_message_text(user_message, channel_idx):
+  if HOME_ASSISTANT_ENABLED and channel_idx == HOME_ASSISTANT_CHANNEL_INDEX:
+    info_print("[Info] Routing to Home Assistant channel.")
+    if HOME_ASSISTANT_ENABLE_PIN:
+      if not pin_is_valid(user_message):
+        return "Security code missing/invalid. Format: 'PIN=XXXX your msg'"
+      user_message = strip_pin(user_message)
+    ha_response = send_to_home_assistant(user_message)
+    return ha_response if ha_response else "🤖 [No response from Home Assistant]"
+  else:
+    info_print(f"[Info] Using default AI provider: {AI_PROVIDER}")
+    resp = get_ai_response(user_message, sender_id=None, is_direct=False, channel_idx=channel_idx)
+    return resp if resp else "🤖 [No AI response]"
+
+# -----------------------------
+# Revised Command Handler (Case-Insensitive)
+# -----------------------------
+def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None):
+  cmd = cmd.lower()
+  dprint(f"handle_command => cmd='{cmd}', full_text='{full_text}', sender_id={sender_id} is_direct={is_direct} channel_idx={channel_idx}")
+  if cmd == "/about":
+    return "MESH-AI Off Grid Chat Bot - By: MR-TBOT.com"
+  elif cmd in ["/ai", "/bot", "/query", "/data"]:
+    user_prompt = full_text[len(cmd):].strip()
+    if AI_PROVIDER == "home_assistant" and HOME_ASSISTANT_ENABLE_PIN:
+      if not pin_is_valid(user_prompt):
+        return "Security code missing or invalid. Use 'PIN=XXXX'"
+      user_prompt = strip_pin(user_prompt)
+    ai_answer = get_ai_response(user_prompt, sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx)
+    return ai_answer if ai_answer else "🤖 [No AI response]"
+  elif cmd == "/whereami":
+    lat, lon, tstamp = get_node_location(sender_id)
+    sn = get_node_shortname(sender_id)
+    if lat is None or lon is None:
+      return f"🤖 Sorry {sn}, I have no GPS fix for your node."
+    tstr = str(tstamp) if tstamp else "Unknown"
+    return f"Node {sn} GPS: {lat}, {lon} (time: {tstr})"
+  elif cmd in ["/emergency", "/911"]:
+    lat, lon, tstamp = get_node_location(sender_id)
+    user_msg = full_text[len(cmd):].strip()
+    send_emergency_notification(sender_id, user_msg, lat, lon, tstamp)
+    log_message(sender_id, f"EMERGENCY TRIGGERED: {full_text}", is_emergency=True)
+    return "🚨 Emergency alert sent. Stay safe."
+  elif cmd == "/test":
+    sn = get_node_shortname(sender_id)
+    return f"Hello {sn}! Received {LOCAL_LOCATION_STRING} by {AI_NODE_NAME}."
+  elif cmd == "/help":
+    built_in = ["/about", "/ai", "/query", "/whereami", "/emergency", "/911", "/test", "/motd"]
+    custom_cmds = [c.get("command") for c in commands_config.get("commands",[])]
+    return "Commands:\n" + ", ".join(built_in + custom_cmds)
+  elif cmd == "/motd":
+    return motd_content
+  elif cmd == "/reset":
+    # Clear conversation history for either the direct chat with this sender
+    # or for the channel messages for the provided channel_idx.
+    try:
+      removed_timestamps = set()
+      # Lock while mutating the shared messages list
+      with messages_lock:
+        if is_direct:
+          # Remove direct messages belonging to this DM (from the sender)
+          for m in list(messages):
+            if m.get('direct') and m.get('node_id') == sender_id:
+              removed_timestamps.add(m.get('timestamp'))
+              try:
+                messages.remove(m)
+              except ValueError:
+                pass
+          # Also remove AI replies that reference those timestamps
+          for m in list(messages):
+            if m.get('node') == AI_NODE_NAME and m.get('reply_to') in removed_timestamps:
+              try:
+                messages.remove(m)
+              except ValueError:
+                pass
+        else:
+          # Channel reset: remove channel messages for the specified channel_idx
+          for m in list(messages):
+            if (not m.get('direct')) and (m.get('channel_idx') == channel_idx):
+              removed_timestamps.add(m.get('timestamp'))
+              try:
+                messages.remove(m)
+              except ValueError:
+                pass
+          for m in list(messages):
+            if m.get('node') == AI_NODE_NAME and m.get('reply_to') in removed_timestamps:
+              try:
+                messages.remove(m)
+              except ValueError:
+                pass
+      save_archive()
+      return "memory cleared, starting fresh"
+    except Exception as e:
+      dprint(f"/reset failed: {e}")
+      return "⚠️ Failed to clear memory"
+  elif cmd == "/sms":
+    parts = full_text.split(" ", 2)
+    if len(parts) < 3:
+      return "Invalid syntax. Use: /sms <phone_number> <message>"
+    phone_number = parts[1]
+    message_text = parts[2]
+    try:
+      client = Client(TWILIO_SID, TWILIO_AUTH_TOKEN)
+      client.messages.create(
+        body=message_text,
+        from_=TWILIO_FROM_NUMBER,
+        to=phone_number
+      )
+      print(f"✅ SMS sent to {phone_number}")
+      return "SMS sent successfully."
+    except Exception as e:
+      print(f"⚠️ Failed to send SMS: {e}")
+      return "Failed to send SMS."
+  elif cmd == "/summary":
+    # Summarize the last 24 hours of traffic for the DM or channel
+    try:
+      now = datetime.now(timezone.utc)
+      since = now - timedelta(hours=24)
+      # Gather relevant messages
+      relevant = []
+      for m in messages:
+        try:
+          ts = m.get('timestamp')
+          if not ts:
+            continue
+          # timestamps stored like 'YYYY-MM-DD HH:MM:SS UTC'
+          try:
+            t = datetime.strptime(ts.replace(' UTC', ''), "%Y-%m-%d %H:%M:%S")
+            t = t.replace(tzinfo=timezone.utc)
+          except Exception:
+            # try alternative parse
+            t = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc)
+          if t < since:
+            continue
+          if is_direct:
+            # direct: include only messages between sender and AI
+            if m.get('direct') and (m.get('node_id') == sender_id or (m.get('node') and AI_NODE_NAME in m.get('node'))):
+              relevant.append((t, m))
+          else:
+            # channel: include messages for the channel
+            if (not m.get('direct')) and (m.get('channel_idx') == channel_idx):
+              relevant.append((t, m))
+        except Exception:
+          continue
+      # Sort chronologically
+      relevant.sort(key=lambda x: x[0])
+
+      # Build counts per node and detect major events
+      counts = {}
+      major_keywords = ["emergency", "911", "sos", "help", "alert", "fire", "flood", "injury", "injured", "blocked", "stuck", "rescue", "evacuate", "warning", "accident"]
+      major_events = []
+      lines = []
+      for dt, m in sorted(relevant, key=lambda x: x[0]):
+        nid = m.get('node') if m.get('node') else (str(m.get('node_id')) if m.get('node_id') is not None else 'Unknown')
+        counts[nid] = counts.get(nid, 0) + 1
+        text = str(m.get('message', ''))
+        lines.append(f"{dt.strftime('%Y-%m-%d %H:%M:%S UTC')} | {nid} | {text}")
+        low = text.lower()
+        for kw in major_keywords:
+          if kw in low:
+            major_events.append((dt, nid, text))
+            break
+
+      # Build the AI prompt
+      header = "DM summary" if is_direct else f"Channel {channel_idx} summary"
+      msg_count = sum(counts.values())
+      counts_text = "\n".join([f"- {k}: {v} messages" for k, v in sorted(counts.items(), key=lambda x: -x[1])]) if counts else "No messages"
+      events_text = "\n".join([f"- {e[0].strftime('%Y-%m-%d %H:%M:%S UTC')} | {e[1]}: {e[2]}" for e in major_events]) if major_events else "No major events detected"
+
+      raw_messages = "\n".join(lines)
+
+      ai_prompt = (
+        f"You are an assistant. Provide a concise summary for the {header} over the last 24 hours.\n"
+        f"Requirements:\n"
+        f"1) A short 2-4 sentence summary highlighting the most important happenings.\n"
+        f"2) A bullet list of any major events (if any) with timestamp and node.\n"
+        f"3) A short table or list of message counts per node.\n"
+        f"4) Any recommended next steps or observations.\n\n"
+        f"Total messages in window: {msg_count}\n\n"
+        f"Per-node counts:\n{counts_text}\n\n"
+        f"Major events:\n{events_text}\n\n"
+  f"Raw messages (chronological):\n{raw_messages}\n\n"
+        f"Provide the response in clear, human-readable language."
+      )
+
+      # Call AI (forward context so model can use history if needed)
+      resp = get_ai_response(ai_prompt, sender_id=(sender_id if is_direct else None), is_direct=is_direct, channel_idx=(channel_idx if not is_direct else None))
+      return resp if resp else "🤖 [No AI response]"
+    except Exception as e:
+      dprint(f"/summary error: {e}")
+      return "⚠️ Failed to generate summary"
+  for c in commands_config.get("commands", []):
+    if c.get("command").lower() == cmd:
+      if "ai_prompt" in c:
+        user_input = full_text[len(cmd):].strip()
+        custom_text = c["ai_prompt"].replace("{user_input}", user_input)
+        if AI_PROVIDER == "home_assistant" and HOME_ASSISTANT_ENABLE_PIN:
+          if not pin_is_valid(custom_text):
+            return "Security code missing or invalid."
+          custom_text = strip_pin(custom_text)
+        ans = get_ai_response(custom_text)
+        return ans if ans else "🤖 [No AI response]"
+      elif "response" in c:
+        return c["response"]
+      return "No configured response for this command."
+  return None
+
+def parse_incoming_text(text, sender_id, is_direct, channel_idx):
+    dprint(f"parse_incoming_text => text='{text}' is_direct={is_direct} channel={channel_idx}")
+    info_print(f"[Info] Received from node {sender_id} (direct={is_direct}, ch={channel_idx}) => '{text}'")
+    text = text.strip()
+    if not text:
+        return None
+    if is_direct and not config.get("reply_in_directs", True):
+        return None
+    if (not is_direct) and channel_idx != HOME_ASSISTANT_CHANNEL_INDEX and not config.get("reply_in_channels", True):
+        return None
+
+    if text.startswith("/"):
+        cmd = text.split()[0]
+        resp = handle_command(cmd, text, sender_id, is_direct=is_direct, channel_idx=channel_idx)
+        return resp
+
+    # Non-command messages: route to AI for direct messages, or Home Assistant if configured for this channel.
+    if is_direct:
+        # Direct messages go to the AI provider
+        return get_ai_response(text, sender_id=sender_id, is_direct=True, channel_idx=channel_idx)
+
+    # If Home Assistant integration is enabled and this is the HA channel, route there
+    if HOME_ASSISTANT_ENABLED and channel_idx == HOME_ASSISTANT_CHANNEL_INDEX:
+        return route_message_text(text, channel_idx)
+
+    # Otherwise, no automatic response
+    return None
+    
+
+def on_receive(packet=None, interface=None, **kwargs):
+  dprint(f"on_receive => packet={packet}")
+  if not packet or 'decoded' not in packet:
+    dprint("No decoded packet => ignoring.")
+    return
+  if packet['decoded']['portnum'] != 'TEXT_MESSAGE_APP':
+    dprint("Not TEXT_MESSAGE_APP => ignoring.")
+    return
+
+  try:
+    text_raw = packet['decoded']['payload']
+    text = text_raw.decode('utf-8', errors='replace')
+    sender_node = packet.get('fromId', None)
+    raw_to = packet.get('toId', None)
+    to_node_int = parse_node_id(raw_to)
+    ch_idx = packet.get('channel', 0)
+    dprint(f"[MSG] from {sender_node} to {raw_to} (ch={ch_idx}): {text}")
+
+    # Log the incoming message
+    entry = log_message(sender_node, text, direct=(to_node_int != BROADCAST_ADDR), channel_idx=(None if to_node_int != BROADCAST_ADDR else ch_idx))
+
+    # Track recent DM/channel
+    global lastDMNode, lastChannelIndex
+    if to_node_int != BROADCAST_ADDR:
+      lastDMNode = sender_node
+    else:
+      lastChannelIndex = ch_idx
+
+    # Broadcast SSE event for dashboard clients (so they can play a chime)
+    try:
+      evt = {
+        "type": "message",
+        "from": str(sender_node),
+        "channel": ch_idx,
+        "text": text,
+        "direct": (to_node_int != BROADCAST_ADDR),
+      }
+      broadcast_sse(evt)
+    except Exception:
+      pass
+
+    # Only forward messages on the configured Discord inbound channel to Discord.
+    if ENABLE_DISCORD and DISCORD_SEND_ALL and DISCORD_INBOUND_CHANNEL_INDEX is not None and ch_idx == DISCORD_INBOUND_CHANNEL_INDEX:
+      sender_info = f"{get_node_shortname(sender_node)} ({sender_node})"
+      disc_content = f"**{sender_info}**: {text}"
+      send_discord_message(disc_content)
+
+    # Determine whether this message is direct to us
+    my_node_num = None
+    if FORCE_NODE_NUM is not None:
+      my_node_num = FORCE_NODE_NUM
+    else:
+      if hasattr(interface, "myNode") and interface.myNode:
+        my_node_num = interface.myNode.nodeNum
+      elif hasattr(interface, "localNode") and interface.localNode:
+        my_node_num = interface.localNode.nodeNum
+
+    if to_node_int == BROADCAST_ADDR:
+      is_direct = False
+    elif my_node_num is not None and to_node_int == my_node_num:
+      is_direct = True
+    else:
+      is_direct = (my_node_num == to_node_int)
+
+    # Route the text into the command/AI pipeline
+    resp = parse_incoming_text(text, sender_node, is_direct, ch_idx)
+    if resp:
+      info_print("[Info] Wait 10s before responding to reduce collisions.")
+      time.sleep(10)
+      # Log AI response with direct/channel metadata so it appears in history
+      # Log the AI response and force the node label so it's included in history
+      ai_entry = log_message(
+        AI_NODE_NAME,
+        resp,
+        reply_to=entry.get('timestamp') if isinstance(entry, dict) else None,
+        direct=is_direct,
+        channel_idx=(ch_idx if not is_direct else None),
+        force_node=AI_NODE_NAME,
+      )
+
+      # If message originated on Discord inbound channel, also send the AI response back to Discord.
+      if ENABLE_DISCORD and DISCORD_SEND_AI and DISCORD_INBOUND_CHANNEL_INDEX is not None and ch_idx == DISCORD_INBOUND_CHANNEL_INDEX:
+        disc_msg = f"🤖 **{AI_NODE_NAME}**: {resp}"
+        send_discord_message(disc_msg)
+
+      if is_direct:
+        send_direct_chunks(interface, resp, sender_node)
+      else:
+        send_broadcast_chunks(interface, resp, ch_idx)
+
+  except OSError as e:
+    error_code = getattr(e, 'errno', None) or getattr(e, 'winerror', None)
+    print(f"⚠️ OSError detected in on_receive: {e} (error code: {error_code})")
+    if error_code in (10053, 10054, 10060):
+      print("⚠️ Connection error detected. Restarting interface...")
+      global connection_status
+      connection_status = "Disconnected"
+      reset_event.set()
+    # Instead of re-raising, simply return to prevent thread crash
+    return
+  except Exception as e:
+    print(f"⚠️ Unexpected error in on_receive: {e}")
+    return
+
+
+@app.route('/events')
+def sse_events():
+  """Server-Sent Events endpoint for dashboard clients. Sends events as JSON lines."""
+  if Flask is None or request is None:
+    return "SSE not available", 503
+
+  q = Queue()
+  with sse_clients_lock:
+    sse_clients.append(q)
+
+  def gen():
+    try:
+      while True:
+        try:
+          item = q.get(timeout=0.5)
+        except Empty:
+          # send a heartbeat comment to keep connections alive
+          yield ': heartbeat\n\n'
+          continue
+        try:
+          payload = json.dumps(item)
+        except Exception:
+          payload = json.dumps({"type": "error", "message": "invalid payload"})
+        yield f'data: {payload}\n\n'
+    finally:
+      # On disconnect remove the client's queue
+      with sse_clients_lock:
+        try:
+          sse_clients.remove(q)
+        except Exception:
+          pass
+
+  return Response(stream_with_context(gen()), mimetype='text/event-stream')
+
+@app.route("/messages", methods=["GET"])
+def get_messages_api():
+    dprint("GET /messages => returning current messages")
+    # Return a shallow copy under lock to avoid concurrent modification during JSON serialization
+    try:
+      with messages_lock:
+        copy_msgs = list(messages)
+    except Exception:
+      copy_msgs = list(messages)
+    return jsonify(copy_msgs)
+
+@app.route("/nodes", methods=["GET"])
+def get_nodes_api():
+    node_list = []
+    if interface and hasattr(interface, "nodes"):
+        for nid in interface.nodes:
+            sn = get_node_shortname(nid)
+            ln = get_node_fullname(nid)
+            node_list.append({
+                "id": nid,
+                "shortName": sn,
+                "longName": ln
+            })
+    return jsonify(node_list)
+
+@app.route("/connection_status", methods=["GET"], endpoint="connection_status_info")
+def connection_status_info():
+    return jsonify({"status": connection_status, "error": last_error_message})
+
+@app.route("/logs_stream")
+def logs_stream():
+    def generate():
+        last_index = 0
+        while True:
+            # apply your noise filter
+            visible = [
+                line for line in script_logs
+                if DEBUG_ENABLED or not any(p in line for p in _ProtoNoiseFilter.NOISY)
+            ]
+            # send only the new lines
+            if last_index < len(visible):
+                for line in visible[last_index:]:
+                    # each SSE “data:” is one log line
+                    yield f"data: {line}\n\n"
+                last_index = len(visible)
+            time.sleep(0.5)
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no"   # for nginx, disables proxy buffering
+    }
+    return Response(
+        stream_with_context(generate()),
+        headers=headers,
+        mimetype="text/event-stream"
+    )
+
+@app.route("/logs", methods=["GET"])
+def logs():
+    uptime = datetime.now(timezone.utc) - server_start_time
+    uptime_str = str(uptime).split('.')[0]
+
+    # build a regex that matches any protobuf noise
+    noise_re = re.compile(r"protobuf|DecodeError|ParseFromString", re.IGNORECASE)
+
+    # include only non-noisy lines unless DEBUG_ENABLED
+    visible = [
+        line for line in script_logs
+        if DEBUG_ENABLED or not noise_re.search(line)
+    ]
+    log_text = "\n".join(visible)
+
+    html = """<html>
+  <head>
+    <meta http-equiv="refresh" content="1">
+    <title>MESH-AI Logs</title>
+    <style>
+      body {{ background:#000; color:#fff; font-family:monospace; padding:20px; }}
+      pre {{ white-space: pre-wrap; word-break: break-word; }}
+    </style>
+  </head>
+  <body>
+    <h1>Script Logs</h1>
+  <div><strong>Uptime:</strong> {UPTIME}</div>
+  <div><strong>Restarts:</strong> {RESTARTS}</div>
+  <pre id="logbox">{LOG_TEXT}</pre>
+    <script>
+      // once the page renders, scroll to the bottom
+      document.addEventListener("DOMContentLoaded", () => {{
+        window.scrollTo(0, document.body.scrollHeight);
+      }});
+
+      // Subscribe to Server-Sent Events for message notifications
+      (function() {{
+        try {{
+          const evtSrc = new EventSource('/events');
+          // small embedded chime WAV (mono, 8-bit, 8kHz) - pleasant short blip
+          const base64Wav = 'UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA='; // very short silent placeholder if unsupported
+          let audioCtx = null;
+          let chimeBuffer = null;
+
+          function initAudio() {{
+            if (audioCtx) return Promise.resolve();
+            try {{
+              audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }} catch (e) {{
+              console.warn('AudioContext unavailable', e);
+              return Promise.reject(e);
+            }}
+            // decode base64 WAV
+            const raw = atob(base64Wav);
+            const rawLen = raw.length;
+            const buf = new Uint8Array(rawLen);
+            for (let i = 0; i < rawLen; i++) buf[i] = raw.charCodeAt(i);
+            return audioCtx.decodeAudioData(buf.buffer).then((decoded) => {{ chimeBuffer = decoded; }}).catch(()=>{{ chimeBuffer = null; }});
+          }}
+
+          function playChime() {{
+            if (!audioCtx) {{ initAudio().catch(()=>{{}}); return; }}
+            if (!chimeBuffer) return;
+            const src = audioCtx.createBufferSource();
+            src.buffer = chimeBuffer;
+            src.connect(audioCtx.destination);
+            try {{ src.start(0); }} catch (e) {{ try{{ src.noteOn(0); }}catch(e){{}} }}
+          }}
+
+          evtSrc.addEventListener('message', function(e) {{
+            try {{
+              const d = JSON.parse(e.data || '{}');
+              if (d && d.type === 'message') {{
+                // flash a small visual indicator
+                const ticker = document.getElementById('ticker');
+                if (ticker) {{
+                  ticker.style.display = 'block';
+                  ticker.innerHTML = `<p>${{(d.direct? '[DM] ':'')}}${{d.from}}: ${{d.text}}</p>`;
+                  setTimeout(()=>{{ ticker.style.display='none'; }}, 5000);
+                }}
+                // Play chime
+                playChime();
+              }}
+            }} catch (err) {{ console.warn('SSE parse error', err); }}
+          }});
+
+          // warm up audio on first user gesture to avoid autoplay restrictions
+          document.addEventListener('click', function once(){ initAudio().catch(()=>{}); document.removeEventListener('click', once); });
+        }} catch (e) {{ console.warn('SSE not supported', e); }}
+      }})();
+    </script>
+  </body>
+</html>"""
+
+    # Substitute only the required placeholders to avoid interfering with JS template literals
+    html = html.replace('{UPTIME}', uptime_str).replace('{RESTARTS}', str(restart_count)).replace('{LOG_TEXT}', log_text)
+    return html
+# -----------------------------
+# Revised Discord Webhook Route for Inbound Messages
+# -----------------------------
+@app.route("/discord_webhook", methods=["POST"])
+def discord_webhook():
+    if not DISCORD_RECEIVE_ENABLED:
+        return jsonify({"status": "disabled", "message": "Discord receive is disabled"}), 200
+    data = request.json
+    if not data:
+        return jsonify({"status": "error", "message": "No JSON payload provided"}), 400
+
+    # Extract the username (default if not provided)
+    username = data.get("username", "DiscordUser")
+    channel_index = DISCORD_INBOUND_CHANNEL_INDEX
+    message_text = data.get("message")
+    if message_text is None:
+        return jsonify({"status": "error", "message": "Missing message"}), 400
+
+    # Prepend username to the message
+    formatted_message = f"**{username}**: {message_text}"
+
+    try:
+        log_message("Discord", formatted_message, direct=False, channel_idx=int(channel_index))
+        if interface is None:
+            print("❌ Cannot route Discord message: interface is None.")
+        else:
+            send_broadcast_chunks(interface, formatted_message, int(channel_index))
+        print(f"✅ Routed Discord message back on channel {channel_index}")
+        return jsonify({"status": "sent", "channel_index": channel_index, "message": formatted_message})
+    except Exception as e:
+        print(f"⚠️ Discord webhook error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# -----------------------------
+# New Twilio SMS Webhook Route for Inbound SMS
+# -----------------------------
+@app.route("/twilio_webhook", methods=["POST"])
+def twilio_webhook():
+    sms_body = request.form.get("Body")
+    from_number = request.form.get("From")
+    if not sms_body:
+        return "No SMS body received", 400
+    target = config.get("twilio_inbound_target", "channel")
+    if target == "channel":
+        channel_index = config.get("twilio_inbound_channel_index")
+        if channel_index is None:
+            return "No inbound channel index configured", 400
+        log_message("Twilio", f"From {from_number}: {sms_body}", direct=False, channel_idx=int(channel_index))
+        send_broadcast_chunks(interface, sms_body, int(channel_index))
+        print(f"✅ Routed incoming SMS from {from_number} to channel {channel_index}")
+    elif target == "node":
+        node_id = config.get("twilio_inbound_node")
+        if node_id is None:
+            return "No inbound node configured", 400
+        log_message("Twilio", f"From {from_number}: {sms_body}", direct=True)
+        send_direct_chunks(interface, sms_body, node_id)
+        print(f"✅ Routed incoming SMS from {from_number} to node {node_id}")
+    else:
+        return "Invalid twilio_inbound_target config", 400
+    return "SMS processed", 200
+
+@app.route("/dashboard", methods=["GET"])
+def dashboard():
+    channel_names = config.get("channel_names", {})
+    channel_names_json = json.dumps(channel_names)
+
+    # Prepare node GPS and beacon info for JS
+    node_gps_info = {}
+    if interface and hasattr(interface, "nodes"):
+        for nid, ninfo in interface.nodes.items():
+            pos = ninfo.get("position", {})
+            lat = pos.get("latitude")
+            lon = pos.get("longitude")
+            tstamp = pos.get("time")
+            # Try all possible hop keys, fallback to None
+            hops = (
+                ninfo.get("hopLimit")
+                or ninfo.get("hop_count")
+                or ninfo.get("hopCount")
+                or ninfo.get("numHops")
+                or ninfo.get("num_hops")
+                or ninfo.get("hops")
+                or None
+            )
+            # Convert tstamp (epoch) to readable UTC if present
+            if tstamp:
+                try:
+                    dt = datetime.fromtimestamp(tstamp, timezone.utc)
+                    tstr = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                except Exception:
+                    tstr = str(tstamp)
+            else:
+                tstr = None
+            node_gps_info[str(nid)] = {
+                "lat": lat,
+                "lon": lon,
+                "beacon_time": tstr,
+                "hops": hops,
+            }
+    node_gps_info_json = json.dumps(node_gps_info)
+
+    # Get connected node's GPS for distance calculation
+    my_lat, my_lon, _ = get_node_location(interface.myNode.nodeNum) if interface and hasattr(interface, "myNode") and interface.myNode else (None, None, None)
+    my_gps_json = json.dumps({"lat": my_lat, "lon": my_lon})
+
+    html = """
+<html>
+<head>
+  <title>MESH-AI Dashboard</title>
+  <style>
+    :root { --theme-color: #ffa500; }
+    body { background: #000; color: #fff; font-family: Arial, sans-serif; margin: 0; padding-top: 120px; transition: filter 0.5s linear; }
+    #connectionStatus { position: fixed; top: 0; left: 0; width: 100%; z-index: 350; text-align: center; padding: 0; font-size: 14px; font-weight: bold; display: block; }
+    .header-buttons { position: fixed; top: 0; right: 0; z-index: 400; }
+    .header-buttons a { background: var(--theme-color); color: #000; padding: 8px 12px; margin: 5px; text-decoration: none; border-radius: 4px; font-weight: bold; }
+    #ticker-container { position: fixed; top: 20px; left: 0; width: 100vw; z-index: 300; height: 50px; display: flex; align-items: center; justify-content: center; pointer-events: none; }
+    #ticker { background: #111; color: var(--theme-color); white-space: nowrap; overflow: hidden; width: 100vw; min-width: 100vw; max-width: 100vw; padding: 5px 0; font-size: 36px; display: none; position: relative; border-bottom: 2px solid var(--theme-color); min-height: 50px; pointer-events: auto; }
+    #ticker p { display: inline-block; margin: 0; animation: tickerScroll 30s linear infinite; vertical-align: middle; min-width: 100vw; }
+    #ticker .dismiss-btn { position: absolute; right: 20px; top: 50%; transform: translateY(-50%); font-size: 18px; background: #222; color: #fff; border: 1px solid var(--theme-color); border-radius: 4px; cursor: pointer; padding: 2px 10px; z-index: 10; }
+    @keyframes tickerScroll { 0% { transform: translateX(100%); } 100% { transform: translateX(-100%); } }
+    #sendForm { margin: 20px; padding: 20px; background: #111; border: 2px solid var(--theme-color); border-radius: 10px; }
+    .three-col { display: flex; flex-direction: row; gap: 20px; margin: 20px; height: calc(100vh - 220px); }
+    .three-col .col:nth-child(1), .three-col .col:nth-child(3) { flex: 2; overflow-y: auto; }
+    .three-col .col:nth-child(2) { flex: 1; overflow-y: auto; }
+    .lcars-panel { background: #111; padding: 20px; border: 2px solid var(--theme-color); border-radius: 10px; }
+    .lcars-panel h2 { color: var(--theme-color); margin-top: 0; }
+    .message { border: 1px solid var(--theme-color); border-radius: 4px; margin: 5px; padding: 5px; }
+    .message.outgoing { background: #222; }
+    .message.newMessage { border-color: #00ff00; background: #1a2; }
+    .message.recentNode { border-color: #00bfff; background: #113355; }
+    .timestamp { font-size: 0.8em; color: #666; }
+    .btn { margin-left: 10px; padding: 2px 6px; font-size: 0.8em; cursor: pointer; }
+    .switch { position: relative; display: inline-block; width: 60px; height: 34px; vertical-align: middle; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; }
+    .slider:before { position: absolute; content: ""; height: 26px; width: 26px; left: 4px; bottom: 4px; background-color: white; transition: .4s; }
+    input:checked + .slider { background-color: #2196F3; }
+    input:focus + .slider { box-shadow: 0 0 1px #2196F3; }
+    input:checked + .slider:before { transform: translateX(26px); }
+    .slider.round { border-radius: 34px; }
+    .slider.round:before { border-radius: 50%; }
+    #charCounter { font-size: 0.9em; color: #ccc; text-align: right; margin-top: 5px; }
+    .nodeItem { margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid var(--theme-color); display: flex; flex-direction: column; align-items: flex-start; flex-wrap: wrap; }
+    .nodeItem.recentNode { border-bottom: 2px solid #00bfff; background: #113355; }
+    .nodeMainLine { font-weight: bold; font-size: 1.1em; }
+    .nodeLongName { color: #aaa; font-size: 0.98em; margin-top: 2px; }
+    .nodeInfoLine { margin-top: 2px; font-size: 0.95em; color: #ccc; display: flex; flex-wrap: wrap; gap: 10px; }
+    .nodeGPS { margin-left: 0; }
+    .nodeBeacon { color: #aaa; font-size: 0.92em; }
+    .nodeHops { color: #6cf; font-size: 0.92em; }
+    .nodeMapBtn { margin-left: 0; background: #222; color: #fff; border: 1px solid #ffa500; border-radius: 4px; padding: 2px 6px; font-size: 1em; cursor: pointer; text-decoration: none; }
+    .nodeMapBtn:hover { background: #ffa500; color: #000; }
+    .channel-header { display: flex; align-items: center; gap: 10px; }
+    .reply-btn { margin-left: 10px; padding: 2px 8px; font-size: 0.85em; background: #222; color: var(--theme-color); border: 1px solid var(--theme-color); border-radius: 4px; cursor: pointer; }
+    .mark-read-btn { margin-left: 10px; padding: 2px 8px; font-size: 0.85em; background: #222; color: #0f0; border: 1px solid #0f0; border-radius: 4px; cursor: pointer; }
+    .mark-all-read-btn { margin-left: 10px; padding: 2px 8px; font-size: 0.85em; background: #222; color: #ff0; border: 1px solid #ff0; border-radius: 4px; cursor: pointer; }
+    /* Threaded DM styles */
+    .dm-thread { margin-bottom: 16px; border-left: 3px solid var(--theme-color); padding-left: 10px; }
+    .dm-thread .message { margin-left: 0; }
+    .dm-thread .reply-btn { margin-top: 5px; }
+    .dm-thread .thread-replies { margin-left: 30px; border-left: 2px dashed #555; padding-left: 10px; }
+    /* Hide Discord section by default */
+    #discordSection { display: none; }
+    /* Node sort controls */
+    .nodeSortBar { margin-bottom: 10px; }
+    .nodeSortBar label { margin-right: 8px; }
+    .nodeSortBar select { background: #222; color: #fff; border: 1px solid var(--theme-color); border-radius: 4px; padding: 2px 8px; }
+    /* Full width search bar for nodes */
+    #nodeSearch { width: 100%; margin-bottom: 10px; font-size: 1em; padding: 6px; box-sizing: border-box; }
+    /* UI Settings panel hidden by default */
+    .settings-panel { display: none; background: #111; border: 2px solid var(--theme-color); border-radius: 10px; padding: 20px; margin: 20px; }
+    .settings-toggle { background: var(--theme-color); color: #000; padding: 8px 12px; margin: 20px; border-radius: 4px; font-weight: bold; cursor: pointer; display: inline-block; }
+    .settings-toggle.active { background: #222; color: #ffa500; }
+    /* Timezone selector */
+    #timezoneSelect { margin-left: 10px; }
+    /* Keep settings toggle and panel fixed so they don't move */
+    .settings-toggle { position: fixed; bottom: 16px; left: 16px; z-index: 1100; box-shadow: 0 2px 6px rgba(0,0,0,0.6); }
+    .settings-panel { position: fixed; bottom: 64px; left: 16px; z-index: 1100; width: 360px; max-height: 60vh; overflow:auto; margin: 0; }
+    /* Autostart panel styles */
+    .autostart-panel { position: fixed; bottom: 16px; right: 16px; z-index: 1100; }
+    .autostart-box { display:flex;align-items:center;gap:10px;padding:10px 14px;background:#111;border:2px solid var(--theme-color);border-radius:12px; }
+  </style>
+
+  <script>
+    // --- Mark as Read/Unread State ---
+    let readDMs = JSON.parse(localStorage.getItem("readDMs") || "[]");
+    let readChannels = JSON.parse(localStorage.getItem("readChannels") || "{}");
+
+    function saveReadDMs() {
+      localStorage.setItem("readDMs", JSON.stringify(readDMs));
+    }
+    function saveReadChannels() {
+      localStorage.setItem("readChannels", JSON.stringify(readChannels));
+    }
+    function markDMAsRead(ts) {
+      if (!readDMs.includes(ts)) {
+        readDMs.push(ts);
+        saveReadDMs();
+        fetchMessagesAndNodes();
+      }
+    }
+    function markAllDMsAsRead() {
+      if (!confirm("Are you sure you want to mark ALL direct messages as read?")) return;
+      let dms = allMessages.filter(m => m.direct);
+      readDMs = dms.map(m => m.timestamp);
+      saveReadDMs();
+      fetchMessagesAndNodes();
+    }
+    function markChannelAsRead(channelIdx) {
+      if (!confirm("Are you sure you want to mark ALL messages in this channel as read?")) return;
+      let msgs = allMessages.filter(m => !m.direct && m.channel_idx == channelIdx);
+      if (!readChannels) readChannels = {};
+      readChannels[channelIdx] = msgs.map(m => m.timestamp);
+      saveReadChannels();
+      fetchMessagesAndNodes();
+    }
+    function isDMRead(ts) {
+      return readDMs.includes(ts);
+    }
+    function isChannelMsgRead(ts, channelIdx) {
+      return readChannels && readChannels[channelIdx] && readChannels[channelIdx].includes(ts);
+    }
+
+    // --- Ticker Dismissal State ---
+    function setTickerDismissed(ts) {
+      // Store the timestamp of the dismissed message and expiry
+      localStorage.setItem("tickerDismissed", JSON.stringify({ts: ts, until: Date.now() + 30000}));
+    }
+    function isTickerDismissed(ts) {
+      let obj = {};
+      try { obj = JSON.parse(localStorage.getItem("tickerDismissed") || "{}"); } catch(e){}
+      if (!obj.ts || !obj.until) return false;
+      // Only dismiss if the same message and not expired
+      return obj.ts === ts && Date.now() < obj.until;
+    }
+
+    // --- Timezone Offset State ---
+    function getTimezoneOffset() {
+      let tz = localStorage.getItem("meshtastic_ui_tz_offset");
+      if (tz === null || isNaN(Number(tz))) return 0;
+      return Number(tz);
+    }
+    function setTimezoneOffset(val) {
+      localStorage.setItem("meshtastic_ui_tz_offset", String(val));
+    }
+
+    // Globals for reply targets
+    var lastDMTarget = null;
+    var lastChannelTarget = null;
+    let allNodes = [];
+    let allMessages = [];
+    let lastMessageTimestamp = null;
+    let tickerTimeout = null;
+    let tickerLastShownTimestamp = null;
+    let nodeGPSInfo = """ + node_gps_info_json + """;
+    let myGPS = """ + my_gps_json + """;
+
+    // --- Node Sorting ---
+    let nodeSortKey = localStorage.getItem("nodeSortKey") || "name";
+    let nodeSortDir = localStorage.getItem("nodeSortDir") || "asc";
+
+    function setNodeSort(key, dir) {
+      nodeSortKey = key;
+      nodeSortDir = dir;
+      localStorage.setItem("nodeSortKey", key);
+      localStorage.setItem("nodeSortDir", dir);
+      updateNodesUI(allNodes, false);
+    }
+
+    function compareNodes(a, b) {
+      // Helper for null/undefined
+      function safe(v) { return v === undefined || v === null ? "" : v; }
+      // For distance, use haversine if both have GPS, else sort GPS-enabled first
+      if (nodeSortKey === "distance") {
+        let aGPS = nodeGPSInfo[String(a.id)];
+        let bGPS = nodeGPSInfo[String(b.id)];
+        let aHas = aGPS && aGPS.lat != null && aGPS.lon != null;
+        let bHas = bGPS && bGPS.lat != null && bGPS.lon != null;
+        if (!aHas && !bHas) return 0;
+        if (aHas && !bHas) return -1;
+        if (!aHas && bHas) return 1;
+        let distA = calcDistance(myGPS.lat, myGPS.lon, aGPS.lat, aGPS.lon);
+        let distB = calcDistance(myGPS.lat, myGPS.lon, bGPS.lat, bGPS.lon);
+        return (distA - distB) * (nodeSortDir === "asc" ? 1 : -1);
+      }
+      if (nodeSortKey === "gps") {
+        let aGPS = nodeGPSInfo[String(a.id)];
+        let bGPS = nodeGPSInfo[String(b.id)];
+        let aHas = aGPS && aGPS.lat != null && aGPS.lon != null;
+        let bHas = bGPS && bGPS.lat != null && bGPS.lon != null;
+        if (aHas && !bHas) return nodeSortDir === "asc" ? -1 : 1;
+        if (!aHas && bHas) return nodeSortDir === "asc" ? 1 : -1;
+        return 0;
+      }
+      if (nodeSortKey === "name") {
+        let cmp = safe(a.shortName).localeCompare(safe(b.shortName), undefined, {sensitivity:"base"});
+        return cmp * (nodeSortDir === "asc" ? 1 : -1);
+      }
+      if (nodeSortKey === "beacon") {
+        let aGPS = nodeGPSInfo[String(a.id)];
+        let bGPS = nodeGPSInfo[String(b.id)];
+        let aTime = aGPS && aGPS.beacon_time ? Date.parse(aGPS.beacon_time.replace(" UTC","Z")) : 0;
+        let bTime = bGPS && bGPS.beacon_time ? Date.parse(bGPS.beacon_time.replace(" UTC","Z")) : 0;
+        return (bTime - aTime) * (nodeSortDir === "asc" ? -1 : 1);
+      }
+      if (nodeSortKey === "hops") {
+        let aGPS = nodeGPSInfo[String(a.id)];
+        let bGPS = nodeGPSInfo[String(b.id)];
+        let aH = aGPS && aGPS.hops != null ? aGPS.hops : 99;
+        let bH = bGPS && bGPS.hops != null ? bGPS.hops : 99;
+        return (aH - bH) * (nodeSortDir === "asc" ? 1 : -1);
+      }
+      return 0;
+    }
+
+    // Haversine formula (km)
+    function calcDistance(lat1, lon1, lat2, lon2) {
+      if (
+        lat1 == null || lon1 == null ||
+        lat2 == null || lon2 == null
+      ) return 99999;
+      let toRad = x => x * Math.PI / 180;
+      let R = 6371;
+      let dLat = toRad(lat2 - lat1);
+      let dLon = toRad(lon2 - lon1);
+      let a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+              Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+              Math.sin(dLon/2) * Math.sin(dLon/2);
+      let c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      return R * c;
+    }
+
+    // --- UI Settings State ---
+    let uiSettings = {
+      themeColor: "#ffa500",
+      hueRotateEnabled: false,
+      hueRotateSpeed: 10,
+      soundURL: ""
+    };
+    let hueRotateInterval = null;
+    let currentHue = 0;
+
+    function toggleMode(force) {
+      if (typeof force !== "undefined") {
+        document.getElementById('modeSwitch').checked = force === 'direct';
+      }
+      const dm = document.getElementById('modeSwitch').checked;
+      document.getElementById('dmField').style.display = dm ? 'block' : 'none';
+      document.getElementById('channelField').style.display = dm ? 'none' : 'block';
+      document.getElementById('modeLabel').textContent = dm ? 'Direct' : 'Broadcast';
+    }
+
+    // Defensive toggle function: ensures the settings panel can be
+    // toggled even if other JS earlier in the page throws an error
+    // and prevents the normal event listeners from being installed.
+    function toggleSettings() {
+      try {
+        console && console.debug && console.debug('toggleSettings called');
+        const panel = document.getElementById('settingsPanel');
+        const toggle = document.getElementById('settingsToggle');
+        if (!panel || !toggle) return;
+        if (panel.style.display === 'none' || panel.style.display === '') {
+          panel.style.display = 'block';
+          toggle.textContent = "Hide UI Settings";
+        } else {
+          panel.style.display = 'none';
+          toggle.textContent = "Show UI Settings";
+        }
+      } catch (e) { console && console.error && console.error('toggleSettings error', e); }
+    }
+
+    // Expose toggleSettings to the global scope so inline onclick handlers
+    // still work even if other JS errors prevent event bindings below.
+    try { window.toggleSettings = toggleSettings; } catch (e) { console && console.error && console.error('expose toggleSettings failed', e); }
+
+    // Defensive DOM wiring: run after DOMContentLoaded
+    document.addEventListener("DOMContentLoaded", function() {
+      // Defensive bindings: check elements exist before using them so one
+      // missing element doesn't break all other UI wiring.
+      const modeSwitchEl = document.getElementById('modeSwitch');
+      if (modeSwitchEl) modeSwitchEl.addEventListener('change', function() { toggleMode(); });
+
+      const settingsToggleEl = document.getElementById('settingsToggle');
+      const settingsPanelEl = document.getElementById('settingsPanel');
+      if (settingsToggleEl) {
+        settingsToggleEl.addEventListener('click', function() {
+          if (!settingsPanelEl) return;
+          if (settingsPanelEl.style.display === 'none' || settingsPanelEl.style.display === '') {
+            settingsPanelEl.style.display = 'block';
+            settingsToggleEl.textContent = "Hide UI Settings";
+          } else {
+            settingsPanelEl.style.display = 'none';
+            settingsToggleEl.textContent = "Show UI Settings";
+          }
+        });
+      }
+      if (settingsPanelEl) {
+        settingsPanelEl.style.display = 'none'; // Hide settings panel by default
+      }
+      if (settingsToggleEl) settingsToggleEl.textContent = "Show UI Settings";
+
+      const nodeSearchEl = document.getElementById('nodeSearch');
+      if (nodeSearchEl) nodeSearchEl.addEventListener('input', function() { filterNodes(this.value, false); });
+      const destNodeSearchEl = document.getElementById('destNodeSearch');
+      if (destNodeSearchEl) destNodeSearchEl.addEventListener('input', function() { filterNodes(this.value, true); });
+
+      // Node sort controls
+      const nodeSortKeyEl = document.getElementById('nodeSortKey');
+      const nodeSortDirEl = document.getElementById('nodeSortDir');
+      if (nodeSortKeyEl) nodeSortKeyEl.addEventListener('change', function() { setNodeSort(this.value, nodeSortDir); });
+      if (nodeSortDirEl) nodeSortDirEl.addEventListener('change', function() { setNodeSort(nodeSortKey, this.value); });
+
+      // --- UI Settings: Load from localStorage ---
+      try { loadUISettings(); } catch (e) { console && console.error && console.error('loadUISettings failed', e); }
+
+      // Set initial values in settings panel
+      document.getElementById('uiColorPicker').value = uiSettings.themeColor;
+      document.getElementById('hueRotateEnabled').checked = uiSettings.hueRotateEnabled;
+      document.getElementById('hueRotateSpeed').value = uiSettings.hueRotateSpeed;
+      document.getElementById('soundURL').value = uiSettings.soundURL;
+
+      // Apply settings on load
+      applyThemeColor(uiSettings.themeColor);
+      if (uiSettings.hueRotateEnabled) startHueRotate(uiSettings.hueRotateSpeed);
+      setIncomingSound(uiSettings.soundURL);
+
+      // Apply button
+      document.getElementById('applySettingsBtn').addEventListener('click', function() {
+        // Read values
+        uiSettings.themeColor = document.getElementById('uiColorPicker').value;
+        uiSettings.hueRotateEnabled = document.getElementById('hueRotateEnabled').checked;
+        uiSettings.hueRotateSpeed = parseFloat(document.getElementById('hueRotateSpeed').value);
+        // For soundURL, only allow local file path from file input
+        var fileInput = document.getElementById('soundFile');
+        if (fileInput && fileInput.files.length > 0) {
+          var file = fileInput.files[0];
+          var url = URL.createObjectURL(file);
+          uiSettings.soundURL = url;
+          document.getElementById('soundURL').value = file.name;
+        }
+        saveUISettings();
+        applyThemeColor(uiSettings.themeColor);
+        if (uiSettings.hueRotateEnabled) {
+          startHueRotate(uiSettings.hueRotateSpeed);
+        } else {
+          stopHueRotate();
+        }
+        setIncomingSound(uiSettings.soundURL);
+        // Save timezone offset
+        setTimezoneOffset(document.getElementById('timezoneSelect').value);
+        fetchMessagesAndNodes();
+      });
+
+      // Listen for file input change to update sound preview
+      document.getElementById('soundFile').addEventListener('change', function() {
+        if (this.files.length > 0) {
+          var file = this.files[0];
+          var url = URL.createObjectURL(file);
+          uiSettings.soundURL = url;
+          document.getElementById('soundURL').value = file.name;
+          setIncomingSound(url);
+        }
+      });
+
+      // Set initial sort controls
+      document.getElementById('nodeSortKey').value = nodeSortKey;
+      document.getElementById('nodeSortDir').value = nodeSortDir;
+
+      // Set timezone selector
+      let tzSel = document.getElementById('timezoneSelect');
+      let tz = getTimezoneOffset();
+      tzSel.value = tz;
+    });
+
+    // --- UI Settings Functions ---
+    function saveUISettings() {
+      // Only persist the file name for sound, not the blob URL
+      let settingsToSave = Object.assign({}, uiSettings);
+      if (settingsToSave.soundURL && settingsToSave.soundURL.startsWith('blob:')) {
+        settingsToSave.soundURL = document.getElementById('soundURL').value;
+      }
+      localStorage.setItem("meshtastic_ui_settings", JSON.stringify(settingsToSave));
+    }
+    function loadUISettings() {
+      try {
+        let s = localStorage.getItem("meshtastic_ui_settings");
+        if (s) {
+          let parsed = JSON.parse(s);
+          Object.assign(uiSettings, parsed);
+        }
+      } catch (e) {}
+    }
+    function applyThemeColor(color) {
+      document.documentElement.style.setProperty('--theme-color', color);
+    }
+    function startHueRotate(speed) {
+      stopHueRotate();
+      hueRotateInterval = setInterval(function() {
+        currentHue = (currentHue + 1) % 360;
+        document.body.style.filter = `hue-rotate(${currentHue}deg)`;
+      }, Math.max(5, 1000 / Math.max(1, speed)));
+    }
+    function stopHueRotate() {
+      if (hueRotateInterval) clearInterval(hueRotateInterval);
+      hueRotateInterval = null;
+      document.body.style.filter = "";
+      currentHue = 0;
+    }
+    function toggleHueRotate(enabled, speed) {
+      uiSettings.hueRotateEnabled = enabled;
+      uiSettings.hueRotateSpeed = speed;
+      saveUISettings();
+      if (enabled) startHueRotate(speed);
+      else stopHueRotate();
+    }
+    function setIncomingSound(url) {
+      let audio = document.getElementById('incomingSound');
+      audio.src = url || "";
+      uiSettings.soundURL = url;
+      saveUISettings();
+    }
+
+    function replyToMessage(mode, target) {
+      toggleMode(mode);
+      if (mode === 'direct') {
+        const dest = document.getElementById('destNode');
+        dest.value = target;
+        const name = dest.selectedOptions[0] ? dest.selectedOptions[0].text.split(' (')[0] : '';
+        document.getElementById('messageBox').value = '@' + name + ': ';
+      } else {
+        const ch = document.getElementById('channelSel');
+        ch.value = target;
+        document.getElementById('messageBox').value = '';
+      }
+    }
+
+    function dmToNode(nodeId, shortName, replyToTs) {
+      toggleMode('direct');
+      document.getElementById('destNode').value = nodeId;
+      if (replyToTs) {
+        // Prefill with quoted message if replying to a thread
+        let threadMsg = allMessages.find(m => m.timestamp === replyToTs);
+        let quoted = threadMsg ? `> ${threadMsg.message}\n` : '';
+        document.getElementById('messageBox').value = quoted + '@' + shortName + ': ';
+      } else {
+        document.getElementById('messageBox').value = '@' + shortName + ': ';
+      }
+    }
+
+    function replyToLastDM() {
+      if (lastDMTarget !== null) {
+        const opt = document.querySelector(`#destNode option[value="${lastDMTarget}"]`);
+        const shortName = opt ? opt.text.split(' (')[0] : '';
+        dmToNode(lastDMTarget, shortName);
+      } else {
+        alert("No direct message target available.");
+      }
+    }
+
+    function replyToLastChannel() {
+      if (lastChannelTarget !== null) {
+        toggleMode('broadcast');
+        document.getElementById('channelSel').value = lastChannelTarget;
+        document.getElementById('messageBox').value = '';
+      } else {
+        alert("No broadcast channel target available.");
+      }
+    }
+
+    // Data fetch & UI updates
+    const CHANNEL_NAMES = """ + json.dumps(channel_names) + """;
+
+    function getNowUTC() {
+      return new Date(new Date().toISOString().slice(0, 19) + "Z");
+    }
+
+    function getTZAdjusted(tsStr) {
+      // tsStr is "YYYY-MM-DD HH:MM:SS UTC"
+      let tz = getTimezoneOffset();
+      if (!tsStr) return "";
+      let dt = new Date(tsStr.replace(" UTC", "Z"));
+      if (isNaN(dt.getTime())) return tsStr;
+      dt.setHours(dt.getHours() + tz);
+      let pad = n => n < 10 ? "0" + n : n;
+      return dt.getFullYear() + "-" + pad(dt.getMonth()+1) + "-" + pad(dt.getDate()) + " " +
+             pad(dt.getHours()) + ":" + pad(dt.getMinutes()) + ":" + pad(dt.getSeconds()) +
+             (tz === 0 ? " UTC" : (tz > 0 ? " UTC+" + tz : " UTC" + tz));
+    }
+
+    function isRecent(tsStr, minutes) {
+      if (!tsStr) return false;
+      let now = getNowUTC();
+      let msgTime = new Date(tsStr.replace(" UTC", "Z"));
+      return (now - msgTime) < minutes * 60 * 1000;
+    }
+
+    async function fetchMessagesAndNodes() {
+      try {
+        let msgs = await (await fetch("/messages")).json();
+        allMessages = msgs;
+        let nodes = await (await fetch("/nodes")).json();
+        allNodes = nodes;
+        updateMessagesUI(msgs);
+        updateNodesUI(nodes, false);
+        updateNodesUI(nodes, true);
+        updateDirectMessagesUI(msgs, nodes);
+        highlightRecentNodes(nodes);
+        showLatestMessageTicker(msgs);
+        updateDiscordMessagesUI(msgs);
+      } catch (e) { console.error(e); }
+    }
+
+    function updateMessagesUI(messages) {
+      // Reverse the order to show the newest messages first
+      const groups = {};
+      messages.slice().reverse().forEach(m => {
+        if (!m.direct && m.channel_idx != null) {
+          (groups[m.channel_idx] = groups[m.channel_idx] || []).push(m);
+        }
+      });
+
+      const channelDiv = document.getElementById("channelDiv");
+      channelDiv.innerHTML = "";
+      Object.keys(groups).sort().forEach(ch => {
+        const name = CHANNEL_NAMES[ch] || `Channel ${ch}`;
+        // Channel header with reply and mark all as read button
+        const headerWrap = document.createElement("div");
+        headerWrap.className = "channel-header";
+        const header = document.createElement("h3");
+        header.textContent = `${ch} – ${name}`;
+        header.style.margin = 0;
+        headerWrap.appendChild(header);
+
+        // Add reply button for channel
+        const replyBtn = document.createElement("button");
+        replyBtn.textContent = "Send to Channel";
+        replyBtn.className = "reply-btn";
+        replyBtn.onclick = function() {
+          replyToMessage('broadcast', ch);
+        };
+        headerWrap.appendChild(replyBtn);
+
+        // Mark all as read for this channel
+        const markAllBtn = document.createElement("button");
+        markAllBtn.textContent = "Mark all as read";
+        markAllBtn.className = "mark-all-read-btn";
+        markAllBtn.onclick = function() {
+          markChannelAsRead(ch);
+        };
+        headerWrap.appendChild(markAllBtn);
+
+        channelDiv.appendChild(headerWrap);
+
+        groups[ch].forEach(m => {
+          if (isChannelMsgRead(m.timestamp, ch)) return; // Hide read messages
+          const wrap = document.createElement("div");
+          wrap.className = "message";
+          if (isRecent(m.timestamp, 60)) wrap.classList.add("newMessage");
+          const ts = document.createElement("div");
+          ts.className = "timestamp";
+          ts.textContent = `📢 ${getTZAdjusted(m.timestamp)} | ${m.node}`;
+          const body = document.createElement("div");
+          body.textContent = m.message;
+          wrap.append(ts, body);
+
+          // Mark as read button
+          const markBtn = document.createElement("button");
+          markBtn.textContent = "Mark as read";
+          markBtn.className = "mark-read-btn";
+          markBtn.onclick = function() {
+            if (!readChannels[ch]) readChannels[ch] = [];
+            if (!readChannels[ch].includes(m.timestamp)) {
+              readChannels[ch].push(m.timestamp);
+              saveReadChannels();
+              fetchMessagesAndNodes();
+            }
+          };
+          wrap.appendChild(markBtn);
+
+          channelDiv.appendChild(wrap);
+        });
+        channelDiv.appendChild(document.createElement("hr"));
+      });
+
+      // Update global reply targets
+      lastDMTarget = null;
+      lastChannelTarget = null;
+      for (const m of messages) {
+        if (m.direct && m.node_id != null && lastDMTarget === null) {
+          lastDMTarget = m.node_id;
+        }
+        if (!m.direct && m.channel_idx != null && lastChannelTarget === null) {
+          lastChannelTarget = m.channel_idx;
+        }
+        if (lastDMTarget != null && lastChannelTarget != null) break;
+      }
+    }
+
+    // --- DM Threaded UI ---
+    function updateDirectMessagesUI(messages, nodes) {
+      // Group DMs by node_id, then by thread (reply_to)
+      const dmDiv = document.getElementById("dmMessagesDiv");
+      dmDiv.innerHTML = "";
+
+      // Only direct messages, newest first
+      let dms = messages.filter(m => m.direct && !isDMRead(m.timestamp)).slice().reverse();
+
+      // Group by node_id
+      let threads = {};
+      dms.forEach(m => {
+        if (!threads[m.node_id]) threads[m.node_id] = [];
+        threads[m.node_id].push(m);
+      });
+
+      // Mark all as read button for DMs
+      if (dms.length > 0) {
+        const markAllBtn = document.createElement("button");
+        markAllBtn.textContent = "Mark all as read";
+        markAllBtn.className = "mark-all-read-btn";
+        markAllBtn.onclick = function() {
+          markAllDMsAsRead();
+        };
+        dmDiv.appendChild(markAllBtn);
+      }
+
+      Object.keys(threads).forEach(nodeId => {
+        const node = allNodes.find(n => n.id == nodeId);
+        const shortName = node ? node.shortName : nodeId;
+        const threadDiv = document.createElement("div");
+        threadDiv.className = "dm-thread";
+
+        // Find root messages (no reply_to)
+        let rootMsgs = threads[nodeId].filter(m => !m.reply_to);
+
+        rootMsgs.forEach(rootMsg => {
+          const wrap = document.createElement("div");
+          wrap.className = "message";
+          if (isRecent(rootMsg.timestamp, 60)) wrap.classList.add("newMessage");
+          const ts = document.createElement("div");
+          ts.className = "timestamp";
+          ts.textContent = `📩 ${getTZAdjusted(rootMsg.timestamp)} | ${rootMsg.node}`;
+          const body = document.createElement("div");
+          body.textContent = rootMsg.message;
+          wrap.append(ts, body);
+
+          // Add reply button for root
+          const replyBtn = document.createElement("button");
+          replyBtn.textContent = "Reply";
+          replyBtn.className = "reply-btn";
+          replyBtn.onclick = function() {
+            dmToNode(nodeId, shortName, rootMsg.timestamp);
+          };
+          wrap.appendChild(replyBtn);
+
+          // Mark as read button for root
+          const markBtn = document.createElement("button");
+          markBtn.textContent = "Mark as read";
+          markBtn.className = "mark-read-btn";
+          markBtn.onclick = function() {
+            markDMAsRead(rootMsg.timestamp);
+          };
+          wrap.appendChild(markBtn);
+
+          threadDiv.appendChild(wrap);
+
+          // Find replies to this root
+          let replies = threads[nodeId].filter(m => m.reply_to === rootMsg.timestamp);
+          if (replies.length) {
+            const repliesDiv = document.createElement("div");
+            repliesDiv.className = "thread-replies";
+            replies.forEach(replyMsg => {
+              const replyWrap = document.createElement("div");
+              replyWrap.className = "message";
+              if (isRecent(replyMsg.timestamp, 60)) replyWrap.classList.add("newMessage");
+              const rts = document.createElement("div");
+              rts.className = "timestamp";
+              rts.textContent = `↪️ ${getTZAdjusted(replyMsg.timestamp)} | ${replyMsg.node}`;
+              const rbody = document.createElement("div");
+              rbody.textContent = replyMsg.message;
+              replyWrap.append(rts, rbody);
+
+              // Reply to reply (threaded)
+              const replyBtn2 = document.createElement("button");
+              replyBtn2.textContent = "Reply";
+              replyBtn2.className = "reply-btn";
+              replyBtn2.onclick = function() {
+                dmToNode(nodeId, shortName, replyMsg.timestamp);
+              };
+              replyWrap.appendChild(replyBtn2);
+
+              // Mark as read button for reply
+              const markBtn2 = document.createElement("button");
+              markBtn2.textContent = "Mark as read";
+              markBtn2.className = "mark-read-btn";
+              markBtn2.onclick = function() {
+                markDMAsRead(replyMsg.timestamp);
+              };
+              replyWrap.appendChild(markBtn2);
+
+              repliesDiv.appendChild(replyWrap);
+            });
+            threadDiv.appendChild(repliesDiv);
+          }
+        });
+
+        dmDiv.appendChild(threadDiv);
+      });
+    }
+
+    function updateNodesUI(nodes, isDest) {
+      // isDest: false = available nodes panel, true = destination node dropdown
+      if (!isDest) {
+        const list = document.getElementById("nodeListDiv");
+        let filter = document.getElementById('nodeSearch').value.toLowerCase();
+        list.innerHTML = "";
+        let filtered = nodes.filter(n =>
+          (n.shortName && n.shortName.toLowerCase().includes(filter)) ||
+          (n.longName && n.longName.toLowerCase().includes(filter)) ||
+          String(n.id).toLowerCase().includes(filter)
+        );
+        // Sort
+        filtered.sort(compareNodes);
+
+        filtered.forEach(n => {
+          const d = document.createElement("div");
+          d.className = "nodeItem";
+          if (isRecentNode(n.id)) d.classList.add("recentNode");
+
+          // Main line: Short name and ID
+          const mainLine = document.createElement("div");
+          mainLine.className = "nodeMainLine";
+          mainLine.innerHTML = `<span>${n.shortName || ""}</span> <span style="color:#ffa500;">(${n.id})</span>`;
+          d.appendChild(mainLine);
+
+          // Long name (if present)
+          if (n.longName && n.longName !== n.shortName) {
+            const longName = document.createElement("div");
+            longName.className = "nodeLongName";
+            longName.textContent = n.longName;
+            d.appendChild(longName);
+          }
+
+          // Info line 1: GPS/map, distance
+          const infoLine1 = document.createElement("div");
+          infoLine1.className = "nodeInfoLine";
+          let gps = nodeGPSInfo[String(n.id)];
+          if (gps && gps.lat != null && gps.lon != null) {
+            // Map button (emoji)
+            const mapA = document.createElement("a");
+            mapA.href = `https://www.google.com/maps/search/?api=1&query=${gps.lat},${gps.lon}`;
+            mapA.target = "_blank";
+            mapA.className = "nodeMapBtn";
+            mapA.title = "Show on Google Maps";
+            mapA.innerHTML = "🗺️";
+            infoLine1.appendChild(mapA);
+
+            // Distance
+            if (myGPS && myGPS.lat != null && myGPS.lon != null) {
+              let dist = calcDistance(myGPS.lat, myGPS.lon, gps.lat, gps.lon);
+              if (dist < 99999) {
+                const distSpan = document.createElement("span");
+                distSpan.className = "nodeGPS";
+                distSpan.title = "Approximate distance from connected node";
+                distSpan.innerHTML = `📏 ${dist.toFixed(2)} km`;
+                infoLine1.appendChild(distSpan);
+              }
+            }
+          }
+          d.appendChild(infoLine1);
+
+          // Info line 2: Beacon/reporting time
+          const infoLine2 = document.createElement("div");
+          infoLine2.className = "nodeInfoLine";
+          if (gps && gps.beacon_time) {
+            const beacon = document.createElement("span");
+            beacon.className = "nodeBeacon";
+            beacon.title = "Last beacon/reporting time";
+            beacon.innerHTML = `🕒 ${getTZAdjusted(gps.beacon_time)}`;
+            infoLine2.appendChild(beacon);
+          }
+          d.appendChild(infoLine2);
+
+          // Info line 3: Hops
+          const infoLine3 = document.createElement("div");
+          infoLine3.className = "nodeInfoLine";
+          // Only show hops if available and not null/undefined/""
+          if (gps && gps.hops != null && gps.hops !== "" && gps.hops !== undefined) {
+            const hops = document.createElement("span");
+            hops.className = "nodeHops";
+            hops.title = "Hops from this node";
+            hops.innerHTML = `⛓️ ${gps.hops} hop${gps.hops==1?"":"s"}`;
+            infoLine3.appendChild(hops);
+            d.appendChild(infoLine3);
+          }
+          // If hops is not available, do not show this section at all
+
+          // DM button
+          const btn = document.createElement("button");
+          btn.textContent = "DM";
+          btn.className = "btn";
+          btn.onclick = () => dmToNode(n.id, n.shortName);
+          d.append(btn);
+
+          list.appendChild(d);
+        });
+      } else {
+        const sel  = document.getElementById("destNode");
+        const prevNode = sel.value;
+        sel.innerHTML  = "<option value=''>--Select Node--</option>";
+        let filter = document.getElementById('destNodeSearch').value.toLowerCase();
+        let filtered = nodes.filter(n =>
+          (n.shortName && n.shortName.toLowerCase().includes(filter)) ||
+          (n.longName && n.longName.toLowerCase().includes(filter)) ||
+          String(n.id).toLowerCase().includes(filter)
+        );
+        filtered.forEach(n => {
+          const opt = document.createElement("option");
+          opt.value = n.id;
+          opt.innerHTML = `${n.shortName} (${n.id})`;
+          sel.append(opt);
+        });
+        sel.value = prevNode;
+      }
+    }
+
+    function filterNodes(val, isDest) {
+      updateNodesUI(allNodes, isDest);
+    }
+
+    // Track recently discovered nodes (seen in last hour)
+    function isRecentNode(nodeId) {
+      // Find the latest message from this node
+      let found = allMessages.slice().reverse().find(m => m.node_id == nodeId);
+      if (!found) return false;
+      return isRecent(found.timestamp, 60);
+    }
+
+    function highlightRecentNodes(nodes) {
+      // Called after updateNodesUI
+      // No-op: handled by .recentNode class in updateNodesUI
+    }
+
+    // Show latest inbound message in ticker, dismissable, timeout after 30s, and persist dismiss across refreshes
+    function showLatestMessageTicker(messages) {
+      // Show both channel and direct inbound messages, but not outgoing (WebUI, Discord, Twilio, DiscordPoll, AI_NODE_NAME)
+      // and not AI responses (reply_to is not null)
+      let inbound = messages.filter(m =>
+        m.node !== "WebUI" &&
+        m.node !== "Discord" &&
+        m.node !== "Twilio" &&
+        m.node !== "DiscordPoll" &&
+        m.node !== """ + json.dumps(AI_NODE_NAME) + """ &&
+        (!m.reply_to) // Only show original messages, not replies (AI responses)
+      );
+      if (!inbound.length) return hideTicker();
+      let latest = inbound[inbound.length - 1];
+      if (!latest || !latest.message) return hideTicker();
+
+      // If dismissed, don't show
+      if (isTickerDismissed(latest.timestamp)) return hideTicker();
+
+      // Only show ticker if not already shown for this message
+      if (tickerLastShownTimestamp === latest.timestamp) return;
+      tickerLastShownTimestamp = latest.timestamp;
+
+      let ticker = document.getElementById('ticker');
+      let tickerMsg = ticker.querySelector('p');
+      tickerMsg.textContent = latest.message;
+      ticker.style.display = 'block';
+
+      // Show dismiss button at far right, on top
+      let dismissBtn = ticker.querySelector('.dismiss-btn');
+      if (!dismissBtn) {
+        dismissBtn = document.createElement('button');
+        dismissBtn.textContent = "Dismiss";
+        dismissBtn.className = "dismiss-btn";
+        dismissBtn.onclick = function(e) {
+          e.stopPropagation();
+          ticker.style.display = 'none';
+          setTickerDismissed(latest.timestamp);
+          if (tickerTimeout) clearTimeout(tickerTimeout);
+        };
+        ticker.appendChild(dismissBtn);
+      } else {
+        // Always update dismiss button to dismiss this message
+        dismissBtn.onclick = function(e) {
+          e.stopPropagation();
+          ticker.style.display = 'none';
+          setTickerDismissed(latest.timestamp);
+          if (tickerTimeout) clearTimeout(tickerTimeout);
+        };
+      }
+
+      // Remove after 30s and persist dismiss
+      if (tickerTimeout) clearTimeout(tickerTimeout);
+      tickerTimeout = setTimeout(() => {
+        ticker.style.display = 'none';
+        setTickerDismissed(latest.timestamp);
+        tickerLastShownTimestamp = null;
+      }, 30000);
+    }
+
+    function hideTicker() {
+      let ticker = document.getElementById('ticker');
+      ticker.style.display = 'none';
+      tickerLastShownTimestamp = null;
+      if (tickerTimeout) {
+        clearTimeout(tickerTimeout);
+        tickerTimeout = null;
+      }
+    }
+
+    function pollStatus() {
+      fetch("/connection_status")
+        .then(r => r.json())
+        .then(d => {
+          const s = document.getElementById("connectionStatus");
+          if (d.status != "Connected") {
+            s.style.background = "red";
+            s.style.height = "40px";
+            s.textContent = `Connection Error: ${d.error}`;
+          } else {
+            s.style.background = "green";
+            s.style.height = "20px";
+            s.textContent = "Connected";
+          }
+        })
+        .catch(e => console.error(e));
+    }
+    setInterval(pollStatus, 5000);
+
+    function onPageLoad() {
+      setInterval(fetchMessagesAndNodes, 10000);
+      fetchMessagesAndNodes();
+      toggleMode(); // Set initial mode
+    }
+    window.addEventListener("load", onPageLoad);
+
+    // --- Discord Messages Section ---
+    function updateDiscordMessagesUI(messages) {
+      // Only show Discord messages if any exist
+      let discordMsgs = messages.filter(m => m.node === "Discord" || m.node === "DiscordPoll");
+      let discordSection = document.getElementById("discordSection");
+      let discordDiv = document.getElementById("discordMessagesDiv");
+      if (discordMsgs.length === 0) {
+        discordSection.style.display = "none";
+        discordDiv.innerHTML = "";
+        return;
+      }
+      discordSection.style.display = "block";
+      discordDiv.innerHTML = "";
+      discordMsgs.forEach(m => {
+        const wrap = document.createElement("div");
+        wrap.className = "message";
+        if (isRecent(m.timestamp, 60)) wrap.classList.add("newMessage");
+        const ts = document.createElement("div");
+        ts.className = "timestamp";
+        ts.textContent = `💬 ${getTZAdjusted(m.timestamp)} | ${m.node}`;
+        const body = document.createElement("div");
+        body.textContent = m.message;
+        wrap.append(ts, body);
+        discordDiv.appendChild(wrap);
+      });
+    }
+  </script>
+</head>
+<body onload="onPageLoad()">
+  <div id="connectionStatus"></div>
+  <div class="header-buttons"><a href="/logs" target="_blank">Logs</a></div>
+  <div id="ticker-container">
+    <div id="ticker"><p></p></div>
+  </div>
+  <audio id="incomingSound"></audio>
+
+  <div class="lcars-panel" id="sendForm">
+    <h2>Send a Message</h2>
+    <form method="POST" action="/ui_send">
+      <label>Message Mode:</label>
+      <label class="switch">
+        <input type="checkbox" id="modeSwitch">
+        <span class="slider round"></span>
+      </label>
+      <span id="modeLabel">Broadcast</span><br><br>
+
+      <div id="dmField" style="display:none;">
+        <label>Destination Node:</label><br>
+        <input type="text" id="destNodeSearch" placeholder="Search destination nodes..."><br>
+        <select id="destNode" name="destination_node"></select><br><br>
+      </div>
+
+      <div id="channelField" style="display:block;">
+        <label>Channel:</label><br>
+        <select id="channelSel" name="channel_index">
+"""
+    for i in range(8):
+        name = channel_names.get(str(i), f"Channel {i}")
+        html += f"          <option value='{i}'>{i} - {name}</option>\n"
+    html += """        </select><br><br>
+      </div>
+
+      <label>Message:</label><br>
+      <textarea id="messageBox" name="message" rows="3" style="width:80%;"></textarea>
+      <div id="charCounter">Characters: 0/1000, Chunks: 0/5</div><br>
+      <button type="submit">Send</button>
+      <button type="button" onclick="replyToLastDM()">Reply to Last DM</button>
+      <button type="button" onclick="replyToLastChannel()">Reply to Last Channel</button>
+    </form>
+  </div>
+
+  <div class="three-col">
+    <div class="col">
+      <div class="lcars-panel">
+        <h2>Channel Messages</h2>
+        <div id="channelDiv"></div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="lcars-panel">
+        <h2>Available Nodes</h2>
+        <input type="text" id="nodeSearch" placeholder="Search nodes by name, id, or long name...">
+        <div class="nodeSortBar">
+          <label for="nodeSortKey">Sort by:</label>
+          <select id="nodeSortKey">
+            <option value="name">Name</option>
+            <option value="beacon">Last Reporting Time</option>
+            <option value="hops">Number of Hops</option>
+            <option value="gps">GPS Enabled</option>
+            <option value="distance">Distance</option>
+          </select>
+          <label for="nodeSortDir">Order:</label>
+          <select id="nodeSortDir">
+            <option value="asc">Ascending</option>
+            <option value="desc">Descending</option>
+          </select>
+        </div>
+        <div id="nodeListDiv"></div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="lcars-panel">
+        <h2>Direct Messages</h2>
+        <div id="dmMessagesDiv"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="lcars-panel" id="discordSection" style="margin:20px;">
+    <h2>Discord Messages</h2>
+    <div id="discordMessagesDiv"></div>
+  </div>
+
+    <div class="settings-toggle" id="settingsToggle" onclick="toggleSettings()">Show UI Settings</div>
+    <!-- Fallback toggleSettings: ensures the button works even if main script fails to load -->
+    <script>
+      if (typeof window.toggleSettings !== 'function') {
+        window.toggleSettings = function() {
+          try {
+            var panel = document.getElementById('settingsPanel');
+            var toggle = document.getElementById('settingsToggle');
+            if (!panel || !toggle) return;
+            if (panel.style.display === 'none' || panel.style.display === '') {
+              panel.style.display = 'block';
+              toggle.textContent = 'Hide UI Settings';
+            } else {
+              panel.style.display = 'none';
+              toggle.textContent = 'Show UI Settings';
+            }
+          } catch (e) { console && console.error && console.error('fallback toggleSettings error', e); }
+        };
+      }
+    </script>
+  <div class="settings-panel" id="settingsPanel">
+    <h2>UI Settings</h2>
+    <label for="uiColorPicker">Theme Color:</label>
+    <input type="color" id="uiColorPicker" value="#ffa500"><br><br>
+    <label for="hueRotateEnabled">Enable Hue Rotation:</label>
+    <input type="checkbox" id="hueRotateEnabled"><br><br>
+    <label for="hueRotateSpeed">Hue Rotation Speed:</label>
+    <input type="range" id="hueRotateSpeed" min="5" max="60" step="0.1" value="10"><br><br>
+    <label for="soundFile">Incoming Message Sound (local file):</label>
+    <input type="file" id="soundFile" accept="audio/*"><br>
+    <input type="text" id="soundURL" placeholder="No file selected" readonly style="background:#222;color:#fff;border:none;"><br><br>
+    <label for="timezoneSelect">Timezone Offset (hours):</label>
+    <select id="timezoneSelect">
+"""
+    # Timezone selector: -12 to +14
+    for tz in range(-12, 15):
+        html += f'      <option value="{tz}">{tz:+d}</option>\n'
+    html += """    </select><br><br>
+    <button id="applySettingsBtn" type="button">Apply Settings</button>
+  </div>
+    </div>
+
+    <!-- Autostart toggle panel (fixed bottom-right) -->
+    <div class="autostart-panel">
+      <div class="autostart-box">
+        <label style="font-weight:bold;color:#fff;margin:0 6px 0 0;">Start MESH-AI on boot</label>
+        <label class="switch" style="margin:0;">
+          <input type="checkbox" id="autostartToggle">
+          <span class="slider round"></span>
+        </label>
+        <button id="saveAutostartBtn" class="btn" style="margin-left:6px;">Save</button>
+      </div>
+    </div>
+
+    <script>
+    // Autostart controls
+      async function loadAutostart() {
+        try {
+          let r = await fetch('/autostart');
+          let j = await r.json();
+          document.getElementById('autostartToggle').checked = !!j.start_on_boot;
+        } catch (e) { console.error(e); }
+      }
+      const saveAutostartBtn = document.getElementById('saveAutostartBtn');
+      const autostartToggleEl = document.getElementById('autostartToggle');
+      if (saveAutostartBtn) {
+        saveAutostartBtn.addEventListener('click', async function() {
+          try {
+            let enabled = autostartToggleEl ? autostartToggleEl.checked : false;
+            let r = await fetch('/autostart/toggle', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({start_on_boot: enabled}) });
+            let j = await r.json();
+            alert('Autostart saved: ' + (j.start_on_boot ? 'Enabled' : 'Disabled'));
+          } catch (e) { alert('Failed to save autostart: ' + e); }
+        });
+      }
+      // Load initial state
+      loadAutostart();
+
+  // Expose defensive toggle to global window in case event binding fails
+  // (already exposed earlier near the toggleSettings definition)
+    </script>
+</body>
+</html>
+"""
+    return html
+
+
+
+@app.route('/autostart', methods=['GET'])
+def get_autostart():
+    cfg = safe_load_json(CONFIG_FILE, {})
+    return jsonify({'start_on_boot': bool(cfg.get('start_on_boot', False))})
+
+
+@app.route('/autostart/toggle', methods=['POST'])
+def toggle_autostart():
+    data = request.get_json(force=True)
+    desired = bool(data.get('start_on_boot', False))
+    # Update config.json
+    try:
+        cfg = safe_load_json(CONFIG_FILE, {})
+        cfg['start_on_boot'] = desired
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    # Update autostart desktop file
+    try:
+        desktop_path = os.path.expanduser('~/.config/autostart/mesh-ai-autostart.desktop')
+        if os.path.exists(desktop_path):
+            # read and replace X-GNOME-Autostart-enabled
+            with open(desktop_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            out = []
+            found = False
+            for L in lines:
+                if L.strip().startswith('X-GNOME-Autostart-enabled'):
+                    out.append('X-GNOME-Autostart-enabled=' + ('true' if desired else 'false') + '\n')
+                    found = True
+                else:
+                    out.append(L)
+            if not found:
+                out.append('X-GNOME-Autostart-enabled=' + ('true' if desired else 'false') + '\n')
+            with open(desktop_path, 'w', encoding='utf-8') as f:
+                f.writelines(out)
+        else:
+            # create the file
+            desktop_dir = os.path.dirname(desktop_path)
+            os.makedirs(desktop_dir, exist_ok=True)
+            with open(desktop_path, 'w', encoding='utf-8') as f:
+                f.write('[Desktop Entry]\nType=Application\nName=MESH-AI Autostart\nExec=' + os.path.abspath('start_mesh_ai.sh') + '\nX-GNOME-Autostart-enabled=' + ('true' if desired else 'false') + '\n')
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    return jsonify({'start_on_boot': desired})
+@app.route("/ui_send", methods=["POST"])
+def ui_send():
+    message = request.form.get("message", "").strip()
+    mode = "direct" if request.form.get("destination_node", "") != "" else "broadcast"
+    if mode == "direct":
+        dest_node = request.form.get("destination_node", "").strip()
+    else:
+        dest_node = None
+    if mode == "broadcast":
+        channel_idx = int(request.form.get("channel_index", "0"))
+    else:
+        channel_idx = None
+    if not message:
+        return redirect(url_for("dashboard"))
+    try:
+        if mode == "direct" and dest_node:
+            dest_info = f"{get_node_shortname(dest_node)} ({dest_node})"
+            log_message("WebUI", f"{message} [to: {dest_info}]", direct=True)
+            info_print(f"[UI] Direct message to node {dest_info} => '{message}'")
+            send_direct_chunks(interface, message, dest_node)
+        else:
+            log_message("WebUI", f"{message} [to: Broadcast Channel {channel_idx}]", direct=False, channel_idx=channel_idx)
+            info_print(f"[UI] Broadcast on channel {channel_idx} => '{message}'")
+            send_broadcast_chunks(interface, message, channel_idx)
+    except Exception as e:
+        print(f"⚠️ /ui_send error: {e}")
+    return redirect(url_for("dashboard"))
+
+
+# Temporary internal test endpoint - simulate an incoming packet and trigger AI response flow
+@app.route("/__test_inject", methods=["POST"])
+def __test_inject():
+    """Inject a synthetic incoming text message to exercise on_receive/AI flow.
+
+    JSON body: { "from": <node_id>, "to": <toId or '^all'>, "channel": <int>, "payload": "text" }
+    Returns the created incoming log entry and any AI reply entry.
+    """
+    try:
+      data = request.json or {}
+      text = data.get('payload') or data.get('text') or ''
+      sender = data.get('from') or data.get('fromId')
+      raw_to = data.get('to') or data.get('toId') or '^all'
+      ch_idx = int(data.get('channel', 0))
+
+      to_node_int = parse_node_id(raw_to)
+      is_direct = (to_node_int != BROADCAST_ADDR)
+
+      # Log incoming message using existing helper
+      incoming = log_message(sender, text, direct=is_direct, channel_idx=(None if is_direct else ch_idx))
+
+      # Update last DM/channel tracking like on_receive
+      global lastDMNode, lastChannelIndex
+      if to_node_int != BROADCAST_ADDR:
+        lastDMNode = sender
+      else:
+        lastChannelIndex = ch_idx
+
+      # Route into pipeline
+      resp = parse_incoming_text(text, sender, is_direct, ch_idx)
+      ai_entry = None
+      if resp:
+        # Wait a short delay similar to on_receive behavior
+        time.sleep(1)
+        ai_entry = log_message(
+          AI_NODE_NAME,
+          resp,
+          reply_to=incoming.get('timestamp') if isinstance(incoming, dict) else None,
+          direct=is_direct,
+          channel_idx=(ch_idx if not is_direct else None),
+          force_node=AI_NODE_NAME,
+        )
+
+      return jsonify({"incoming": incoming, "ai": ai_entry})
+    except Exception as e:
+      return jsonify({"error": str(e)}), 500
+
+@app.route("/send", methods=["POST"])
+def send_message():
+    dprint("POST /send => manual JSON send")
+    data = request.json
+    if not data:
+        return jsonify({"status": "error", "message": "No JSON payload"}), 400
+    message = data.get("message")
+    node_id = data.get("node_id")
+    channel_idx = data.get("channel_index", 0)
+    direct = data.get("direct", False)
+    if not message or node_id is None:
+        return jsonify({"status": "error", "message": "Missing 'message' or 'node_id'"}), 400
+    try:
+        if direct:
+            log_message("WebUI", f"{message} [to: {get_node_shortname(node_id)} ({node_id})]", direct=True)
+            info_print(f"[Info] Direct send to node {node_id} => '{message}'")
+            send_direct_chunks(interface, message, node_id)
+            return jsonify({"status": "sent", "to": node_id, "direct": True, "message": message})
+        else:
+            log_message("WebUI", f"{message} [to: Broadcast Channel {channel_idx}]", direct=False, channel_idx=channel_idx)
+            info_print(f"[Info] Broadcast on ch={channel_idx} => '{message}'")
+            send_broadcast_chunks(interface, message, channel_idx)
+            return jsonify({"status": "sent", "to": f"channel {channel_idx}", "message": message})
+    except Exception as e:
+        print(f"⚠️ Failed to send: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+def connect_interface():
+    """Return a Meshtastic interface with the baud rate from config.
+
+    Resolution order:
+      1. Wi‑Fi TCP bridge
+      2. Local MeshInterface()
+      3. USB SerialInterface (explicit path or auto‑detect)
+    """
+    global connection_status, last_error_message
+    try:
+        # 1️⃣  Wi‑Fi bridge -------------------------------------------------
+        if USE_WIFI and WIFI_HOST and TCPInterface is not None:
+            print(f"TCPInterface → {WIFI_HOST}:{WIFI_PORT}")
+            connection_status, last_error_message = "Connected", ""
+            return TCPInterface(hostname=WIFI_HOST, portNumber=WIFI_PORT)
+
+        # 2️⃣  Local mesh interface ---------------------------------------
+        if USE_MESH_INTERFACE and MESH_INTERFACE_AVAILABLE:
+            print("MeshInterface() for direct‑radio mode")
+            connection_status, last_error_message = "Connected", ""
+            return MeshInterface()
+
+        # 3️⃣  USB serial --------------------------------------------------
+        # If a serial path is provided, retry opening it with backoff
+        if SERIAL_PORT:
+            max_attempts = 10
+            attempt = 0
+            last_exc = None
+            print(f"SerialInterface on '{SERIAL_PORT}' (default baud, will switch to {SERIAL_BAUD}) …")
+            while attempt < max_attempts:
+                attempt += 1
+                try:
+                    iface = meshtastic.serial_interface.SerialInterface(devPath=SERIAL_PORT)
+                    break
+                except Exception as e:
+                    last_exc = e
+                    wait = min(5, 1 + attempt)
+                    print(f"⚠️ Attempt {attempt}/{max_attempts} failed to open {SERIAL_PORT}: {e} — retrying in {wait}s")
+                    add_script_log(f"Retry {attempt} failed opening serial {SERIAL_PORT}: {e}")
+                    time.sleep(wait)
+            else:
+                # All attempts failed
+                raise RuntimeError(f"Could not open serial device {SERIAL_PORT}: {last_exc}")
+        else:
+            print(f"SerialInterface auto‑detect (default baud, will switch to {SERIAL_BAUD}) …")
+            iface = meshtastic.serial_interface.SerialInterface()
+
+        # Attempt to change baudrate after opening
+        try:
+            ser = getattr(iface, "_serial", None)
+            if ser is not None and hasattr(ser, "baudrate"):
+                ser.baudrate = SERIAL_BAUD
+                print(f"Baudrate switched to {SERIAL_BAUD}")
+        except Exception as e:
+            print(f"⚠️ could not set baudrate to {SERIAL_BAUD}: {e}")
+
+        connection_status, last_error_message = "Connected", ""
+        return iface
+
+    except Exception as exc:
+        connection_status, last_error_message = "Disconnected", str(exc)
+        add_script_log(f"Connection error: {exc}")
+        raise
+
+def thread_excepthook(args):
+  # Suppress repeated protobuf DecodeError tracebacks from the meshtastic stream
+  try:
+    exc_val = args.exc_value
+    exc_type = args.exc_type
+    if exc_type is not None and exc_type.__name__ == 'DecodeError':
+      # concise log for noisy protobuf decode errors
+      logging.error(f"Meshtastic protobuf.DecodeError suppressed: {exc_val}")
+    else:
+      logging.error(f"Meshtastic thread error: {exc_val}")
+      traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback)
+  except Exception:
+    # fallback
+    logging.error(f"Meshtastic thread error (unknown): {args.exc_value}")
+    global connection_status
+    connection_status = "Disconnected"
+    reset_event.set()
+
+threading.excepthook = thread_excepthook
+
+@app.route("/connection_status", methods=["GET"])
+def connection_status_route():
+    return jsonify({"status": connection_status, "error": last_error_message})
+
+def main():
+  global interface, restart_count, server_start_time, reset_event
+  server_start_time = server_start_time or datetime.now(timezone.utc)
+  restart_count += 1
+  add_script_log(f"Server restarted. Restart count: {restart_count}")
+  print("Starting MESH-AI server...")
+  load_archive()
+
+  # Additional startup info
+  if ENABLE_DISCORD:
+    print(
+      f"Discord configuration enabled: Inbound channel index: {DISCORD_INBOUND_CHANNEL_INDEX}, "
+      f"Webhook URL is {'set' if DISCORD_WEBHOOK_URL else 'not set'}, "
+      f"Bot Token is {'set' if DISCORD_BOT_TOKEN else 'not set'}, "
+      f"Channel ID is {'set' if DISCORD_CHANNEL_ID else 'not set'}."
+    )
+  else:
+    print("Discord configuration disabled.")
+
+  if ENABLE_TWILIO:
+    if TWILIO_SID and TWILIO_AUTH_TOKEN and ALERT_PHONE_NUMBER and TWILIO_FROM_NUMBER:
+      print("Twilio is configured for emergency SMS.")
+    else:
+      print("Twilio is not properly configured for emergency SMS.")
+  else:
+    print("Twilio is disabled.")
+
+  if ENABLE_SMTP:
+    if SMTP_HOST and SMTP_USER and SMTP_PASS and ALERT_EMAIL_TO:
+      print("SMTP is configured for emergency email alerts.")
+    else:
+      print("SMTP is not properly configured for emergency email alerts.")
+  else:
+    print("SMTP is disabled.")
+
+  # Pick an available port for Flask (default 5000) to avoid address-in-use errors
+  def _find_free_port(preferred=5000):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+      s.bind(("0.0.0.0", preferred))
+      port = preferred
+    except OSError:
+      s.bind(("0.0.0.0", 0))
+      port = s.getsockname()[1]
+    finally:
+      s.close()
+    return port
+
+  flask_port = _find_free_port(5000)
+  print(f"Launching Flask in the background on port {flask_port}...")
+  api_thread = threading.Thread(
+    target=app.run,
+    kwargs={"host": "0.0.0.0", "port": flask_port, "debug": False},
+    daemon=True,
+  )
+  api_thread.start()
+
+  # If Discord polling is configured, start that thread.
+  if DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID:
+    threading.Thread(target=poll_discord_channel, daemon=True).start()
+
+  # Main connection loop
+  while True:
+    try:
+      print("---------------------------------------------------")
+      print("Attempting to connect to Meshtastic device...")
+
+      # Unsubscribe any previous callbacks and close any existing interface
+      try:
+        pub.unsubscribe(on_receive, "meshtastic.receive")
+      except Exception:
+        pass
+
+      try:
+        if interface:
+          interface.close()
+      except Exception:
+        pass
+
+      # Monkey-patch meshtastic to suppress noisy protobuf.DecodeError tracebacks
+      try:
+        import google.protobuf.message as _pb_msg
+        if MESH_INTERFACE_AVAILABLE:
+          try:
+            orig = None
+            try:
+              orig = MeshInterface._handleFromRadio
+            except Exception:
+              orig = None
+            if orig:
+              def _safe_handle(self, fromRadioBytes):
+                try:
+                  return orig(self, fromRadioBytes)
+                except _pb_msg.DecodeError as e:
+                  # log concise message and swallow
+                  add_script_log(f"Suppressed protobuf.DecodeError: {e}")
+                  return None
+
+              MeshInterface._handleFromRadio = _safe_handle
+          except Exception:
+            pass
+      except Exception:
+        # protobuf not available or other issue
+        pass
+
+      # Try to (re)connect
+      interface = connect_interface()
+
+      print("Subscribing to on_receive callback...")
+      pub.subscribe(on_receive, "meshtastic.receive")
+
+      print(f"AI provider set to: {AI_PROVIDER}")
+      if HOME_ASSISTANT_ENABLED:
+        print(f"Home Assistant multi-mode is ENABLED. Channel index: {HOME_ASSISTANT_CHANNEL_INDEX}")
+        if HOME_ASSISTANT_ENABLE_PIN:
+          print("Home Assistant secure PIN protection is ENABLED.")
+
+      print("Connection successful. Running until error or Ctrl+C.")
+      add_script_log("Connection established successfully.")
+
+      # Inner loop: periodically check if a reset has been signaled
+      while not reset_event.is_set():
+        time.sleep(1)
+
+      # If we get here, a reset was signaled — trigger reconnect
+      raise OSError("Reset event triggered due to connection loss")
+
+    except KeyboardInterrupt:
+      print("User interrupted the script. Shutting down.")
+      add_script_log("Server shutdown via KeyboardInterrupt.")
+      break
+
+    except OSError as e:
+      error_code = getattr(e, 'errno', None) or getattr(e, 'winerror', None)
+      if error_code in (10053, 10054, 10060):
+        print("⚠️ Connection was forcibly closed. Attempting to reconnect...")
+        add_script_log(f"Connection forcibly closed: {e} (error code: {error_code})")
+        time.sleep(5)
+        reset_event.clear()
+        continue
+
+      # For other OS-level errors, fall through to general reconnect logic
+      logging.error(f"OSError during connection: {e}")
+      add_script_log(f"OSError: {e}")
+      time.sleep(5)
+      reset_event.clear()
+      continue
+
+    except Exception as e:
+      logging.error(f"⚠️ Connection/runtime error: {e}")
+      add_script_log(f"Error: {e}")
+      print("Will attempt reconnect in 30 seconds...")
+      try:
+        if interface:
+          interface.close()
+      except Exception:
+        pass
+      time.sleep(30)
+      reset_event.clear()
+      continue
+
+def connection_monitor(initial_delay=30):
+    global connection_status
+    time.sleep(initial_delay)
+    while True:
+        if connection_status == "Disconnected":
+            print("⚠️ Connection lost! Triggering reconnect...")
+            reset_event.set()
+        time.sleep(5)
+
+# Start the watchdog thread after 20 seconds to give node a chance to connect
+def poll_discord_channel():
+    """Polls the Discord channel for new messages using the Discord API."""
+    # Wait a short period for interface to be set up
+    time.sleep(5)
+    last_message_id = None
+    headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
+    url = f"https://discord.com/api/v9/channels/{DISCORD_CHANNEL_ID}/messages"
+    while True:
+        try:
+            params = {"limit": 10}
+            if last_message_id:
+                params["after"] = last_message_id
+            response = requests.get(url, headers=headers, params=params)
+            if response.status_code == 200:
+                msgs = response.json()
+                msgs = sorted(msgs, key=lambda m: int(m["id"]))
+                for msg in msgs:
+                    if msg["author"].get("bot"):
+                        continue
+                    # Only process messages that arrived after the script started
+                    if last_message_id is None:
+                        msg_timestamp_str = msg.get("timestamp")
+                        if msg_timestamp_str:
+                            msg_time = datetime.fromisoformat(msg_timestamp_str.replace("Z", "+00:00"))
+                            if msg_time < server_start_time:
+                                continue
+                    username = msg["author"].get("username", "DiscordUser")
+                    content = msg.get("content")
+                    if content:
+                        formatted = f"**{username}**: {content}"
+                        log_message("DiscordPoll", formatted, direct=False, channel_idx=DISCORD_INBOUND_CHANNEL_INDEX)
+                        if interface is None:
+                            print("❌ Cannot send polled Discord message: interface is None.")
+                        else:
+                            send_broadcast_chunks(interface, formatted, DISCORD_INBOUND_CHANNEL_INDEX)
+                        print(f"Polled and routed Discord message: {formatted}")
+                        last_message_id = msg["id"]
+            else:
+                print(f"Discord poll error: {response.status_code} {response.text}")
+        except Exception as e:
+            print(f"Error polling Discord: {e}")
+        time.sleep(10)
+
+if __name__ == "__main__":
+  import atexit
+  ensure_single_instance()
+  atexit.register(remove_pidfile)
+  while True:
+        try:
+            main()
+        except KeyboardInterrupt:
+            print("User interrupted the script. Exiting.")
+            add_script_log("Server exited via KeyboardInterrupt.")
+            break
+        except Exception as e:
+            logging.error(f"Unhandled error in main: {e}")
+            add_script_log(f"Unhandled error: {e}")
+            print("Encountered an error. Restarting in 30 seconds...")
+            time.sleep(30)

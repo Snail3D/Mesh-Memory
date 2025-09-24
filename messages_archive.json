@@ -1,0 +1,211 @@
+[
+  {
+    "timestamp": "2025-09-24 05:36:19 UTC",
+    "node": "SnMo (!376be684)",
+    "node_id": "!376be684",
+    "message": "🔔 Alert Bell Character! \u0007",
+    "emergency": false,
+    "reply_to": null,
+    "direct": true,
+    "channel_idx": null,
+    "is_ai": false
+  },
+  {
+    "timestamp": "2025-09-24 05:36:32 UTC",
+    "node": "SnMo (!376be684)",
+    "node_id": "!376be684",
+    "message": "📍 Snail Mobile has shared their position and requested a response with your position.",
+    "emergency": false,
+    "reply_to": null,
+    "direct": true,
+    "channel_idx": null,
+    "is_ai": false
+  },
+  {
+    "timestamp": "2025-09-24 05:36:32 UTC",
+    "node": "Node_El Paso Mesh AI (El Paso Mesh AI)",
+    "node_id": "El Paso Mesh AI",
+    "message": "What's the alert about?",
+    "emergency": false,
+    "reply_to": "2025-09-24 05:36:19 UTC",
+    "direct": true,
+    "channel_idx": null,
+    "is_ai": true
+  },
+  {
+    "timestamp": "2025-09-24 05:36:48 UTC",
+    "node": "Node_El Paso Mesh AI (El Paso Mesh AI)",
+    "node_id": "El Paso Mesh AI",
+    "message": "I'm currently located at Node_ElPaso.",
+    "emergency": false,
+    "reply_to": "2025-09-24 05:36:32 UTC",
+    "direct": true,
+    "channel_idx": null,
+    "is_ai": true
+  },
+  {
+    "timestamp": "2025-09-24 05:37:30 UTC",
+    "node": "SnMo (!376be684)",
+    "node_id": "!376be684",
+    "message": "🔔 Alert Bell Character! \u0007",
+    "emergency": false,
+    "reply_to": null,
+    "direct": true,
+    "channel_idx": null,
+    "is_ai": false
+  },
+  {
+    "timestamp": "2025-09-24 05:37:40 UTC",
+    "node": "Node_El Paso Mesh AI (El Paso Mesh AI)",
+    "node_id": "El Paso Mesh AI",
+    "message": "What's the request for?",
+    "emergency": false,
+    "reply_to": "2025-09-24 05:37:30 UTC",
+    "direct": true,
+    "channel_idx": null,
+    "is_ai": true
+  },
+  {
+    "timestamp": "2025-09-24 05:45:59 UTC",
+    "node": "SnMo (!376be684)",
+    "node_id": "!376be684",
+    "message": "🔔 Alert Bell Character! \u0007",
+    "emergency": false,
+    "reply_to": null,
+    "direct": true,
+    "channel_idx": null,
+    "is_ai": false
+  },
+  {
+    "timestamp": "2025-09-24 05:53:52 UTC",
+    "node": "SnMo (!376be684)",
+    "node_id": "!376be684",
+    "message": "🔔 Alert Bell Character! \u0007",
+    "emergency": false,
+    "reply_to": null,
+    "direct": true,
+    "channel_idx": null,
+    "is_ai": false
+  },
+  {
+    "timestamp": "2025-09-24 05:54:25 UTC",
+    "node": "Node_El Paso Mesh AI (El Paso Mesh AI)",
+    "node_id": "El Paso Mesh AI",
+    "message": "It seems like you're receiving repeated alerts from SnMo. Can you please provide more context or clarify what's happening? What kind of alert is it and who requested a response with your position?",
+    "emergency": false,
+    "reply_to": "2025-09-24 05:53:52 UTC",
+    "direct": true,
+    "channel_idx": null,
+    "is_ai": true
+  },
+  {
+    "timestamp": "2025-09-24 06:04:07 UTC",
+    "node": "SnMo (!376be684)",
+    "node_id": "!376be684",
+    "message": "🔔 Alert Bell Character! \u0007",
+    "emergency": false,
+    "reply_to": null,
+    "direct": true,
+    "channel_idx": null,
+    "is_ai": false
+  },
+  {
+    "timestamp": "2025-09-24 06:04:38 UTC",
+    "node": "Node_El Paso Mesh AI (El Paso Mesh AI)",
+    "node_id": "El Paso Mesh AI",
+    "message": "I'm not receiving any additional information from SnMo. It seems like they're repeating the same message. Can you try contacting them again or providing more context?",
+    "emergency": false,
+    "reply_to": "2025-09-24 06:04:07 UTC",
+    "direct": true,
+    "channel_idx": null,
+    "is_ai": true
+  },
+  {
+    "timestamp": "2025-09-24 06:05:05 UTC",
+    "node": "SnMo (!376be684)",
+    "node_id": "!376be684",
+    "message": "/ping",
+    "emergency": false,
+    "reply_to": null,
+    "direct": true,
+    "channel_idx": null,
+    "is_ai": false
+  },
+  {
+    "timestamp": "2025-09-24 06:05:16 UTC",
+    "node": "SnMo (!376be684)",
+    "node_id": "!376be684",
+    "message": "/test",
+    "emergency": false,
+    "reply_to": null,
+    "direct": true,
+    "channel_idx": null,
+    "is_ai": false
+  },
+  {
+    "timestamp": "2025-09-24 06:05:31 UTC",
+    "node": "SnMo (!376be684)",
+    "node_id": "!376be684",
+    "message": "📍 Snail Mobile has shared their position and requested a response with your position.",
+    "emergency": false,
+    "reply_to": null,
+    "direct": true,
+    "channel_idx": null,
+    "is_ai": false
+  },
+  {
+    "timestamp": "2025-09-24 06:05:33 UTC",
+    "node": "SnMo (!376be684)",
+    "node_id": "!376be684",
+    "message": "📍 Snail Mobile has shared their position and requested a response with your position.",
+    "emergency": false,
+    "reply_to": null,
+    "direct": true,
+    "channel_idx": null,
+    "is_ai": false
+  },
+  {
+    "timestamp": "2025-09-24 06:05:47 UTC",
+    "node": "SnMo (!376be684)",
+    "node_id": "!376be684",
+    "message": "/ai testing ",
+    "emergency": false,
+    "reply_to": null,
+    "direct": false,
+    "channel_idx": 3,
+    "is_ai": false
+  },
+  {
+    "timestamp": "2025-09-24 06:06:03 UTC",
+    "node": "Node_El Paso Mesh AI (El Paso Mesh AI)",
+    "node_id": "El Paso Mesh AI",
+    "message": "Hello Snail Mobile, I've received your ping and test messages. My current location is in El Paso, Mexico. Please wait for my GPS update to share my exact coordinates.",
+    "emergency": false,
+    "reply_to": "2025-09-24 06:05:31 UTC",
+    "direct": true,
+    "channel_idx": null,
+    "is_ai": true
+  },
+  {
+    "timestamp": "2025-09-24 06:06:33 UTC",
+    "node": "Node_El Paso Mesh AI (El Paso Mesh AI)",
+    "node_id": "El Paso Mesh AI",
+    "message": "GPS updating...",
+    "emergency": false,
+    "reply_to": "2025-09-24 06:05:33 UTC",
+    "direct": true,
+    "channel_idx": null,
+    "is_ai": true
+  },
+  {
+    "timestamp": "2025-09-24 06:06:42 UTC",
+    "node": "Node_El Paso Mesh AI (El Paso Mesh AI)",
+    "node_id": "El Paso Mesh AI",
+    "message": "How's the test going?",
+    "emergency": false,
+    "reply_to": "2025-09-24 06:05:47 UTC",
+    "direct": false,
+    "channel_idx": 3,
+    "is_ai": true
+  }
+]

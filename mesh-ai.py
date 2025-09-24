@@ -378,7 +378,7 @@ def process_responses_worker():
             # Unpack the task
             text, sender_node, is_direct, ch_idx, thread_root_ts, interface_ref = task
             
-            info_print(f"[AsyncAI] Processing response for: {text[:50]}... (queue: {response_queue.qsize()})")
+            info_print(f"🧠 Processing: {text[:50]}...")
             start_time = time.time()
             
             # Generate AI response (this can take a long time)
@@ -387,7 +387,7 @@ def process_responses_worker():
             processing_time = time.time() - start_time
             
             if resp:
-                info_print(f"[AsyncAI] Generated response in {processing_time:.1f}s, preparing to send...")
+                info_print(f"💡 Generated response in {processing_time:.1f}s")
                 
                 # Reduced collision delay for async processing
                 time.sleep(1)
@@ -421,16 +421,16 @@ def process_responses_worker():
                         send_broadcast_chunks(interface_ref, resp, ch_idx)
                         
                 total_time = time.time() - start_time
-                info_print(f"[AsyncAI] Completed response for {sender_node} (total: {total_time:.1f}s)")
+                info_print(f"📤 Response sent to {sender_node} ({total_time:.1f}s)")
             else:
-                info_print(f"[AsyncAI] No response generated for {sender_node} ({processing_time:.1f}s)")
+                info_print(f"🤔 No response needed ({processing_time:.1f}s)")
                 
             response_queue.task_done()
             
         except queue.Empty:
             continue  # Timeout, check if we should continue
         except Exception as e:
-            info_print(f"[AsyncAI] Error processing response: {e}")
+            info_print(f"❌ AI Error: {e}")
             try:
                 response_queue.task_done()
             except ValueError:
@@ -440,7 +440,7 @@ def start_response_worker():
     """Start the background response worker thread."""
     worker_thread = threading.Thread(target=process_responses_worker, daemon=True)
     worker_thread.start()
-    info_print("[AsyncAI] Response worker thread started")
+    info_print("🚀 AI worker ready")
 
 def stop_response_worker():
     """Stop the background response worker thread."""
@@ -906,9 +906,11 @@ def send_to_ollama(user_message, sender_id=None, is_direct=False, channel_idx=No
         r = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT)
         if r.status_code == 200:
             jr = r.json()
-            dprint(f"Ollama raw => {jr}")
-            # Ollama may return different fields depending on version; prefer 'response' then 'choices'
+            # Extract just the response without verbose token info
             resp = jr.get("response")
+            if resp:
+                info_print(f"🤖 Ollama response received ({len(resp)} chars)")
+            # Ollama may return different fields depending on version; prefer 'response' then 'choices'
             if not resp and isinstance(jr.get("choices"), list) and jr.get("choices"):
                 # choices may contain dicts with 'text' or 'content'
                 first = jr.get("choices")[0]
@@ -1271,7 +1273,7 @@ def on_receive(packet=None, interface=None, **kwargs):
     pkt_keys = list(packet.keys()) if isinstance(packet, dict) else type(packet).__name__
   except Exception:
     pkt_keys = 'unknown'
-  info_print(f"[CB] on_receive fired. keys={pkt_keys}")
+  # Callback fired - processing packet
   # Accept packets from generic receive or text-only topic
   decoded = None
   if isinstance(packet, dict):
@@ -1281,7 +1283,7 @@ def on_receive(packet=None, interface=None, **kwargs):
   if not decoded and 'text' in kwargs:
     decoded = {'text': kwargs.get('text'), 'portnum': 'TEXT_MESSAGE_APP'}
   if not decoded:
-    dprint("No decoded/text in packet => ignoring.")
+    # Silent ignore - non-text packet
     return
 
   # normalize decoded to dict
@@ -1301,7 +1303,7 @@ def on_receive(packet=None, interface=None, **kwargs):
   except Exception:
     is_text = False
   if not is_text:
-    info_print(f"[Info] Ignoring non-text packet: portnum={portnum}")
+    dprint(f"📦 Ignoring non-text packet: {portnum}")
     return
 
   try:
@@ -1327,9 +1329,9 @@ def on_receive(packet=None, interface=None, **kwargs):
     # De-dup: if we have seen the same text/from/to/channel very recently, drop it
     rx_key = _rx_make_key(packet, text, ch_idx)
     if _rx_seen_before(rx_key):
-      info_print(f"[Info] Duplicate RX suppressed for from={sender_node} ch={ch_idx}: {text}")
+      dprint(f"🔄 Duplicate message ignored from {sender_node}")
       return
-    info_print(f"[RX] from {sender_node or '?'} to {raw_to or '^all'} (ch={ch_idx}): {text}")
+    info_print(f"📨 {sender_node or '?'} → {raw_to or '📢'} (ch{ch_idx}): {text}")
 
     entry = log_message(
         sender_node,
@@ -1393,10 +1395,10 @@ def on_receive(packet=None, interface=None, **kwargs):
     
     if should_respond:
       # Queue the response for async processing instead of blocking here
-      info_print(f"[AsyncAI] Queueing response for {sender_node}: {text[:50]}...")
+      info_print(f"🤖 Thinking about: {text[:50]}...")
       try:
         response_queue.put((text, sender_node, is_direct, ch_idx, thread_root_ts, interface), block=False)
-        info_print(f"[AsyncAI] Queued (queue size: {response_queue.qsize()})")
+        info_print(f"⚡ AI queued (size: {response_queue.qsize()})")
       except queue.Full:
         info_print(f"[AsyncAI] Response queue full ({response_queue.qsize()}), processing immediately to avoid drop")
         # Fall back to immediate processing if queue is full
@@ -1434,7 +1436,7 @@ def on_receive(packet=None, interface=None, **kwargs):
 
 @app.route("/messages", methods=["GET"])
 def get_messages_api():
-  dprint("GET /messages => returning current messages")
+  # Removed verbose debug - too noisy
   with messages_lock:
     snapshot = list(messages)
   return jsonify(snapshot)
@@ -1502,7 +1504,6 @@ def logs():
 
     html = f"""<html>
   <head>
-    <meta http-equiv="refresh" content="1">
     <title>MESH-AI Logs</title>
     <style>
       body {{ background:#000; color:#fff; font-family:monospace; padding:20px; }}
@@ -1515,9 +1516,36 @@ def logs():
     <div><strong>Restarts:</strong> {restart_count}</div>
     <pre id="logbox">{log_text}</pre>
     <script>
-      // once the page renders, scroll to the bottom
+      // Auto-refresh logs without page blink
+      let lastLogContent = "";
+      
+      function updateLogs() {{
+        fetch('/logs')
+          .then(response => response.text())
+          .then(html => {{
+            // Extract just the log content from the response
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, 'text/html');
+            const newLogContent = doc.querySelector('#logbox').textContent;
+            
+            // Only update if content changed to prevent flashing
+            if (newLogContent !== lastLogContent) {{
+              document.querySelector('#logbox').textContent = newLogContent;
+              lastLogContent = newLogContent;
+              // Scroll to bottom when new content arrives
+              window.scrollTo(0, document.body.scrollHeight);
+            }}
+          }})
+          .catch(err => console.log('Log refresh error:', err));
+      }}
+      
+      // Initial setup
       document.addEventListener("DOMContentLoaded", () => {{
+        lastLogContent = document.querySelector('#logbox').textContent;
         window.scrollTo(0, document.body.scrollHeight);
+        
+        // Auto-refresh every 2 seconds without page reload
+        setInterval(updateLogs, 2000);
       }});
     </script>
   </body>
@@ -3033,7 +3061,7 @@ def main():
             except Exception:
                 pass
             interface = connect_interface()
-            print("Subscribing to on_receive callback...")
+            print("📻 Listening for messages...")
             # Only subscribe to the main topic to avoid duplicate callbacks
             pub.subscribe(on_receive, "meshtastic.receive")
             print(f"AI provider set to: {AI_PROVIDER}")
@@ -3041,7 +3069,7 @@ def main():
                 print(f"Home Assistant multi-mode is ENABLED. Channel index: {HOME_ASSISTANT_CHANNEL_INDEX}")
                 if HOME_ASSISTANT_ENABLE_PIN:
                     print("Home Assistant secure PIN protection is ENABLED.")
-            print("Connection successful. Running until error or Ctrl+C.")
+            print("📡 Radio connecting...")
             add_script_log("Connection established successfully.")
             # Inner loop: periodically check if a reset has been signaled
             while not reset_event.is_set():
