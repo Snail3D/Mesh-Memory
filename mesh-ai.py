@@ -699,12 +699,13 @@ def send_to_lmstudio(user_message: str):
         response = requests.post(LMSTUDIO_URL, json=payload, timeout=LMSTUDIO_TIMEOUT)
         if response.status_code == 200:
             j = response.json()
-            dprint(f"LMStudio raw ⇒ {j}")
             ai_resp = (
                 j.get("choices", [{}])[0]
                  .get("message", {})
                  .get("content", "🤖 [No response]")
             )
+            if ai_resp and ai_resp != "🤖 [No response]":
+                info_print(f"🤖 LMStudio response received ({len(ai_resp)} chars)")
             return ai_resp[:MAX_RESPONSE_LENGTH]
         else:
             print(f"⚠️ LMStudio error: {response.status_code} - {response.text}")
@@ -757,12 +758,13 @@ def send_to_openai(user_message):
         r = requests.post(url, headers=headers, json=payload, timeout=OPENAI_TIMEOUT)
         if r.status_code == 200:
             jr = r.json()
-            dprint(f"OpenAI raw => {jr}")
             content = (
                 jr.get("choices", [{}])[0]
                   .get("message", {})
                   .get("content", "🤖 [No response]")
             )
+            if content and content != "🤖 [No response]":
+                info_print(f"🤖 OpenAI response received ({len(content)} chars)")
             return content[:MAX_RESPONSE_LENGTH]
         else:
             print(f"⚠️ OpenAI error: {r.status_code} => {r.text}")
@@ -938,10 +940,10 @@ def send_to_home_assistant(user_message):
         r = requests.post(HOME_ASSISTANT_URL, json=payload, headers=headers, timeout=HOME_ASSISTANT_TIMEOUT)
         if r.status_code == 200:
             data = r.json()
-            dprint(f"HA raw => {data}")
             speech = data.get("response", {}).get("speech", {})
             answer = speech.get("plain", {}).get("speech")
             if answer:
+                info_print(f"🤖 Home Assistant response received ({len(answer)} chars)")
                 return answer[:MAX_RESPONSE_LENGTH]
             return "🤖 [No response from Home Assistant]"
         else:
