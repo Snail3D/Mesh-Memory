@@ -1,0 +1,3 @@
+# Disable autosuspend for RAKwireless WisCore devices to prevent connection drops
+SUBSYSTEM=="usb", ATTR{idVendor}=="239a", ATTR{idProduct}=="8029", ATTR{power/control}="on"
+SUBSYSTEM=="usb", ATTR{idVendor}=="239a", ATTR{power/autosuspend}="-1"

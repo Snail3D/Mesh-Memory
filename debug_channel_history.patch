@@ -1,0 +1,67 @@
+diff --git a/mesh-ai.py b/mesh-ai.py
+index f6d9e0d..907ecbb 100644
+--- a/mesh-ai.py
++++ b/mesh-ai.py
+@@ -855,9 +855,11 @@ def build_ollama_history(sender_id=None, is_direct=False, channel_idx=None, threa
+       # Channel messages for this channel - simple logic like the original
+       for m in snapshot:
+         try:
+-          # Type-safe comparison: force channel_idx to integer for comparison
++          # ULTRA VERBOSE DEBUG - check exactly why channel history isn't matching
++          print(f"⚠️ Checking message: direct={m.get('direct')} channel={m.get('channel_idx')} vs requested channel={channel_idx}")
+           msg_channel = m.get('channel_idx')
+-          if isinstance(msg_channel, str) and msg_channel.isdigit():
++          if isinstance(msg_channel, str):
++              print(f"⚠️ Converting string channel '{msg_channel}' to int")
+               msg_channel = int(msg_channel)
+           
+           if (m.get('direct') is False) and (msg_channel == channel_idx):
+@@ -979,9 +981,11 @@ def build_chat_history(sender_id=None, is_direct=False, channel_idx=None, thread_
+       # Channel messages for this channel - simple logic like the original
+       for m in snapshot:
+         try:
+-          # Type-safe comparison: force channel_idx to integer for comparison
++          # ULTRA VERBOSE DEBUG - check exactly why channel history isn't matching
++          print(f"⚠️ Checking message: direct={m.get('direct')} channel={m.get('channel_idx')} vs requested channel={channel_idx}")
+           msg_channel = m.get('channel_idx')
+-          if isinstance(msg_channel, str) and msg_channel.isdigit():
++          if isinstance(msg_channel, str):
++              print(f"⚠️ Converting string channel '{msg_channel}' to int")
+               msg_channel = int(msg_channel)
+           
+           if (m.get('direct') is False) and (msg_channel == channel_idx):
+@@ -1064,6 +1068,7 @@ def send_to_ollama(user_message, sender_id=None, is_direct=False, channel_idx=Non
+     if history:
+         combined_prompt = f"{SYSTEM_PROMPT}\nCONTEXT:\n{history}\n\nUSER: {user_message}\nASSISTANT:"
+     else:
++        print(f"⚠️ WARNING: No history for Ollama with channel_idx={channel_idx}")
+         combined_prompt = f"{SYSTEM_PROMPT}\nUSER: {user_message}\nASSISTANT:"
+     if DEBUG_ENABLED:
+         dprint(f"Ollama combined prompt:\n{combined_prompt}")
+@@ -1185,6 +1190,7 @@ def route_message_text(user_message, channel_idx, sender_id=None, is_direct=False
+     info_print(f"[Info] Using default AI provider: {AI_PROVIDER}")
+     resp = get_ai_response(user_message, sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx, thread_root_ts=thread_root_ts)
+     return resp if resp else "🤖 [No AI response]"
++    
+ 
+ # -----------------------------
+ # Revised Command Handler (Case-Insensitive)
+@@ -1384,6 +1390,10 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=N
+     # IMPORTANT: For non-command channel messages, do NOT anchor to a specific thread root;
+     # passing thread_root_ts here would restrict history to only the root and AI replies.
+     # To provide rich context, use the recent whole-channel history instead.
++    print(f"⚠️ Handling channel message - is_direct={is_direct} channel_idx={channel_idx}")
++    if channel_idx:
++        # Convert channel_idx to int if it's a string
++        channel_idx = int(channel_idx) if isinstance(channel_idx, str) else channel_idx
+     return get_ai_response(text, sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx, thread_root_ts=None)
+   
+   # Otherwise, no automatic response
+@@ -1469,6 +1479,7 @@ def on_receive(packet=None, interface=None, **kwargs):
+       is_direct = (my_node_num == to_node_int)
+ 
+     # Decide on a response based on parsed text and context
++    print(f"⚠️ Message parsing: is_direct={is_direct} channel_idx={ch_idx}")
+     # Compute a thread root for channel messages so multiple /ai commands stick to the same thread.
+     thread_root_ts = entry.get('timestamp')
+     if not is_direct:
