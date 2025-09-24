@@ -1167,7 +1167,7 @@ def strip_pin(text):
         return text
     return text[:idx].strip() + " " + text[idx+8:].strip()
 
-def route_message_text(user_message, channel_idx):
+def route_message_text(user_message, channel_idx, sender_id=None, is_direct=False, thread_root_ts=None):
   if HOME_ASSISTANT_ENABLED and channel_idx == HOME_ASSISTANT_CHANNEL_INDEX:
     info_print("[Info] Routing to Home Assistant channel.")
     if HOME_ASSISTANT_ENABLE_PIN:
@@ -1178,7 +1178,7 @@ def route_message_text(user_message, channel_idx):
     return ha_response if ha_response else "🤖 [No response from Home Assistant]"
   else:
     info_print(f"[Info] Using default AI provider: {AI_PROVIDER}")
-    resp = get_ai_response(user_message, sender_id=None, is_direct=False, channel_idx=channel_idx)
+    resp = get_ai_response(user_message, sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx, thread_root_ts=thread_root_ts)
     return resp if resp else "🤖 [No AI response]"
 
 # -----------------------------
@@ -1370,8 +1370,15 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
   if HOME_ASSISTANT_ENABLED and channel_idx == HOME_ASSISTANT_CHANNEL_INDEX:
     if check_only:
       return True  # HA responses can take time, process async
-    return route_message_text(text, channel_idx)
+    return route_message_text(text, channel_idx, sender_id=sender_id, is_direct=is_direct, thread_root_ts=thread_root_ts)
 
+  # For other channels, provide AI response if reply_in_channels is enabled
+  if config.get("reply_in_channels", True):
+    if check_only:
+      return True  # Channel messages need AI processing
+    # Regular channel messages get AI response with full context
+    return get_ai_response(text, sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx, thread_root_ts=thread_root_ts)
+  
   # Otherwise, no automatic response
   return None if not check_only else False
 
