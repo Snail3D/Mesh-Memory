@@ -3,6 +3,7 @@ import meshtastic.serial_interface
 from meshtastic import BROADCAST_ADDR
 from pubsub import pub
 import json
+import difflib
 import requests
 import time
 from datetime import datetime, timedelta, timezone  # Added timezone import
@@ -18,6 +19,8 @@ import sys
 import socket  # for socket error checking
 import re
 import random
+from typing import Optional, Set, Dict, Any
+from dataclasses import dataclass
 from meshtastic_facts import MESHTASTIC_ALERT_FACTS
 from twilio.rest import Client  # for Twilio SMS support
 from unidecode import unidecode   # Added unidecode import for Ollama text normalization
@@ -506,6 +509,24 @@ except FileNotFoundError:
     motd_content = "No MOTD available."
 
 
+ADMIN_PASSWORD = str(config.get("admin_password", "password") or "password")
+_initial_admins = config.get("admin_whitelist", [])
+AUTHORIZED_ADMINS: Set[str] = set()
+if isinstance(_initial_admins, list):
+    for entry in _initial_admins:
+        if entry is None:
+            continue
+        AUTHORIZED_ADMINS.add(str(entry))
+PENDING_ADMIN_REQUESTS: Dict[str, Dict[str, Any]] = {}
+
+
+def _sender_key(sender_id: Any) -> str:
+    """Normalize sender identifiers for tracking admin approval."""
+    if sender_id is None:
+        return ""
+    return str(sender_id)
+
+
 
 # -----------------------------
 # AI Provider & Other Config Vars
@@ -579,6 +600,14 @@ ALERT_BELL_KEYWORDS = {
     "alert bell character",
 }
 
+try:
+    BIBLE_VERSES_DATA = safe_load_json("bible_jesus_verses.json", [])
+except Exception:
+    BIBLE_VERSES_DATA = []
+
+CHUCK_NORRIS_FACTS = safe_load_json("chuck_api_jokes.json", [])
+EL_PASO_FACTS = safe_load_json("el_paso_people_facts.json", [])
+
 ALERT_BELL_RESPONSES = MESHTASTIC_ALERT_FACTS
 
 POSITION_REQUEST_RESPONSES = [
@@ -593,6 +622,202 @@ POSITION_REQUEST_RESPONSES = [
     "position beacon requested; i'm still just firmware in the loop..",
     "heard the position call, yet i'm a chat bot without a compass..",
 ]
+
+COMMAND_REPLY_DELAY = 3
+
+TRAILING_COMMAND_PUNCT = ",.;:!?)]}"
+
+COMMAND_ALIASES = {
+    "/menu": "/help",
+    "/commands": "/help",
+    "/command": "/help",
+    "/h": "/help",
+    "/bibleverse": "/bible",
+    "/scripture": "/bible",
+    "/verses": "/bible",
+    "/biblefact": "/bible",
+    "/biblefacts": "/bible",
+    "/chuck": "/chucknorris",
+    "/norris": "/chucknorris",
+    "/chuckfacts": "/chucknorris",
+    "/chuckfact": "/chucknorris",
+    "/facts": "/chucknorris",
+    "/elp": "/elpaso",
+    "/elpasofact": "/elpaso",
+    "/elpasofacts": "/elpaso",
+    "/where": "/whereami",
+    "/location": "/whereami",
+    "/locate": "/whereami",
+    "/setmotd": "/changemotd",
+    "/motdset": "/changemotd",
+    "/setprompt": "/changeprompt",
+    "/promptset": "/changeprompt",
+    "/promptshow": "/showprompt",
+    "/showmotd": "/motd",
+    "/resetchat": "/reset",
+}
+
+BUILTIN_COMMANDS = {
+    "/about",
+    "/ai",
+    "/bot",
+    "/query",
+    "/data",
+    "/whereami",
+    "/emergency",
+    "/911",
+    "/test",
+    "/help",
+    "/menu",
+    "/motd",
+    "/bible",
+    "/chucknorris",
+    "/elpaso",
+    "/changemotd",
+    "/changeprompt",
+    "/showprompt",
+    "/printprompt",
+    "/reset",
+    "/sms",
+}
+
+FUZZY_COMMAND_MATCH_THRESHOLD = 0.68
+
+
+def _strip_command_token(cmd: str) -> str:
+    token = cmd.strip()
+    while token and token[-1] in TRAILING_COMMAND_PUNCT:
+        token = token[:-1]
+    if not token.startswith("/"):
+        token = f"/{token.lstrip('/')}"
+    return token.lower()
+
+
+def _known_commands() -> Set[str]:
+    known = set(BUILTIN_COMMANDS)
+    for entry in commands_config.get("commands", []):
+        custom_cmd = entry.get("command")
+        if not isinstance(custom_cmd, str):
+            continue
+        normalized = custom_cmd if custom_cmd.startswith("/") else f"/{custom_cmd}"  # keep slash prefix
+        known.add(normalized.lower())
+    known.update(COMMAND_ALIASES.keys())
+    known.update(COMMAND_ALIASES.values())
+    return known
+
+
+def resolve_command_token(raw: str):
+    """Resolve a raw slash token to a canonical command and optional notice."""
+    stripped = _strip_command_token(raw)
+    alias_target = COMMAND_ALIASES.get(stripped)
+    if alias_target:
+        return alias_target, "alias"
+    known = _known_commands()
+    if stripped in known:
+        return stripped, None
+    candidates = difflib.get_close_matches(stripped, list(known), n=1, cutoff=FUZZY_COMMAND_MATCH_THRESHOLD)
+    if candidates:
+        return candidates[0], "fuzzy"
+    return stripped, None
+
+
+def annotate_command_response(resp, original_cmd: str, canonical_cmd: str, reason: str):
+    if not resp or canonical_cmd == original_cmd:
+        return resp
+    if reason == "alias":
+        note = f"Interpreting {original_cmd} as {canonical_cmd} (alias)."
+    else:
+        note = f"Interpreting {original_cmd} as {canonical_cmd} (closest match)."
+    if isinstance(resp, PendingReply):
+        return PendingReply(f"{note}\n{resp.text}", resp.reason)
+    return f"{note}\n{resp}"
+
+
+def _process_admin_password(sender_id: Any, message: str):
+    sender_key = _sender_key(sender_id)
+    pending_request = PENDING_ADMIN_REQUESTS.get(sender_key)
+    attempt = (message or "").strip()
+    if attempt == ADMIN_PASSWORD:
+        AUTHORIZED_ADMINS.add(sender_key)
+        if pending_request:
+            PENDING_ADMIN_REQUESTS.pop(sender_key, None)
+        clean_log(
+            f"Admin password accepted for {get_node_shortname(sender_id)} ({sender_id})",
+            "✅",
+            show_always=True,
+            rate_limit=False,
+        )
+        success_text = "Bingo! you're now authorized to make admin changes"
+        follow_resp = None
+        if pending_request:
+            follow_resp = handle_command(
+                pending_request.get("command", ""),
+                pending_request.get("full_text", ""),
+                sender_id,
+                is_direct=pending_request.get("is_direct", True),
+                channel_idx=pending_request.get("channel_idx"),
+                thread_root_ts=pending_request.get("thread_root_ts"),
+            )
+        if isinstance(follow_resp, PendingReply):
+            combined = f"{success_text}\n{follow_resp.text}" if follow_resp.text else success_text
+            return PendingReply(combined, follow_resp.reason)
+        if isinstance(follow_resp, str) and follow_resp:
+            combined = f"{success_text}\n{follow_resp}"
+            return PendingReply(combined, "admin password")
+        return PendingReply(success_text, "admin password")
+
+    clean_log(
+        f"Admin password rejected for {get_node_shortname(sender_id)} ({sender_id})",
+        "🚫",
+        show_always=True,
+        rate_limit=False,
+    )
+    return PendingReply("no way jose, try again.. or don't", "admin password")
+
+
+@dataclass
+class PendingReply:
+    text: str
+    reason: str = "command"
+
+
+def _command_delay(reason: str) -> None:
+    try:
+        clean_log(f"Buffering {COMMAND_REPLY_DELAY}s before replying to {reason}", "⏳", show_always=True, rate_limit=False)
+    except Exception:
+        pass
+    time.sleep(COMMAND_REPLY_DELAY)
+
+
+def _format_bible_verse() -> Optional[str]:
+    if not BIBLE_VERSES_DATA:
+        return None
+    verse = random.choice(BIBLE_VERSES_DATA)
+    if isinstance(verse, dict):
+        ref = verse.get("reference") or verse.get("ref")
+        text = verse.get("text") or verse.get("verse")
+        if ref and text:
+            return f"{ref}: {text}"
+    if isinstance(verse, str):
+        return verse
+    return None
+
+
+def _random_chuck_fact() -> Optional[str]:
+    if not CHUCK_NORRIS_FACTS:
+        return None
+    return random.choice(CHUCK_NORRIS_FACTS)
+
+
+def _random_el_paso_fact() -> Optional[str]:
+    if not EL_PASO_FACTS:
+        return None
+    return random.choice(EL_PASO_FACTS)
+
+def _cmd_reply(cmd_name: str, message: str) -> PendingReply:
+    label = f"{cmd_name} command" if cmd_name else "command"
+    return PendingReply(message, label)
+
 DISCORD_RESPONSE_CHANNEL_INDEX = config.get("discord_response_channel_index", None)
 DISCORD_RECEIVE_ENABLED = config.get("discord_receive_enabled", True)
 # New variable for inbound routing
@@ -715,38 +940,43 @@ def process_responses_worker():
             processing_time = time.time() - start_time
             
             if resp:
+                pending = resp if isinstance(resp, PendingReply) else None
+                response_text = pending.text if pending else resp
                 clean_log(f"✅ [AsyncAI] Generated response in {processing_time:.1f}s, preparing to send...", "🤖")
-                
-                # Reduced collision delay for async processing
-                time.sleep(1)
 
-                # Log AI reply and mark it as coming from the forced AI node (if configured)
+                # Reduced collision delay for async processing
+                if pending:
+                    _command_delay(pending.reason)
+                else:
+                    time.sleep(1)
+
+                # Log reply and mark AI status accurately (non-AI responses keep delay + logging)
                 ai_force = FORCE_NODE_NUM if FORCE_NODE_NUM is not None else None
                 log_message(
                     AI_NODE_NAME,
-                    resp,
+                    response_text,
                     reply_to=thread_root_ts,
                     direct=is_direct,
                     channel_idx=(None if is_direct else ch_idx),
                     force_node=ai_force,
-                    is_ai=True,
+                    is_ai=(pending is None),
                 )
 
                 # If message originated on Discord inbound channel, send back to Discord
                 if ENABLE_DISCORD and DISCORD_SEND_AI and DISCORD_INBOUND_CHANNEL_INDEX is not None and ch_idx == DISCORD_INBOUND_CHANNEL_INDEX:
-                    disc_msg = f"🤖 **{AI_NODE_NAME}**: {resp}"
+                    disc_msg = f"🤖 **{AI_NODE_NAME}**: {response_text}"
                     send_discord_message(disc_msg)
                     try:
-                        log_message("Discord", disc_msg, direct=False, channel_idx=DISCORD_INBOUND_CHANNEL_INDEX, is_ai=True)
+                        log_message("Discord", disc_msg, direct=False, channel_idx=DISCORD_INBOUND_CHANNEL_INDEX, is_ai=(pending is None))
                     except Exception:
                         pass
 
                 # Send the response via mesh
-                if interface_ref and resp:
+                if interface_ref and response_text:
                     if is_direct:
-                        send_direct_chunks(interface_ref, resp, sender_node)
+                        send_direct_chunks(interface_ref, response_text, sender_node)
                     else:
-                        send_broadcast_chunks(interface_ref, resp, ch_idx)
+                        send_broadcast_chunks(interface_ref, response_text, ch_idx)
                         
                 try:
                     globals()['last_ai_response_time'] = _now()
@@ -1592,7 +1822,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
   cmd = cmd.lower()
   dprint(f"handle_command => cmd='{cmd}', full_text='{full_text}', sender_id={sender_id}, is_direct={is_direct}")
   if cmd == "/about":
-    return "MESH-AI Off Grid Chat Bot - By: MR-TBOT.com"
+    return _cmd_reply(cmd, "MESH-AI Off Grid Chat Bot - By: MR-TBOT.com")
 
   elif cmd in ["/ai", "/bot", "/query", "/data"]:
     user_prompt = full_text[len(cmd):].strip()
@@ -1604,91 +1834,144 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
       info_print(f"[Info] Converting empty {cmd} command in DM to regular AI query: '{user_prompt}'")
     elif not user_prompt:
       # In channels, if no prompt provided, give helpful message
-      return f"Please provide a question or prompt after {cmd}. Example: `{cmd} What's the weather?`"
+      return _cmd_reply(cmd, f"Please provide a question or prompt after {cmd}. Example: `{cmd} What's the weather?`")
     
     if AI_PROVIDER == "home_assistant" and HOME_ASSISTANT_ENABLE_PIN:
       if not pin_is_valid(user_prompt):
-        return "Security code missing or invalid. Use 'PIN=XXXX'"
+        return _cmd_reply(cmd, "Security code missing or invalid. Use 'PIN=XXXX'")
       user_prompt = strip_pin(user_prompt)
     ai_answer = get_ai_response(user_prompt, sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx, thread_root_ts=thread_root_ts)
-    return ai_answer if ai_answer else "🤖 [No AI response]"
+    if ai_answer:
+      return ai_answer
+    return _cmd_reply(cmd, "🤖 [No AI response]")
 
   elif cmd == "/whereami":
     lat, lon, tstamp = get_node_location(sender_id)
     sn = get_node_shortname(sender_id)
     if lat is None or lon is None:
-      return f"🤖 Sorry {sn}, I have no GPS fix for your node."
+      return _cmd_reply(cmd, f"🤖 Sorry {sn}, I have no GPS fix for your node.")
     tstr = str(tstamp) if tstamp else "Unknown"
-    return f"Node {sn} GPS: {lat}, {lon} (time: {tstr})"
+    return _cmd_reply(cmd, f"Node {sn} GPS: {lat}, {lon} (time: {tstr})")
 
   elif cmd in ["/emergency", "/911"]:
     lat, lon, tstamp = get_node_location(sender_id)
     user_msg = full_text[len(cmd):].strip()
     send_emergency_notification(sender_id, user_msg, lat, lon, tstamp)
     log_message(sender_id, f"EMERGENCY TRIGGERED: {full_text}", is_emergency=True)
-    return "🚨 Emergency alert sent. Stay safe."
+    return _cmd_reply(cmd, "🚨 Emergency alert sent. Stay safe.")
 
   elif cmd == "/test":
     sn = get_node_shortname(sender_id)
-    return f"Hello {sn}! Received {LOCAL_LOCATION_STRING} by {AI_NODE_NAME}."
+    return _cmd_reply(cmd, f"Hello {sn}! Received {LOCAL_LOCATION_STRING} by {AI_NODE_NAME}.")
 
   elif cmd == "/help":
     built_in = [
-      "/about", "/query", "/whereami", "/emergency", "/911", "/test",
-      "/motd", "/changemotd", "/changeprompt", "/showprompt", "/printprompt", "/reset"
+      "/about", "/menu", "/query", "/whereami", "/emergency", "/911", "/test",
+      "/motd", "/bible", "/chucknorris", "/elpaso", "/sms",
+      "/changemotd", "/changeprompt", "/showprompt", "/printprompt", "/reset"
     ]
     custom_cmds = [c.get("command") for c in commands_config.get("commands", [])]
     help_text = "Commands:\n" + ", ".join(built_in + custom_cmds)
     help_text += "\nNote: /changeprompt, /changemotd, /showprompt, and /printprompt are DM-only."
-    return help_text
+    return _cmd_reply(cmd, help_text)
 
   elif cmd == "/motd":
-    return motd_content
+    return _cmd_reply(cmd, motd_content)
+
+  elif cmd == "/bible":
+    verse = _format_bible_verse()
+    if verse:
+        return _cmd_reply(cmd, verse)
+    return _cmd_reply(cmd, "📜 Scripture library unavailable right now.")
+
+  elif cmd == "/chucknorris":
+    fact = _random_chuck_fact()
+    if fact:
+        return _cmd_reply(cmd, fact)
+    return _cmd_reply(cmd, "🥋 Chuck Norris fact generator is offline.")
+
+  elif cmd == "/elpaso":
+    fact = _random_el_paso_fact()
+    if fact:
+        return _cmd_reply(cmd, fact)
+    return _cmd_reply(cmd, "🌵 El Paso fact bank is empty right now.")
 
   elif cmd == "/changemotd":
     if not is_direct:
-      return "❌ This command can only be used in a direct message."
+      return _cmd_reply(cmd, "❌ This command can only be used in a direct message.")
+    sender_key = _sender_key(sender_id)
+    if sender_key not in AUTHORIZED_ADMINS:
+      PENDING_ADMIN_REQUESTS[sender_key] = {
+        "command": cmd,
+        "full_text": full_text,
+        "is_direct": is_direct,
+        "channel_idx": channel_idx,
+        "thread_root_ts": thread_root_ts,
+      }
+      clean_log(
+        f"Admin password required for /changemotd from {get_node_shortname(sender_id)} ({sender_id})",
+        "🔐",
+        show_always=True,
+        rate_limit=False,
+      )
+      return PendingReply("reply with password", "admin password")
     # Change the Message of the Day content and persist to MOTD_FILE
     new_motd = full_text[len(cmd):].strip()
     if not new_motd:
-      return "Usage: /changemotd Your new MOTD text"
+      return _cmd_reply(cmd, "Usage: /changemotd Your new MOTD text")
     try:
       # Persist as a JSON string to match existing file format (atomically)
       write_atomic(MOTD_FILE, json.dumps(new_motd))
       # Update in-memory value
       motd_content = new_motd if isinstance(new_motd, str) else str(new_motd)
       info_print(f"[Info] MOTD updated by {get_node_shortname(sender_id)}")
-      return "✅ MOTD updated. Use /motd to view it."
+      return _cmd_reply(cmd, "✅ MOTD updated. Use /motd to view it.")
     except Exception as e:
-      return f"❌ Failed to update MOTD: {e}"
+      return _cmd_reply(cmd, f"❌ Failed to update MOTD: {e}")
 
   elif cmd == "/changeprompt":
     if not is_direct:
-      return "❌ This command can only be used in a direct message."
+      return _cmd_reply(cmd, "❌ This command can only be used in a direct message.")
+    sender_key = _sender_key(sender_id)
+    if sender_key not in AUTHORIZED_ADMINS:
+      PENDING_ADMIN_REQUESTS[sender_key] = {
+        "command": cmd,
+        "full_text": full_text,
+        "is_direct": is_direct,
+        "channel_idx": channel_idx,
+        "thread_root_ts": thread_root_ts,
+      }
+      clean_log(
+        f"Admin password required for /changeprompt from {get_node_shortname(sender_id)} ({sender_id})",
+        "🔐",
+        show_always=True,
+        rate_limit=False,
+      )
+      return PendingReply("reply with password", "admin password")
     # Change the system prompt for AI providers and persist to config.json
     new_prompt = full_text[len(cmd):].strip()
     if not new_prompt:
-      return "Usage: /changeprompt Your new system prompt"
+      return _cmd_reply(cmd, "Usage: /changeprompt Your new system prompt")
     try:
       SYSTEM_PROMPT = new_prompt
       # Update config dict and persist (atomically)
       if not isinstance(config, dict):
-        return "❌ Internal error: config not loaded"
+        return _cmd_reply(cmd, "❌ Internal error: config not loaded")
       config["system_prompt"] = new_prompt
       write_atomic(CONFIG_FILE, json.dumps(config, indent=2))
       info_print(f"[Info] System prompt updated by {get_node_shortname(sender_id)}")
-      return "✅ System prompt updated."
+      return _cmd_reply(cmd, "✅ System prompt updated.")
     except Exception as e:
-      return f"❌ Failed to update system prompt: {e}"
+      return _cmd_reply(cmd, f"❌ Failed to update system prompt: {e}")
 
   elif cmd in ["/showprompt", "/printprompt"]:
     if not is_direct:
-      return "❌ This command can only be used in a direct message."
+      return _cmd_reply(cmd, "❌ This command can only be used in a direct message.")
     try:
       info_print(f"[Info] Showing system prompt to {get_node_shortname(sender_id)}")
-      return f"Current system prompt:\n{SYSTEM_PROMPT}"
+      return _cmd_reply(cmd, f"Current system prompt:\n{SYSTEM_PROMPT}")
     except Exception as e:
-      return f"❌ Failed to show system prompt: {e}"
+      return _cmd_reply(cmd, f"❌ Failed to show system prompt: {e}")
 
   elif cmd == "/reset":
     # Clear chat context for either this direct DM thread (sender <-> AI)
@@ -1733,22 +2016,22 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
       save_archive()
     if cleared > 0:
       if is_direct:
-        return "I seemed to have had a robot brain fart.., I guess we're starting fresh"
+        return _cmd_reply(cmd, "I seemed to have had a robot brain fart.., I guess we're starting fresh")
       else:
-        return "🧵 Thread/channel context cleared. Starting fresh."
+        return _cmd_reply(cmd, "🧵 Thread/channel context cleared. Starting fresh.")
     else:
       if is_direct:
-        return "🧹 Nothing to reset in your direct chat."
+        return _cmd_reply(cmd, "🧹 Nothing to reset in your direct chat.")
       elif channel_idx is not None:
         ch_name = str(config.get("channel_names", {}).get(str(channel_idx), channel_idx))
-        return f"🧹 Nothing to reset for channel {ch_name}."
+        return _cmd_reply(cmd, f"🧹 Nothing to reset for channel {ch_name}.")
       else:
-        return "🧹 Nothing to reset (unknown target)."
+        return _cmd_reply(cmd, "🧹 Nothing to reset (unknown target).")
 
   elif cmd == "/sms":
     parts = full_text.split(" ", 2)
     if len(parts) < 3:
-      return "Invalid syntax. Use: /sms <phone_number> <message>"
+      return _cmd_reply(cmd, "Invalid syntax. Use: /sms <phone_number> <message>")
     phone_number = parts[1]
     message_text = parts[2]
     try:
@@ -1759,10 +2042,10 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
         to=phone_number,
       )
       print(f"✅ SMS sent to {phone_number}")
-      return "SMS sent successfully."
+      return _cmd_reply(cmd, "SMS sent successfully.")
     except Exception as e:
       print(f"⚠️ Failed to send SMS: {e}")
-      return "Failed to send SMS."
+      return _cmd_reply(cmd, "Failed to send SMS.")
 
   for c in commands_config.get("commands", []):
     if c.get("command").lower() == cmd:
@@ -1771,13 +2054,15 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
         custom_text = c["ai_prompt"].replace("{user_input}", user_input)
         if AI_PROVIDER == "home_assistant" and HOME_ASSISTANT_ENABLE_PIN:
           if not pin_is_valid(custom_text):
-            return "Security code missing or invalid."
+            return _cmd_reply(cmd, "Security code missing or invalid.")
           custom_text = strip_pin(custom_text)
         ans = get_ai_response(custom_text, sender_id=sender_id, is_direct=is_direct, channel_idx=channel_idx, thread_root_ts=thread_root_ts)
-        return ans if ans else "🤖 [No AI response]"
+        if ans:
+          return ans
+        return _cmd_reply(cmd, "🤖 [No AI response]")
       elif "response" in c:
-        return c["response"]
-      return "No configured response for this command."
+        return _cmd_reply(cmd, c["response"])
+      return _cmd_reply(cmd, "No configured response for this command.")
 
   return None
 
@@ -1794,41 +2079,59 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
   if (not is_direct) and channel_idx != HOME_ASSISTANT_CHANNEL_INDEX and not config.get("reply_in_channels", True):
     return None if not check_only else False
 
+  sender_key = _sender_key(sender_id)
+  if is_direct and sender_key in PENDING_ADMIN_REQUESTS and not text.startswith("/"):
+    if check_only:
+      return False
+    return _process_admin_password(sender_id, text)
+
   sanitized = text.replace('\u0007', '').strip()
   normalized = sanitized.lower()
   quick_reply = None
+  quick_reason = None
   if is_direct:
     normalized_no_bell = normalized.replace('🔔', '').strip()
     if normalized in ALERT_BELL_KEYWORDS or normalized_no_bell in ALERT_BELL_KEYWORDS:
       quick_reply = random.choice(ALERT_BELL_RESPONSES)
+      quick_reason = "alert bell"
     else:
       normalized_no_markers = normalized_no_bell.replace('📍', '').strip()
       if ('shared their position' in normalized_no_markers
           and 'requested a response with your position' in normalized_no_markers):
         quick_reply = random.choice(POSITION_REQUEST_RESPONSES)
+        quick_reason = "position request"
   if quick_reply is not None:
     if check_only:
       return False
-    return quick_reply
+    return PendingReply(quick_reply, quick_reason or "quick reply")
 
   # Commands (start with /) should be handled and given context
   if text.startswith("/"):
+    raw_cmd = text.split()[0]
+    canonical_cmd, notice_reason = resolve_command_token(raw_cmd)
     if check_only:
       # Quick commands like /reset don't need AI processing
-      cmd = text.split()[0].lower()
-      if cmd in ["/reset", "/sms"]:
+      cmd_lower = canonical_cmd.lower()
+      if cmd_lower in ["/reset", "/sms"]:
         return False  # Process immediately, not async
       # Built-in AI commands need async processing
-      if cmd in ["/ai", "/bot", "/query", "/data"]:
+      if cmd_lower in ["/ai", "/bot", "/query", "/data"]:
         return True  # Needs AI processing
       # Check if it's a custom AI command
       for c in commands_config.get("commands", []):
-        if c.get("command").lower() == cmd and "ai_prompt" in c:
+        cmd_entry = c.get("command")
+        if not isinstance(cmd_entry, str):
+          continue
+        entry_norm = cmd_entry.lower() if cmd_entry.startswith("/") else f"/{cmd_entry.lower()}"
+        if entry_norm == canonical_cmd.lower() and "ai_prompt" in c:
           return True  # Needs AI processing
       return False  # Other commands can be processed immediately
     else:
-      cmd = text.split()[0]
-      resp = handle_command(cmd, text, sender_id, is_direct=is_direct, channel_idx=channel_idx, thread_root_ts=thread_root_ts)
+      if canonical_cmd != raw_cmd:
+        text = canonical_cmd + text[len(raw_cmd):]
+      resp = handle_command(canonical_cmd, text, sender_id, is_direct=is_direct, channel_idx=channel_idx, thread_root_ts=thread_root_ts)
+      if notice_reason:
+        resp = annotate_command_response(resp, raw_cmd, canonical_cmd, notice_reason)
       return resp
 
   # Non-command messages: route to AI for direct messages, or Home Assistant if configured for this channel.
@@ -1988,21 +2291,30 @@ def on_receive(packet=None, interface=None, **kwargs):
         # Fall back to immediate processing if queue is full
         resp = parse_incoming_text(text, sender_node, is_direct, ch_idx, thread_root_ts=thread_root_ts)
         if resp:
-          info_print(f"[Info] Immediate fallback response: {resp}")
-          if is_direct:
-            send_direct_chunks(interface, resp, sender_node)
-          else:
-            send_broadcast_chunks(interface, resp, ch_idx)
+          pending = resp if isinstance(resp, PendingReply) else None
+          response_text = pending.text if pending else resp
+          if response_text:
+            if pending:
+              _command_delay(pending.reason)
+            info_print(f"[Info] Immediate fallback response: {response_text}")
+            if is_direct:
+              send_direct_chunks(interface, response_text, sender_node)
+            else:
+              send_broadcast_chunks(interface, response_text, ch_idx)
     else:
       # Non-AI messages (e.g., simple commands) can be processed immediately
       resp = parse_incoming_text(text, sender_node, is_direct, ch_idx, thread_root_ts=thread_root_ts)
       if resp:
-        # This should be a quick response (like /reset), so process synchronously
-        info_print(f"[Info] Immediate response: {resp}")
-        if is_direct:
-          send_direct_chunks(interface, resp, sender_node)
-        else:
-          send_broadcast_chunks(interface, resp, ch_idx)
+        pending = resp if isinstance(resp, PendingReply) else None
+        response_text = pending.text if pending else resp
+        if response_text:
+          info_print(f"[Info] Immediate response: {response_text}")
+          if pending:
+            _command_delay(pending.reason)
+          if is_direct:
+            send_direct_chunks(interface, response_text, sender_node)
+          else:
+            send_broadcast_chunks(interface, response_text, ch_idx)
 
   except OSError as e:
     error_code = getattr(e, 'errno', None) or getattr(e, 'winerror', None)
