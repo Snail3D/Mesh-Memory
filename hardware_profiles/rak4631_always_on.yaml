@@ -1,0 +1,16 @@
+# Meshtastic configuration overrides to keep a RAK4631-based node awake on external USB power.
+# Apply with: meshtastic --port /dev/serial/... --configure hardware_profiles/rak4631_always_on.yaml
+# Fields mirror meshtastic.protobuf.Config defaults; see https://docs.rakwireless.com/Product-Categories/WisBlock/RAK4631/Datasheet/ for hardware context.
+
+device:
+  role: ROUTER_CLIENT        # Router roles stay awake and keep the radio powered
+power:
+  is_power_saving: false     # Disable automatic low-power transitions
+  wait_bluetooth_secs: 0     # Do not wait for BLE pairing before running
+  on_battery_shutdown_after_secs: 0  # Never shut down due to perceived low battery
+  sds_secs: 0                # Skip short deep sleep windows
+  ls_secs: 0                 # Skip light sleep windows
+  min_wake_secs: 0           # Allow the firmware to stay awake indefinitely
+position:
+  gps_enabled: false         # RAK4631 build described here uses no GPS module
+  gps_mode: NOT_PRESENT      # Prevent the firmware from repeatedly probing a missing receiver

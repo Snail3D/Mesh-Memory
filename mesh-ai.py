@@ -17,6 +17,8 @@ from flask import Flask, request, jsonify, redirect, url_for, stream_with_contex
 import sys
 import socket  # for socket error checking
 import re
+import random
+from meshtastic_facts import MESHTASTIC_ALERT_FACTS
 from twilio.rest import Client  # for Twilio SMS support
 from unidecode import unidecode   # Added unidecode import for Ollama text normalization
 from google.protobuf.message import DecodeError
@@ -570,6 +572,27 @@ DISCORD_WEBHOOK_URL = config.get("discord_webhook_url", None)
 DISCORD_SEND_EMERGENCY = config.get("discord_send_emergency", False)
 DISCORD_SEND_AI = config.get("discord_send_ai", False)
 DISCORD_SEND_ALL = config.get("discord_send_all", False)
+
+ALERT_BELL_KEYWORDS = {
+    "🔔 alert bell character!",
+    "alert bell character!",
+    "alert bell character",
+}
+
+ALERT_BELL_RESPONSES = MESHTASTIC_ALERT_FACTS
+
+POSITION_REQUEST_RESPONSES = [
+    "position request received, but i'm just a dumb bot..",
+    "i logged your position request, but my feet are virtual..",
+    "position request noted; this brain runs on silicon, not gps..",
+    "got the position ping, but i'm glued to the server rack..",
+    "mesh ctrl: position request acknowledged with zero coordinates..",
+    "position ping heard; i'm anchored to the console though..",
+    "copy that position request—no actual lat/long on this side..",
+    "routing the position request, but i'm strictly imaginary on maps..",
+    "position beacon requested; i'm still just firmware in the loop..",
+    "heard the position call, yet i'm a chat bot without a compass..",
+]
 DISCORD_RESPONSE_CHANNEL_INDEX = config.get("discord_response_channel_index", None)
 DISCORD_RECEIVE_ENABLED = config.get("discord_receive_enabled", True)
 # New variable for inbound routing
@@ -1770,6 +1793,23 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
     return None if not check_only else False
   if (not is_direct) and channel_idx != HOME_ASSISTANT_CHANNEL_INDEX and not config.get("reply_in_channels", True):
     return None if not check_only else False
+
+  sanitized = text.replace('\u0007', '').strip()
+  normalized = sanitized.lower()
+  quick_reply = None
+  if is_direct:
+    normalized_no_bell = normalized.replace('🔔', '').strip()
+    if normalized in ALERT_BELL_KEYWORDS or normalized_no_bell in ALERT_BELL_KEYWORDS:
+      quick_reply = random.choice(ALERT_BELL_RESPONSES)
+    else:
+      normalized_no_markers = normalized_no_bell.replace('📍', '').strip()
+      if ('shared their position' in normalized_no_markers
+          and 'requested a response with your position' in normalized_no_markers):
+        quick_reply = random.choice(POSITION_REQUEST_RESPONSES)
+  if quick_reply is not None:
+    if check_only:
+      return False
+    return quick_reply
 
   # Commands (start with /) should be handled and given context
   if text.startswith("/"):

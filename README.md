@@ -199,6 +199,23 @@ This fork includes significant performance, reliability, and user experience imp
 
 ---
 
+## 🔋 RAK4631 Always-On Setup
+
+RAK's [RAK4631 quick start](https://docs.rakwireless.com/Product-Categories/WisBlock/RAK4631/Datasheet/) and [deep sleep tutorial](https://github.com/RAKWireless/WisBlock/tree/master/tutorials/RAK4631-Deep-Sleep-P2P) show how the core aggressively powers down (down to about 120 uA) whenever it can. On a USB-powered node with no LiPo or GPS that behavior can cut the USB serial path after a few idle minutes. Pin the module in an always-on profile before running MESH MEMORY:
+
+- **Disable USB autosuspend.** Copy `99-rak-no-autosuspend.rules` into `/etc/udev/rules.d/` and reload udev so the host keeps the WisBlock CDC interface awake:
+  ```bash
+  sudo cp 99-rak-no-autosuspend.rules /etc/udev/rules.d/
+  sudo udevadm control --reload-rules
+  sudo udevadm trigger
+  ```
+- **Push the RAK4631 always-on Meshtastic profile.** The repo includes `hardware_profiles/rak4631_always_on.yaml` plus a helper script that reads your `config.json` serial path:
+  ```bash
+  ./scripts/apply_rak4631_profile.py
+  ```
+  Add `--dry-run` to inspect the underlying Meshtastic command. The profile forces `device.role=ROUTER_CLIENT`, disables power saving, and turns off GPS polling so USB power alone is stable.
+- **Verify the node stays awake.** After the profile is applied, run `meshtastic --port /dev/serial/... --info` and confirm it reports `role: ROUTER_CLIENT` and `is_power_saving: false`. The serial link should remain available even after long idle periods.
+
 ## Changelog
 
 ### v1.0.0 - September 24, 2025 🎉
