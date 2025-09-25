@@ -21,6 +21,7 @@ from twilio.rest import Client  # for Twilio SMS support
 from unidecode import unidecode   # Added unidecode import for Ollama text normalization
 from google.protobuf.message import DecodeError
 import queue  # For async message processing
+import atexit
 # Make sure DEBUG_ENABLED exists before any logger/filter classes use it
 # -----------------------------
 # Global Debug & Noise Patterns
@@ -318,6 +319,41 @@ def add_script_log(message):
             f.write(log_entry + "\n")
     except Exception as e:
         print(f"⚠️ Could not write to {SCRIPT_LOG_FILE}: {e}")
+
+def _pid_running(pid: int) -> bool:
+    try:
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+APP_LOCK_FILE = "mesh-ai.app.lock"
+
+def acquire_app_lock():
+    try:
+        if os.path.exists(APP_LOCK_FILE):
+            try:
+                with open(APP_LOCK_FILE, 'r', encoding='utf-8') as f:
+                    existing = f.read().strip()
+                ep = int(existing) if existing else 0
+            except Exception:
+                ep = 0
+            if ep and _pid_running(ep):
+                print(f"❌ Another mesh-ai instance appears to be running (PID {ep}). Exiting.")
+                sys.exit(1)
+        with open(APP_LOCK_FILE, 'w', encoding='utf-8') as f:
+            f.write(str(os.getpid()))
+    except Exception as e:
+        print(f"⚠️ Could not create app lock: {e}")
+
+def release_app_lock():
+    try:
+        if os.path.exists(APP_LOCK_FILE):
+            os.remove(APP_LOCK_FILE)
+    except Exception:
+        pass
 # Redirect stdout and stderr to our log while still printing to terminal.
 class StreamToLogger(object):
     def __init__(self, logger_func):
@@ -448,6 +484,15 @@ def safe_load_json(path, default_value):
     except Exception as e:
         print(f"⚠️ Could not load {path}: {e}")
     return default_value
+
+def write_atomic(path: str, data: str):
+    """Atomically write text data to a file to avoid partial writes.
+    Creates a temporary file in the same directory and replaces the target.
+    """
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(data)
+    os.replace(tmp_path, path)
 
 config = safe_load_json(CONFIG_FILE, {})
 commands_config = safe_load_json(COMMANDS_CONFIG_FILE, {"commands": []})
@@ -603,6 +648,20 @@ lastDMNode = None
 lastChannelIndex = None
 
 # -----------------------------
+# Health/Heartbeat State
+# -----------------------------
+last_rx_time = 0.0
+last_tx_time = 0.0
+last_ai_response_time = 0.0
+last_ai_request_time = 0.0
+ai_last_error = ""
+ai_last_error_time = 0.0
+heartbeat_running = False
+
+def _now():
+  return time.time()
+
+# -----------------------------
 # Async Message Processing
 # -----------------------------
 # Queue for pending AI responses to process asynchronously
@@ -666,6 +725,10 @@ def process_responses_worker():
                     else:
                         send_broadcast_chunks(interface_ref, resp, ch_idx)
                         
+                try:
+                    globals()['last_ai_response_time'] = _now()
+                except Exception:
+                    pass
                 total_time = time.time() - start_time
                 clean_log(f"🎯 [AsyncAI] Completed response for {sender_node} (total: {total_time:.1f}s)", "✅")
             else:
@@ -907,6 +970,11 @@ def send_broadcast_chunks(interface, text, channelIndex):
             try:
                 interface.sendText(chunk, destinationId=BROADCAST_ADDR, channelIndex=channelIndex, wantAck=True)
                 success = True
+                # mark last transmit time on success
+                try:
+                    globals()['last_tx_time'] = _now()
+                except Exception:
+                    pass
                 clean_log(f"Sent chunk {i+1}/{len(chunks)} on Ch{channelIndex}", "📡")
                 break
             except Exception as e:
@@ -966,6 +1034,11 @@ def send_direct_chunks(interface, text, destinationId):
                 else:
                     interface.sendText(chunk, destinationId=destinationId, wantAck=True)
                 success = True
+                # mark last transmit time on success
+                try:
+                    globals()['last_tx_time'] = _now()
+                except Exception:
+                    pass
                 clean_log(f"Sent chunk {i+1}/{len(chunks)} to {destinationId}", "📤")
                 break
             except Exception as e:
@@ -1006,8 +1079,26 @@ def send_to_lmstudio(user_message: str):
         "max_tokens": MAX_RESPONSE_LENGTH,
     }
     try:
-        response = requests.post(LMSTUDIO_URL, json=payload, timeout=LMSTUDIO_TIMEOUT)
-        if response.status_code == 200:
+        # Track last AI request time
+        try:
+            globals()['last_ai_request_time'] = _now()
+        except Exception:
+            pass
+        # Simple retry loop
+        attempts = 0
+        backoff = 1.5
+        response = None
+        while attempts < 2:
+            attempts += 1
+            try:
+                response = requests.post(LMSTUDIO_URL, json=payload, timeout=LMSTUDIO_TIMEOUT)
+                break
+            except Exception as e:
+                if attempts >= 2:
+                    raise
+                time.sleep(backoff)
+                backoff *= 1.7
+        if response is not None and response.status_code == 200:
             j = response.json()
             dprint(f"LMStudio raw ⇒ {j}")
             ai_resp = (
@@ -1021,10 +1112,22 @@ def send_to_lmstudio(user_message: str):
                 ai_log(f"Response: {clean_resp}", "lmstudio")
             return ai_resp[:MAX_RESPONSE_LENGTH]
         else:
-            print(f"⚠️ LMStudio error: {response.status_code} - {response.text}")
+            err = f"LMStudio error: {getattr(response, 'status_code', 'no response')}"
+            print(f"⚠️ {err}")
+            try:
+                globals()['ai_last_error'] = err
+                globals()['ai_last_error_time'] = _now()
+            except Exception:
+                pass
             return None
     except Exception as e:
-        print(f"⚠️ LMStudio request failed: {e}")
+        msg = f"LMStudio request failed: {e}"
+        print(f"⚠️ {msg}")
+        try:
+            globals()['ai_last_error'] = msg
+            globals()['ai_last_error_time'] = _now()
+        except Exception:
+            pass
         return None
 def lmstudio_embed(text: str):
     """Return an embedding vector (if you ever need it)."""
@@ -1068,8 +1171,24 @@ def send_to_openai(user_message):
         "max_tokens": MAX_RESPONSE_LENGTH
     }
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=OPENAI_TIMEOUT)
-        if r.status_code == 200:
+        try:
+            globals()['last_ai_request_time'] = _now()
+        except Exception:
+            pass
+        r = None
+        attempts = 0
+        backoff = 1.5
+        while attempts < 2:
+            attempts += 1
+            try:
+                r = requests.post(url, headers=headers, json=payload, timeout=OPENAI_TIMEOUT)
+                break
+            except Exception as e:
+                if attempts >= 2:
+                    raise
+                time.sleep(backoff)
+                backoff *= 1.7
+        if r is not None and r.status_code == 200:
             jr = r.json()
             dprint(f"OpenAI raw => {jr}")
             content = (
@@ -1083,10 +1202,22 @@ def send_to_openai(user_message):
                 ai_log(f"Response: {clean_resp}", "openai")
             return content[:MAX_RESPONSE_LENGTH]
         else:
-            print(f"⚠️ OpenAI error: {r.status_code} => {r.text}")
+            err = f"OpenAI error: {getattr(r, 'status_code', 'no response')}"
+            print(f"⚠️ {err}")
+            try:
+                globals()['ai_last_error'] = err
+                globals()['ai_last_error_time'] = _now()
+            except Exception:
+                pass
             return None
     except Exception as e:
-        print(f"⚠️ OpenAI request failed: {e}")
+        msg = f"OpenAI request failed: {e}"
+        print(f"⚠️ {msg}")
+        try:
+            globals()['ai_last_error'] = msg
+            globals()['ai_last_error_time'] = _now()
+        except Exception:
+            pass
         return None
 
 def build_ollama_history(sender_id=None, is_direct=False, channel_idx=None, thread_root_ts=None, max_chars=OLLAMA_CONTEXT_CHARS):
@@ -1225,8 +1356,24 @@ def send_to_ollama(user_message, sender_id=None, is_direct=False, channel_idx=No
     }
 
     try:
-        r = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT)
-        if r.status_code == 200:
+        try:
+            globals()['last_ai_request_time'] = _now()
+        except Exception:
+            pass
+        r = None
+        attempts = 0
+        backoff = 1.5
+        while attempts < 2:
+            attempts += 1
+            try:
+                r = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT)
+                break
+            except Exception as e:
+                if attempts >= 2:
+                    raise
+                time.sleep(backoff)
+                backoff *= 1.7
+        if r is not None and r.status_code == 200:
             jr = r.json()
             dprint(f"Ollama raw => {jr}")
             # Extract clean response for logging
@@ -1244,10 +1391,22 @@ def send_to_ollama(user_message, sender_id=None, is_direct=False, channel_idx=No
                 resp = "🤖 [No response]"
             return (resp or "")[:MAX_RESPONSE_LENGTH]
         else:
-            print(f"⚠️ Ollama error: {r.status_code} => {r.text}")
+            err = f"Ollama error: {getattr(r, 'status_code', 'no response')}"
+            print(f"⚠️ {err}")
+            try:
+                globals()['ai_last_error'] = err
+                globals()['ai_last_error_time'] = _now()
+            except Exception:
+                pass
             return None
     except Exception as e:
-        print(f"⚠️ Ollama request failed: {e}")
+        msg = f"Ollama request failed: {e}"
+        print(f"⚠️ {msg}")
+        try:
+            globals()['ai_last_error'] = msg
+            globals()['ai_last_error_time'] = _now()
+        except Exception:
+            pass
         return None
 
 def send_to_home_assistant(user_message):
@@ -1405,6 +1564,8 @@ def route_message_text(user_message, channel_idx):
 # Revised Command Handler (Case-Insensitive)
 # -----------------------------
 def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None, thread_root_ts=None):
+  # Globals modified by DM-only commands
+  global motd_content, SYSTEM_PROMPT, config
   cmd = cmd.lower()
   dprint(f"handle_command => cmd='{cmd}', full_text='{full_text}', sender_id={sender_id}, is_direct={is_direct}")
   if cmd == "/about":
@@ -1449,12 +1610,62 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     return f"Hello {sn}! Received {LOCAL_LOCATION_STRING} by {AI_NODE_NAME}."
 
   elif cmd == "/help":
-    built_in = ["/about", "/query", "/whereami", "/emergency", "/911", "/test", "/motd", "/reset"]
+    built_in = [
+      "/about", "/query", "/whereami", "/emergency", "/911", "/test",
+      "/motd", "/changemotd", "/changeprompt", "/showprompt", "/printprompt", "/reset"
+    ]
     custom_cmds = [c.get("command") for c in commands_config.get("commands", [])]
-    return "Commands:\n" + ", ".join(built_in + custom_cmds)
+    help_text = "Commands:\n" + ", ".join(built_in + custom_cmds)
+    help_text += "\nNote: /changeprompt, /changemotd, /showprompt, and /printprompt are DM-only."
+    return help_text
 
   elif cmd == "/motd":
     return motd_content
+
+  elif cmd == "/changemotd":
+    if not is_direct:
+      return "❌ This command can only be used in a direct message."
+    # Change the Message of the Day content and persist to MOTD_FILE
+    new_motd = full_text[len(cmd):].strip()
+    if not new_motd:
+      return "Usage: /changemotd Your new MOTD text"
+    try:
+      # Persist as a JSON string to match existing file format (atomically)
+      write_atomic(MOTD_FILE, json.dumps(new_motd))
+      # Update in-memory value
+      motd_content = new_motd if isinstance(new_motd, str) else str(new_motd)
+      info_print(f"[Info] MOTD updated by {get_node_shortname(sender_id)}")
+      return "✅ MOTD updated. Use /motd to view it."
+    except Exception as e:
+      return f"❌ Failed to update MOTD: {e}"
+
+  elif cmd == "/changeprompt":
+    if not is_direct:
+      return "❌ This command can only be used in a direct message."
+    # Change the system prompt for AI providers and persist to config.json
+    new_prompt = full_text[len(cmd):].strip()
+    if not new_prompt:
+      return "Usage: /changeprompt Your new system prompt"
+    try:
+      SYSTEM_PROMPT = new_prompt
+      # Update config dict and persist (atomically)
+      if not isinstance(config, dict):
+        return "❌ Internal error: config not loaded"
+      config["system_prompt"] = new_prompt
+      write_atomic(CONFIG_FILE, json.dumps(config, indent=2))
+      info_print(f"[Info] System prompt updated by {get_node_shortname(sender_id)}")
+      return "✅ System prompt updated."
+    except Exception as e:
+      return f"❌ Failed to update system prompt: {e}"
+
+  elif cmd in ["/showprompt", "/printprompt"]:
+    if not is_direct:
+      return "❌ This command can only be used in a direct message."
+    try:
+      info_print(f"[Info] Showing system prompt to {get_node_shortname(sender_id)}")
+      return f"Current system prompt:\n{SYSTEM_PROMPT}"
+    except Exception as e:
+      return f"❌ Failed to show system prompt: {e}"
 
   elif cmd == "/reset":
     # Clear chat context for either this direct DM thread (sender <-> AI)
@@ -1620,6 +1831,10 @@ def on_receive(packet=None, interface=None, **kwargs):
     decoded = {'text': str(decoded), 'portnum': 'TEXT_MESSAGE_APP'}
   
   # continue processing
+  try:
+    globals()['last_rx_time'] = _now()
+  except Exception:
+    pass
   
   portnum = decoded.get('portnum')
   # Accept string or int for TEXT_MESSAGE_APP (1)
@@ -3490,6 +3705,8 @@ def main():
     # Start monitors (connection watchdog and scheduled refresh)
     threading.Thread(target=connection_monitor, args=(20,), daemon=True).start()
     threading.Thread(target=scheduled_refresh_monitor, daemon=True).start()
+    # Heartbeat thread for visibility
+    threading.Thread(target=heartbeat_worker, args=(30,), daemon=True).start()
 
     while True:
         try:
@@ -3580,6 +3797,84 @@ def scheduled_refresh_monitor():
       # Never crash; wait a bit and continue
       time.sleep(60)
 
+# -----------------------------
+# Heartbeat & Health Endpoints
+# -----------------------------
+def heartbeat_worker(period_sec=30):
+  global heartbeat_running
+  heartbeat_running = True
+  while True:
+    try:
+      now = _now()
+      rx_age = (now - last_rx_time) if last_rx_time else None
+      tx_age = (now - last_tx_time) if last_tx_time else None
+      ai_age = (now - last_ai_response_time) if last_ai_response_time else None
+      qsize = 0
+      try:
+        qsize = response_queue.qsize()
+      except Exception:
+        qsize = -1
+      status = {
+        'conn': connection_status,
+        'queue': qsize,
+        'worker': bool(response_worker_running),
+        'rx_age_s': None if rx_age is None else int(rx_age),
+        'tx_age_s': None if tx_age is None else int(tx_age),
+        'ai_age_s': None if ai_age is None else int(ai_age),
+        'msgs': len(messages),
+      }
+      # Short, periodic heartbeat log; always show to keep logs alive
+      clean_log(f"HB conn={status['conn']} q={status['queue']} rx={status['rx_age_s']}s tx={status['tx_age_s']}s ai={status['ai_age_s']}s", "💓", show_always=True, rate_limit=False)
+      periodic_status_update()
+      time.sleep(max(5, int(period_sec)))
+    except Exception as e:
+      print(f"⚠️ Heartbeat error: {e}")
+      time.sleep(10)
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+  now = _now()
+  rx_age = (now - last_rx_time) if last_rx_time else None
+  ai_age = (now - last_ai_response_time) if last_ai_response_time else None
+  ai_err_age = (now - ai_last_error_time) if ai_last_error_time else None
+  qsize = response_queue.qsize()
+  data = {
+    'ok': True,
+    'status': connection_status,
+    'queue': qsize,
+    'worker': bool(response_worker_running),
+    'heartbeat': bool(heartbeat_running),
+    'rx_age_s': None if rx_age is None else int(rx_age),
+    'ai_age_s': None if ai_age is None else int(ai_age),
+    'messages': len(messages),
+    'ai_error': ai_last_error,
+    'ai_error_age_s': None if ai_err_age is None else int(ai_err_age),
+  }
+  code = 200
+  # Degraded conditions
+  if connection_status != "Connected":
+    data['ok'] = False
+    data['degraded'] = 'radio_disconnected'
+    code = 503
+  elif qsize > 0 and (ai_age is not None and ai_age > 180):
+    data['ok'] = False
+    data['degraded'] = 'response_queue_stalled'
+    code = 503
+  elif ai_err_age is not None and ai_err_age < 120:
+    data['ok'] = False
+    data['degraded'] = 'ai_provider_recent_error'
+    code = 503
+  return jsonify(data), code
+
+@app.route("/live", methods=["GET"])
+def live():
+  return jsonify({'ok': True, 'worker': bool(response_worker_running), 'heartbeat': bool(heartbeat_running)})
+
+@app.route("/ready", methods=["GET"])
+def ready():
+  ready = (connection_status == "Connected")
+  return jsonify({'ok': ready, 'status': connection_status}), (200 if ready else 503)
+
 # Start the watchdog thread after 20 seconds to give node a chance to connect
 def poll_discord_channel():
     """Polls the Discord channel for new messages using the Discord API."""
@@ -3625,6 +3920,9 @@ def poll_discord_channel():
         time.sleep(10)
 
 if __name__ == "__main__":
+    # App-level single-instance guard (complements service/script lock)
+    acquire_app_lock()
+    atexit.register(release_app_lock)
     # Start smooth logging system for pleasant scrolling
     start_smooth_logging()
     

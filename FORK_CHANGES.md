@@ -1,5 +1,31 @@
 # Enhanced Mesh-AI Fork - Technical Changes Summary
 
+## Recent Updates (2025-09-25)
+
+Highlights focused on operational stability, visibility, and admin ergonomics.
+
+- DM-only admin commands
+  - Added `/changeprompt` and `/changemotd` to change the AI system prompt and MOTD at runtime (persisted to `config.json` and `motd.json`).
+  - Added `/showprompt` and `/printprompt` to display the active system prompt.
+  - All four are DM-only to reduce accidental misuse in channels.
+
+- Health and heartbeat
+  - New endpoints: `/healthz`, `/live`, `/ready`.
+  - Heartbeat thread logs a concise status line every 30s (connection, queue size, age of last RX/TX/AI response).
+  - `/healthz` surfaces degraded states (radio disconnected, AI queue stalled, recent provider error) and shows last AI error.
+
+- Safer persistence
+  - Atomic writes for `config.json` and `motd.json` to prevent partial files on power loss or crashes.
+
+- Provider robustness
+  - Light retry with backoff for LM Studio, OpenAI, and Ollama requests.
+  - Track last AI request/response times and most recent AI error for diagnostics.
+
+- Process safety
+  - Added app-level PID lock (`mesh-ai.app.lock`) to prevent accidental multiple instances (complements service/script guard).
+
+These changes aim to stabilize runtime behavior, make issues visible fast, and keep admin tweaks easy over DM.
+
 ## Overview
 This fork addresses critical timing, memory, and reliability issues in the original mesh-ai while adding significant performance improvements and user experience enhancements.
 
