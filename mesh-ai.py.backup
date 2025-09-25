@@ -1927,66 +1927,25 @@ def logs():
         }}, 1000);
       }});
       
-      // SSE for real-time log updates with robust reconnection
-      let eventSource;
-      let reconnectAttempts = 0;
-      let maxReconnectAttempts = 5;
-      let lastMessageTime = Date.now();
-      
-      function createEventSource() {{
-        eventSource = new EventSource('/logs_stream');
-        
-        eventSource.onmessage = function(event) {{
-          // Skip heartbeat messages but reset timeout
-          if (event.data.includes('heartbeat') || event.data.includes('keepalive')) {{
-            lastMessageTime = Date.now();
-            return;
-          }}
-          
-          logbox.textContent += event.data + '\\n';
-          smoothScrollToBottom();
-          lastMessageTime = Date.now();
-          reconnectAttempts = 0; // Reset on successful message
-        }};
-        
-        eventSource.onopen = function(event) {{
-          console.log('SSE connection established');
-          reconnectAttempts = 0;
-          lastMessageTime = Date.now();
-        }};
-        
-        eventSource.onerror = function(event) {{
-          console.log('SSE connection error, attempt', reconnectAttempts + 1);
-          eventSource.close();
-          
-          if (reconnectAttempts < maxReconnectAttempts) {{
-            reconnectAttempts++;
-            setTimeout(createEventSource, Math.min(1000 * reconnectAttempts, 5000));
-          }} else {{
-            console.log('Max reconnect attempts reached, reloading page...');
-            location.reload();
-          }}
-        }};
-      }}
-      
-      // Monitor for stale connections (no activity for 60 seconds)
-      setInterval(() => {{
-        if (Date.now() - lastMessageTime > 60000) {{
-          console.log('Connection appears stale, reconnecting...');
-          eventSource.close();
-          reconnectAttempts = 0;
-          createEventSource();
-          lastMessageTime = Date.now();
-        }}
-      }}, 30000); // Check every 30 seconds
-      
-      // Initialize connection
-      createEventSource();
+      // SSE for real-time log updates
+      const eventSource = new EventSource('/logs_stream');
+      eventSource.onmessage = function(event) {{
+        logbox.textContent += event.data + '\\n';
+        smoothScrollToBottom();
+      }};
       
       // Initial scroll to bottom
       document.addEventListener("DOMContentLoaded", () => {{
         smoothScrollToBottom();
       }});
+      
+      // Handle connection errors
+      eventSource.onerror = function(event) {{
+        console.log('SSE connection error, retrying...');
+        setTimeout(() => {{
+          location.reload();
+        }}, 5000);
+      }};
     </script>
   </body>
 </html>"""
