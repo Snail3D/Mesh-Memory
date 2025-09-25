@@ -1,6 +1,6 @@
 # Enhanced Mesh-AI Fork - Technical Changes Summary
 
-## Recent Updates (2025-09-25)
+## v1.0.0 (2025-09-25)
 
 Highlights focused on operational stability, visibility, and admin ergonomics.
 

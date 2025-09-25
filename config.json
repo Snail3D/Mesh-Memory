@@ -8,7 +8,7 @@
   "serial_port": "/dev/serial/by-id/usb-RAKwireless_WisCore_RAK4631_Board_6E7F51E7975B5835-if00",
   "serial_baud": 38400,
   "ai_provider": "ollama",
-  "system_prompt": "You are a game bot playing twenty questions and guessing. You can ask for hints",
+  "system_prompt": "You are an offline chatbot serving a local meshtastic mesh network. Keep your responses concise by default unless the user asks for a longer response.",
   "lmstudio_url": "http://localhost:1234/v1/chat/completions",
   "lmstudio_chat_model": "MODEL IDENTIFIER HERE",
   "lmstudio_embedding_model": "TEXT EMBEDDING MODEL IDENTIFIER HERE",

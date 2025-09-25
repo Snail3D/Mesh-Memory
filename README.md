@@ -1,4 +1,4 @@
-# MESH MEMORY - Enhanced AI with Persistent Memory
+# MESH MEMORY v1.0.0 - Enhanced AI with Persistent Memory
 
 **MESH MEMORY** is an enhanced fork of MESH-AI that brings **persistent memory, async processing, and robust performance** to Meshtastic LoRa mesh networks. Never lose context again - your AI remembers every conversation across restarts and reconnections.
 
@@ -51,7 +51,21 @@ The Meshtastic logo trademark is the trademark of Meshtastic LLC.
 
 ---
 
-## 🚀 **Enhanced Fork Features** 
+## 🚀 v1.0 Highlights
+
+- DM-only admin commands
+  - `/changeprompt <text>`: Set the AI system prompt at runtime (persists to `config.json`).
+  - `/changemotd <text>`: Set the Message of the Day (persists to `motd.json`).
+  - `/showprompt` / `/printprompt`: Display the active system prompt.
+  - Note: These four commands are DM-only to avoid channel misuse.
+
+- Health & heartbeat
+  - `/healthz`: Detailed JSON health (connection status, queue size, RX/TX/AI ages, last AI error). Returns 503 on degraded states.
+  - `/live`: Liveness probe.
+  - `/ready`: Readiness probe (200 only when radio is connected).
+  - Heartbeat log every ~30s shows a compact status line in `mesh-ai.log`.
+
+## 🚀 **Enhanced Fork Features**
 
 This fork includes significant performance, reliability, and user experience improvements over the original mesh-ai:
 
@@ -141,6 +155,13 @@ This fork includes significant performance, reliability, and user experience imp
 ---
 
 ## Changelog
+
+### v1.0.0
+- New DM-only commands: `/changeprompt`, `/changemotd`, `/showprompt`, `/printprompt`.
+- Health endpoints: `/healthz`, `/live`, `/ready` with degraded state signaling.
+- Heartbeat thread for periodic status logging.
+- Atomic writes for `config.json` and `motd.json` to prevent partial files.
+- Light retries and error surfacing for AI providers (LM Studio, OpenAI, Ollama).
 
 ### New Updates in v0.4.2 → v0.5.1 - NOW IN BETA!
 - **REBRANDED TO MESH-AI** 

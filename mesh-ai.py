@@ -445,7 +445,7 @@ BANNER = (
 ██║ ╚═╝ ██║███████╗███████║██║  ██║            ██║  ██║██║
 ╚═╝     ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝            ╚═╝  ╚═╝╚═╝
 
-MESH-AI BETA v0.5.1 by: MR_TBOT (https://mr-tbot.com)
+MESH-AI v1.0.0 by: MR_TBOT (https://mr-tbot.com)
 https://mesh-ai.dev - (https://github.com/mr-tbot/mesh-ai/)
     \033[32m 
 Messaging Dashboard Access: http://localhost:5000/dashboard \033[38;5;214m
