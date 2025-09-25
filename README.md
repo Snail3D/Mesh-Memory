@@ -176,6 +176,7 @@ This fork includes significant performance, reliability, and user experience imp
   - Emergency notifications include GPS coordinates, UTC timestamps, and user messages.
 - **Enhanced REST API & WebUI Dashboard**  
   - A modern three‑column layout showing broadcast messages, direct messages, and available nodes.
+  - **Multi-language menu support** - Internationalized interface with language selection options
   - Additional endpoints include `/messages`, `/nodes`, `/connection_status`, `/logs`, `/send`, `/ui_send`, and a new `/discord_webhook` for inbound Discord messages.
   - UI customization through settings such as theme color, hue rotation, and custom sounds.
 - **Improved Message Chunking & Routing**  
@@ -264,6 +265,7 @@ RAK's [RAK4631 quick start](https://docs.rakwireless.com/Product-Categories/WisB
   - **Node Search** added for easier node management.  
   - **Channel Message Organization** with support for custom channels in `config.json`.  
   - **Revamped DM threaded messaging** system.
+  - **Multi-language Menu Support** - Internationalized interface with dynamic language switching.
   - **Location Links** for nodes with available location data via Google Maps.
   - **Timezone Selection** for accurate incoming message timestamps.
   - **Custom Local Sounds** for message notifications (no longer relying on hosted files).
