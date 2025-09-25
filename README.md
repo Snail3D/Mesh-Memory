@@ -1,6 +1,11 @@
 # MESH MEMORY v1.0.0 - Enhanced AI with Persistent Memory
 
-**MESH MEMORY** is an enhanced fork of MESH-AI that brings **persistent memory, async processing, and robust performance** to Meshtastic LoRa mesh networks. Never lose context again - your AI remembers every conversation across restarts and reconnections.
+**MESH MEMORY** is an enhanced fork of MESH-AI that brings **persistent memor### 🔧 **New Administration Features (v1.0)**
+- **Runtime configuration management**: Update AI prompts and MOTD without restart
+- **Secure DM-only commands**: Admin functions restricted to private messages
+- **Atomic configuration writes**: Safer config file updates
+- **Basic monitoring**: Health endpoints for container deployment
+- **Better diagnostics**: More detailed system health with performance metricsnc processing, and robust performance** to Meshtastic LoRa mesh networks. Never lose context again - your AI remembers every conversation across restarts and reconnections.
 
 > **🧠 The Memory Advantage:**  
 > Unlike the original mesh-ai, MESH MEMORY maintains **full conversation history** and **context persistence**, making your mesh network AI truly intelligent and reliable.
@@ -23,26 +28,26 @@
 - **Background AI processing** - Messages queued and handled efficiently 
 - **90% faster responsiveness** - Dramatically improved user experience
 
-### 🛡️ **Enterprise-Grade Reliability**
+### 🛡️ **Improved Reliability**
 - **Single-instance enforcement** - Prevents conflicts and resource contention
-- **Robust error recovery** - Comprehensive connection handling and retry logic
-- **Process management** - Clean startup, shutdown, and resource cleanup
-- **Production-ready stability** - Extensively tested async architecture
+- **Better error recovery** - Enhanced connection handling and retry logic
+- **Process management** - Cleaner startup, shutdown, and resource cleanup
+- **Stability improvements** - More robust async architecture
 
 ### 🎯 **Enhanced User Experience**
-- **Bulletproof DM commands** - `/ai` and `/query` work flawlessly in all scenarios
-- **Smart command parsing** - Graceful handling of typos and edge cases
-- **Optimized performance** - Faster AI responses with tuned parameters
+- **Reliable DM commands** - `/ai` and `/query` work much better in all scenarios
+- **Smart command parsing** - Better handling of typos and edge cases
+- **Performance improvements** - Faster AI responses with tuned parameters
 - **Better debugging** - Enhanced logging and diagnostic information
 
 > **Disclaimer:**  
 > This project is **NOT ASSOCIATED** with the official Meshtastic Project. It is provided solely as an extension to add AI and advanced features to your Mesh network.  
 
-> **Production Ready v1.0:**  
-> MESH MEMORY v1.0 represents a stable, production-ready release with extensive testing and reliability improvements. While always maintain backup communication methods for emergencies, this version is suitable for regular deployment and daily use.
+> **Stable v1.0 Release:**  
+> MESH MEMORY v1.0 represents a stable release with significant reliability improvements over previous versions. While always maintain backup communication methods for emergencies, this version is much more reliable for daily use.
 
 >  
-> *Built with love by humans and AI working together. Thoroughly tested in the field with robust error handling and recovery mechanisms.*
+> *Built with love by humans and AI working together. Field-tested with improved error handling and recovery mechanisms.*
 
 ---
 
@@ -71,19 +76,19 @@ The Meshtastic logo trademark is the trademark of Meshtastic LLC.
 - **Atomic file writes** - Configuration changes are safe and corruption-resistant
 - **Instant activation** - Changes take effect immediately without restart
 
-### 📊 **Production Health Monitoring**
-- **Comprehensive health endpoints** for production deployment:
+### 📊 **Health Monitoring**
+- **Useful health endpoints** for monitoring:
   - `/healthz`: Detailed JSON health status with connection, queue, and timing data
-  - `/live`: Liveness probe for container orchestration
+  - `/live`: Liveness probe for container deployments
   - `/ready`: Readiness probe (200 only when radio connected)
-- **Smart degraded state detection** - Returns 503 when issues detected
-- **Heartbeat logging** - Compact status line every ~30 seconds in `mesh-ai.log`
+- **Degraded state detection** - Returns 503 when issues detected
+- **Heartbeat logging** - Status updates every ~30 seconds in `mesh-ai.log`
 - **Performance metrics** - Track RX/TX ages, AI response times, and queue depths
 
 ### ⚡ **Enhanced Message Processing**
-- **Intelligent timeout handling** - Progressive retry logic with exponential backoff
-- **Reliable SSE connections** - Robust connection management prevents stale streams  
-- **Improved error recovery** - Graceful handling of connection drops and timeouts
+- **Smart timeout handling** - Progressive retry logic with exponential backoff
+- **Reliable SSE connections** - Better connection management prevents stale streams  
+- **Improved error recovery** - Better handling of connection drops and timeouts
 - **Better user feedback** - Clear error messages and status indicators
 
 ## 🚀 **Enhanced Fork Features**
@@ -114,17 +119,17 @@ This fork includes significant performance, reliability, and user experience imp
 - **Resource protection**: Prevents serial port conflicts and resource contention
 - **Reliable restarts**: Clean shutdown and startup procedures
 
-### 🎯 **Robust DM Command Handling**
+### 🎯 **Better DM Command Handling**
 - **Graceful error recovery**: `/ai` and `/query` commands work reliably in DMs
 - **Smart command parsing**: Empty commands like `/ai` alone are handled gracefully
 - **Better user experience**: Clear error messages and intuitive behavior
 - **Channel vs DM distinction**: Different behaviors for private vs public commands
 
 ### 🛠️ **Infrastructure Improvements**
-- **Enhanced startup script**: `start_mesh_ai.sh` with comprehensive error handling
+- **Improved startup script**: `start_mesh_ai.sh` with better error handling
 - **Better connection recovery**: Improved retry logic for Meshtastic device connections
 - **Enhanced logging**: More detailed debugging and status information
-- **Systematic error handling**: Comprehensive exception handling and recovery
+- **Better error handling**: Improved exception handling and recovery
 
 ### 🎨 **Modern Web Interface (New in v1.0)**
 - **Real-time log viewer**: Live streaming logs with Server-Sent Events technology
@@ -214,16 +219,16 @@ This fork includes significant performance, reliability, and user experience imp
 - **Security-first design** - Admin commands restricted to private DMs only
 - **Atomic file writes** - Corruption-resistant configuration updates
 
-#### 📊 **Production Health Monitoring**
+#### 📊 **Health Monitoring**
 - `/healthz` - Detailed JSON health status with connection, queue, and timing data
-- `/live` - Liveness probe for container orchestration  
+- `/live` - Liveness probe for containers 
 - `/ready` - Readiness probe (200 only when radio connected)
-- **Smart degraded state detection** - Returns 503 when issues detected
-- **Heartbeat logging** - Compact status line every ~30 seconds
+- **Degraded state detection** - Returns 503 when issues detected
+- **Heartbeat logging** - Status updates every ~30 seconds
 
-#### ⚡ **Enhanced Reliability & Performance**
-- **Intelligent timeout handling** with progressive retry logic and exponential backoff
-- **Robust SSE connection management** prevents stale log streams
+#### ⚡ **Reliability & Performance Improvements**
+- **Smart timeout handling** with progressive retry logic and exponential backoff
+- **Better SSE connection management** prevents stale log streams
 - **Improved error recovery** with graceful connection drop handling
 - **Better user feedback** with clear error messages and status indicators
 - **Single-instance PID lock** prevents multiple conflicting processes
