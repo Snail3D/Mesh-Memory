@@ -166,7 +166,7 @@ This fork includes significant performance, reliability, and user experience imp
 - **Home Assistant Integration**  
   - Seamlessly forward messages from a designated channel to Home Assistant’s conversation API. Optionally secure the integration using a PIN.
 - **Comprehensive /Commands System**  
-  - **Built-in Commands**: `/about`, `/test`, `/help`, `/motd`, `/ai` (aliases: `/bot`, `/query`, `/data`), `/emergency` (or `/911`), `/whereami`, `/reset` 
+  - **Built-in Commands**: `/about`, `/test`, `/help`, `/motd`, `/ai` (aliases: `/bot`, `/query`, `/data`), `/emergency` (or `/911`), `/whereami`, `/reset`, plus fun trivia commands: `/bible`, `/chucknorris`, `/elpaso` 
   - **Admin Commands (DM-only)**: `/changeprompt`, `/changemotd`, `/showprompt`, `/printprompt`
   - **Custom Commands**: Fully configurable via `commands_config.json` with static responses or dynamic AI prompts
   - **Case-insensitive**: All commands work regardless of capitalization for mobile usability
@@ -187,6 +187,11 @@ This fork includes significant performance, reliability, and user experience imp
 - **Discord Integration Enhancements**  
   - Route messages to and from Discord.
   - New configuration options and a dedicated `/discord_webhook` endpoint allow for inbound Discord message processing.
+- **Speedy Quick Commands**  
+  - `/bible` shares one of 1,000 gospel-centered verses focused on Jesus as Lord.
+  - `/chucknorris` replies with a random fact from a curated 1,000 item Chuck Norris library.
+  - `/elpaso` surfaces one of 300 lesser-known facts about the Sun City’s people and history.
+  - Every slash/special command now buffers three seconds (`⏳`) before transmitting to keep mesh congestion low.
 - **Windows & Linux Focused**
   - Official support for Windows environments with installation guides; instructions for Linux available now - MacOS coming soon!
 
@@ -888,6 +893,11 @@ Update your configuration file with the following keys (replace placeholder text
     - `/emergency`, `/911` - Trigger emergency alerts with GPS
     - `/whereami` - Get your current GPS coordinates
     - `/reset` - Clear conversation history for channel or DM
+    
+  - **Fun Trivia Commands**:
+    - `/bible` - Random Bible verse from `bible_jesus_verses.json` 📜
+    - `/chucknorris` - Random Chuck Norris fact from `chuck_api_jokes.json` 🥋  
+    - `/elpaso` - Random El Paso trivia from `el_paso_people_facts.json` 🌵
     
   - **Admin Commands (DM-only for security):**
     - `/changeprompt <text>` - Update AI system prompt (persists to config.json)
