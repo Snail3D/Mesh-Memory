@@ -485,6 +485,49 @@ The MESH-AI server (running on Flask) exposes the following endpoints:
 
 ---
 
+## Health & Monitoring
+
+- Probes (JSON):
+  - `GET /ready` → 200 only when the radio is connected; 503 otherwise.
+  - `GET /live` → liveness check (always 200 when the app loop is running).
+  - `GET /healthz` → detailed status including:
+    - `status` (Connected/Disconnected), `queue` size, `worker` and `heartbeat` flags,
+    - `rx_age_s`, `tx_age_s`, `ai_age_s`, and `ai_error` (if any) with `ai_error_age_s`.
+    - Returns 503 if degraded (radio disconnected, response queue stalled, or recent AI error).
+
+- Examples:
+  - `curl http://localhost:5000/ready`
+  - `curl http://localhost:5000/live`
+  - `curl http://localhost:5000/healthz`
+
+- Heartbeat:
+  - A concise heartbeat is logged roughly every 30 seconds showing connection status and activity ages.
+  - View with: `tail -f mesh-ai.log`
+
+---
+
+## Upgrade to v1.0
+
+1) Stop any running instance and service (if used)
+- `systemctl --user stop mesh-ai.service`
+
+2) Pull latest changes and update dependencies (if needed)
+- `git pull`
+- `source .venv/bin/activate` (or your venv) and `pip install -r requirements.txt`
+
+3) Start via the user service or helper script
+- `systemctl --user start mesh-ai.service`
+  - or: `NO_BROWSER=1 bash start_mesh_ai.sh`
+
+4) Verify readiness and health
+- `curl http://localhost:5000/ready`
+- `curl http://localhost:5000/healthz`
+- `tail -f mesh-ai.log` (look for periodic heartbeat lines)
+
+Notes
+- v1 enforces a single running instance via a lightweight PID lock to avoid serial port conflicts.
+- Admin commands (`/changeprompt`, `/changemotd`, `/showprompt`, `/printprompt`) are DM‑only and persist across restarts.
+
 ## Configuration
 
 Your `config.json` file controls almost every aspect of MESH-AI. Below is an example configuration that includes both the previous settings and the new options:
