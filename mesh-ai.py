@@ -624,7 +624,7 @@ def process_responses_worker():
             # Unpack the task
             text, sender_node, is_direct, ch_idx, thread_root_ts, interface_ref = task
             
-            clean_log(f"Processing: {text[:50]}... (queue: {response_queue.qsize()})", "⚡")
+            clean_log(f"⚡ [AsyncAI] Processing: {text[:50]}... (queue: {response_queue.qsize()})", "🤖")
             start_time = time.time()
             
             # Generate AI response (this can take a long time)
@@ -633,7 +633,7 @@ def process_responses_worker():
             processing_time = time.time() - start_time
             
             if resp:
-                clean_log(f"Generated response in {processing_time:.1f}s, preparing to send...", "✅")
+                clean_log(f"✅ [AsyncAI] Generated response in {processing_time:.1f}s, preparing to send...", "🤖")
                 
                 # Reduced collision delay for async processing
                 time.sleep(1)
@@ -667,16 +667,16 @@ def process_responses_worker():
                         send_broadcast_chunks(interface_ref, resp, ch_idx)
                         
                 total_time = time.time() - start_time
-                clean_log(f"Completed response for {sender_node} (total: {total_time:.1f}s)", "🎯")
+                clean_log(f"🎯 [AsyncAI] Completed response for {sender_node} (total: {total_time:.1f}s)", "✅")
             else:
-                clean_log(f"No response generated for {sender_node} ({processing_time:.1f}s)", "❌")
+                clean_log(f"❌ [AsyncAI] No response generated for {sender_node} ({processing_time:.1f}s)", "🤖")
                 
             response_queue.task_done()
             
         except queue.Empty:
             continue  # Timeout, check if we should continue
         except Exception as e:
-            clean_log(f"Error processing response: {e}", "⚠️")
+            clean_log(f"⚠️ [AsyncAI] Error processing response: {e}", "🚨")
             try:
                 response_queue.task_done()
             except ValueError:
@@ -686,7 +686,7 @@ def start_response_worker():
     """Start the background response worker thread."""
     worker_thread = threading.Thread(target=process_responses_worker, daemon=True)
     worker_thread.start()
-    clean_log("Response worker thread started", "⚡")
+    clean_log("🚀 [AsyncAI] Response worker thread started", "⚡")
 
 def stop_response_worker():
     """Stop the background response worker thread."""
@@ -1660,7 +1660,7 @@ def on_receive(packet=None, interface=None, **kwargs):
     if _rx_seen_before(rx_key):
       info_print(f"[Info] Duplicate RX suppressed for from={sender_node} ch={ch_idx}: {text}")
       return
-    info_print(f"[RX] from {sender_node or '?'} to {raw_to or '^all'} (ch={ch_idx}): {text}")
+    info_print(f"📨 [RX] from {sender_node or '?'} to {raw_to or '^all'} (ch={ch_idx}): {text}")
 
     entry = log_message(
         sender_node,
@@ -1724,12 +1724,12 @@ def on_receive(packet=None, interface=None, **kwargs):
     
     if should_respond:
       # Queue the response for async processing instead of blocking here
-      info_print(f"[AsyncAI] Queueing response for {sender_node}: {text[:50]}...")
+      info_print(f"🤖 [AsyncAI] Queueing response for {sender_node}: {text[:50]}...")
       try:
         response_queue.put((text, sender_node, is_direct, ch_idx, thread_root_ts, interface), block=False)
-        info_print(f"[AsyncAI] Queued (queue size: {response_queue.qsize()})")
+        info_print(f"📬 [AsyncAI] Queued (queue size: {response_queue.qsize()})")
       except queue.Full:
-        info_print(f"[AsyncAI] Response queue full ({response_queue.qsize()}), processing immediately to avoid drop")
+        info_print(f"🚨 [AsyncAI] Response queue full ({response_queue.qsize()}), processing immediately to avoid drop")
         # Fall back to immediate processing if queue is full
         resp = parse_incoming_text(text, sender_node, is_direct, ch_idx, thread_root_ts=thread_root_ts)
         if resp:
