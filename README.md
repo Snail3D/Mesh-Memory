@@ -445,6 +445,25 @@ File structure should look like this:
 
 ---
 
+## Admin Commands (DM-only)
+
+- Change system prompt
+  - `/changeprompt <text>`
+  - Persists to `config.json` (atomic write) and applies immediately.
+
+- Show current system prompt
+  - `/showprompt` or `/printprompt`
+
+- Change Message of the Day (MOTD)
+  - `/changemotd <text>`
+  - Persists to `motd.json` (atomic write); shown via `/motd`.
+
+Notes
+- These commands are DM-only to prevent misuse in channels. If used in a channel, the bot replies with a DM-only notice.
+- Changes persist across restarts.
+
+---
+
 ## Using the API
 
 The MESH-AI server (running on Flask) exposes the following endpoints:
