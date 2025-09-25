@@ -574,6 +574,26 @@ try:
 except (ValueError, TypeError):
   AUTO_REFRESH_MINUTES = 60
 
+# Sending rate limiting to prevent mesh network overload
+from collections import deque
+send_timestamps = deque()
+send_rate_lock = threading.Lock()
+MAX_SENDS_PER_MINUTE = 20  # Configurable limit to prevent spam overload
+
+def check_send_rate_limit():
+    """Check if we're under the sending rate limit. Returns True if OK to send."""
+    with send_rate_lock:
+        now = time.time()
+        # Remove timestamps older than 1 minute
+        while send_timestamps and send_timestamps[0] < now - 60:
+            send_timestamps.popleft()
+        
+        if len(send_timestamps) >= MAX_SENDS_PER_MINUTE:
+            return False
+        
+        send_timestamps.append(now)
+        return True
+
 app = Flask(__name__)
 messages = []
 messages_lock = threading.Lock()
@@ -868,20 +888,52 @@ def send_broadcast_chunks(interface, text, channelIndex):
         return
     if not text:
         return
+    
+    # Check rate limiting to prevent network overload
+    if not check_send_rate_limit():
+        print("⚠️ Send rate limit exceeded, delaying message...")
+        time.sleep(3)  # Brief pause before trying again
+        if not check_send_rate_limit():
+            print("❌ Still rate limited, dropping message to prevent spam")
+            return
     chunks = split_message(text)
     for i, chunk in enumerate(chunks):
-        try:
-            interface.sendText(chunk, destinationId=BROADCAST_ADDR, channelIndex=channelIndex, wantAck=True)
-            time.sleep(CHUNK_DELAY)
-        except Exception as e:
-            print(f"❌ Error sending broadcast chunk: {e}")
-            # Check both errno and winerror for known connection errors
-            error_code = getattr(e, 'errno', None) or getattr(e, 'winerror', None)
-            if error_code in (10053, 10054, 10060):
-                reset_event.set()
+        # Retry logic for timeout resilience
+        max_retries = 3
+        retry_delay = 2
+        success = False
+        
+        for attempt in range(max_retries):
+            try:
+                interface.sendText(chunk, destinationId=BROADCAST_ADDR, channelIndex=channelIndex, wantAck=True)
+                success = True
+                clean_log(f"Sent chunk {i+1}/{len(chunks)} on Ch{channelIndex}", "📡")
+                break
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "timed out" in error_msg or "timeout" in error_msg:
+                    if attempt < max_retries - 1:
+                        clean_log(f"Chunk {i+1} timeout, retrying in {retry_delay}s (attempt {attempt+2}/{max_retries})", "⚠️")
+                        time.sleep(retry_delay)
+                        retry_delay *= 1.5  # Progressive backoff
+                        continue
+                    else:
+                        print(f"❌ Failed to send chunk {i+1} after {max_retries} attempts: {e}")
+                else:
+                    print(f"❌ Error sending broadcast chunk: {e}")
+                    # Check both errno and winerror for known connection errors
+                    error_code = getattr(e, 'errno', None) or getattr(e, 'winerror', None)
+                    if error_code in (10053, 10054, 10060):
+                        reset_event.set()
+                break
+        
+        if not success:
+            print(f"❌ Stopping chunk transmission due to persistent failures")
             break
-        else:
-            clean_log(f"Sent chunk {i+1}/{len(chunks)} on Ch{channelIndex}", "📡")
+            
+        # Adaptive delay based on success
+        if success and i < len(chunks) - 1:  # Don't delay after last chunk
+            time.sleep(CHUNK_DELAY)
 
 def send_direct_chunks(interface, text, destinationId):
     dprint(f"send_direct_chunks: text='{text}', destId={destinationId}")
@@ -891,23 +943,55 @@ def send_direct_chunks(interface, text, destinationId):
         return
     if not text:
         return
+    
+    # Check rate limiting to prevent network overload
+    if not check_send_rate_limit():
+        print("⚠️ Send rate limit exceeded, delaying message...")
+        time.sleep(3)  # Brief pause before trying again
+        if not check_send_rate_limit():
+            print("❌ Still rate limited, dropping message to prevent spam")
+            return
     ephemeral_ok = hasattr(interface, "sendDirectText")
     chunks = split_message(text)
     for i, chunk in enumerate(chunks):
-        try:
-            if ephemeral_ok:
-                interface.sendDirectText(destinationId, chunk, wantAck=True)
-            else:
-                interface.sendText(chunk, destinationId=destinationId, wantAck=True)
-            time.sleep(CHUNK_DELAY)
-        except Exception as e:
-            print(f"❌ Error sending direct chunk: {e}")
-            error_code = getattr(e, 'errno', None) or getattr(e, 'winerror', None)
-            if error_code in (10053, 10054, 10060):
-                reset_event.set()
+        # Retry logic for timeout resilience
+        max_retries = 3
+        retry_delay = 2
+        success = False
+        
+        for attempt in range(max_retries):
+            try:
+                if ephemeral_ok:
+                    interface.sendDirectText(destinationId, chunk, wantAck=True)
+                else:
+                    interface.sendText(chunk, destinationId=destinationId, wantAck=True)
+                success = True
+                clean_log(f"Sent chunk {i+1}/{len(chunks)} to {destinationId}", "📤")
+                break
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "timed out" in error_msg or "timeout" in error_msg:
+                    if attempt < max_retries - 1:
+                        clean_log(f"Chunk {i+1} timeout, retrying in {retry_delay}s (attempt {attempt+2}/{max_retries})", "⚠️")
+                        time.sleep(retry_delay)
+                        retry_delay *= 1.5  # Progressive backoff
+                        continue
+                    else:
+                        print(f"❌ Failed to send chunk {i+1} after {max_retries} attempts: {e}")
+                else:
+                    print(f"❌ Error sending direct chunk: {e}")
+                    error_code = getattr(e, 'errno', None) or getattr(e, 'winerror', None)
+                    if error_code in (10053, 10054, 10060):
+                        reset_event.set()
+                break
+        
+        if not success:
+            print(f"❌ Stopping chunk transmission due to persistent failures")
             break
-        else:
-            clean_log(f"Sent chunk {i+1}/{len(chunks)} to {destinationId}", "📤")
+            
+        # Adaptive delay based on success
+        if success and i < len(chunks) - 1:  # Don't delay after last chunk
+            time.sleep(CHUNK_DELAY)
 
 def send_to_lmstudio(user_message: str):
     """Chat/completion request to LM Studio with explicit model name."""
