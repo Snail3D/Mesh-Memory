@@ -389,6 +389,49 @@ connection_status = "Disconnected"
 last_error_message = ""
 reset_event = threading.Event()  # Global event to signal a fatal error and trigger reconnect
 
+RADIO_WATCHDOG_STATE = {
+    "serial_warn": 0.0,
+    "stale_rx": 0.0,
+    "stale_tx": 0.0,
+    "generic": 0.0,
+}
+
+
+def trigger_radio_reset(reason: str, emoji: str = "🔄", debounce_key: str = "generic") -> None:
+    now_ts = time.time()
+    last_ts = RADIO_WATCHDOG_STATE.get(debounce_key, 0.0) or 0.0
+    if reset_event.is_set():
+        return
+    if now_ts - last_ts < RADIO_WATCHDOG_DEBOUNCE:
+        return
+    RADIO_WATCHDOG_STATE[debounce_key] = now_ts
+    add_script_log(f"Radio watchdog: {reason}")
+    clean_log(f"{reason} — requesting radio reconnect", emoji, show_always=True, rate_limit=False)
+    try:
+        globals()['connection_status'] = "Disconnected"
+    except Exception:
+        pass
+    reset_event.set()
+
+
+class SerialDisconnectHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return
+        if not message:
+            return
+        lower = message.lower()
+        if any(keyword in lower for keyword in SERIAL_WARNING_KEYWORDS):
+            trigger_radio_reset("Serial link reported disconnect", "⚡", debounce_key="serial_warn")
+
+
+serial_watch_handler = SerialDisconnectHandler()
+serial_watch_handler.setLevel(logging.WARNING)
+root_log.addHandler(serial_watch_handler)
+meshtastic_log.addHandler(serial_watch_handler)
+
 # -----------------------------
 # RX De-duplication cache
 # -----------------------------
@@ -519,6 +562,22 @@ if isinstance(_initial_admins, list):
         AUTHORIZED_ADMINS.add(str(entry))
 PENDING_ADMIN_REQUESTS: Dict[str, Dict[str, Any]] = {}
 
+def _coerce_positive_int(value, default):
+    try:
+        ivalue = int(value)
+        return ivalue if ivalue > 0 else None
+    except (TypeError, ValueError):
+        return default
+
+RADIO_STALE_RX_THRESHOLD = _coerce_positive_int(
+    config.get("radio_stale_rx_seconds", RADIO_STALE_RX_THRESHOLD_DEFAULT),
+    RADIO_STALE_RX_THRESHOLD_DEFAULT,
+)
+RADIO_STALE_TX_THRESHOLD = _coerce_positive_int(
+    config.get("radio_stale_tx_seconds", RADIO_STALE_TX_THRESHOLD_DEFAULT),
+    RADIO_STALE_TX_THRESHOLD_DEFAULT,
+)
+
 
 def _sender_key(sender_id: Any) -> str:
     """Normalize sender identifiers for tracking admin approval."""
@@ -627,7 +686,22 @@ COMMAND_REPLY_DELAY = 3
 
 TRAILING_COMMAND_PUNCT = ",.;:!?)]}"
 
+RADIO_STALE_RX_THRESHOLD_DEFAULT = 300
+RADIO_STALE_TX_THRESHOLD_DEFAULT = 300
+RADIO_WATCHDOG_DEBOUNCE = 60
+SERIAL_WARNING_KEYWORDS = (
+    "serial port disconnected",
+    "device reports readiness to read but returned no data",
+)
+
+EL_PASO_LAT = 31.761877
+EL_PASO_LON = -106.485022
+EL_PASO_WEATHER_TTL = 600  # seconds
+EL_PASO_WEATHER_API = "https://api.open-meteo.com/v1/forecast"
+EL_PASO_WEATHER_CACHE: Dict[str, Any] = {"timestamp": 0.0, "text": None}
+
 COMMAND_ALIASES = {
+    # English shortcuts / typos
     "/menu": "/help",
     "/commands": "/help",
     "/command": "/help",
@@ -655,6 +729,76 @@ COMMAND_ALIASES = {
     "/promptshow": "/showprompt",
     "/showmotd": "/motd",
     "/resetchat": "/reset",
+    "/forecast": "/weather",
+    "/wx": "/weather",
+    "/elpweather": "/weather",
+
+    # Spanish
+    "/ayuda": "/help",
+    "/ayudame": "/help",
+    "/dondeestoy": "/whereami",
+    "/clima": "/weather",
+    "/tiempo": "/weather",
+    "/pronostico": "/weather",
+    "/mensaje": "/motd",
+    "/mensajedia": "/motd",
+    "/biblia": "/bible",
+    "/versiculo": "/bible",
+    "/versiculobiblico": "/bible",
+    "/datoelpaso": "/elpaso",
+    "/hechoelpaso": "/elpaso",
+    "/emergencia": "/emergency",
+    "/cambiarmensaje": "/changemotd",
+    "/cambiaprompt": "/changeprompt",
+    "/verprompt": "/showprompt",
+    "/reiniciar": "/reset",
+    "/enviarsms": "/sms",
+
+    # French
+    "/aide": "/help",
+    "/oujesuis": "/whereami",
+    "/meteo": "/weather",
+    "/temps": "/weather",
+    "/messagedujour": "/motd",
+    "/verset": "/bible",
+    "/blaguechuck": "/chucknorris",
+    "/faitelpaso": "/elpaso",
+    "/urgence": "/emergency",
+    "/modifiermotd": "/changemotd",
+    "/modifierprompt": "/changeprompt",
+    "/afficherprompt": "/showprompt",
+    "/reinitialiser": "/reset",
+    "/envoyersms": "/sms",
+
+    # German
+    "/hilfe": "/help",
+    "/woichbin": "/whereami",
+    "/wetter": "/weather",
+    "/wetterbericht": "/weather",
+    "/tagesnachricht": "/motd",
+    "/bibel": "/bible",
+    "/bibelvers": "/bible",
+    "/chuckwitz": "/chucknorris",
+    "/elpasofakt": "/elpaso",
+    "/notfall": "/emergency",
+    "/motdaendern": "/changemotd",
+    "/promptaendern": "/changeprompt",
+    "/promptanzeigen": "/showprompt",
+    "/zuruecksetzen": "/reset",
+    "/smssenden": "/sms",
+
+    # Chinese (pinyin)
+    "/bangzhu": "/help",
+    "/wozainali": "/whereami",
+    "/tianqi": "/weather",
+    "/shengjing": "/bible",
+    "/elpasoshishi": "/elpaso",
+    "/jinji": "/emergency",
+    "/xiugaixiaoxi": "/changemotd",
+    "/xiugaiprompt": "/changeprompt",
+    "/chakantishi": "/showprompt",
+    "/chongzhi": "/reset",
+    "/fasongduanxin": "/sms",
 }
 
 BUILTIN_COMMANDS = {
@@ -669,6 +813,7 @@ BUILTIN_COMMANDS = {
     "/test",
     "/help",
     "/menu",
+    "/weather",
     "/motd",
     "/bible",
     "/chucknorris",
@@ -681,7 +826,7 @@ BUILTIN_COMMANDS = {
     "/sms",
 }
 
-FUZZY_COMMAND_MATCH_THRESHOLD = 0.68
+FUZZY_COMMAND_MATCH_THRESHOLD = 0.6
 
 
 def _strip_command_token(cmd: str) -> str:
@@ -711,14 +856,15 @@ def resolve_command_token(raw: str):
     stripped = _strip_command_token(raw)
     alias_target = COMMAND_ALIASES.get(stripped)
     if alias_target:
-        return alias_target, "alias"
+        return alias_target, "alias", None
     known = _known_commands()
     if stripped in known:
-        return stripped, None
+        return stripped, None, None
     candidates = difflib.get_close_matches(stripped, list(known), n=1, cutoff=FUZZY_COMMAND_MATCH_THRESHOLD)
     if candidates:
-        return candidates[0], "fuzzy"
-    return stripped, None
+        return candidates[0], "fuzzy", None
+    suggestions = difflib.get_close_matches(stripped, list(known), n=3, cutoff=0.3)
+    return None, "unknown", suggestions
 
 
 def annotate_command_response(resp, original_cmd: str, canonical_cmd: str, reason: str):
@@ -807,6 +953,176 @@ def _random_chuck_fact() -> Optional[str]:
     if not CHUCK_NORRIS_FACTS:
         return None
     return random.choice(CHUCK_NORRIS_FACTS)
+
+
+def _weather_code_description(code: Optional[int]) -> str:
+    mapping = {
+        0: "clear sky",
+        1: "mainly clear",
+        2: "partly cloudy",
+        3: "overcast",
+        45: "fog",
+        48: "depositing rime fog",
+        51: "light drizzle",
+        53: "moderate drizzle",
+        55: "dense drizzle",
+        56: "light freezing drizzle",
+        57: "dense freezing drizzle",
+        61: "light rain",
+        63: "moderate rain",
+        65: "heavy rain",
+        66: "light freezing rain",
+        67: "heavy freezing rain",
+        71: "light snow",
+        73: "moderate snow",
+        75: "heavy snow",
+        77: "snow grains",
+        80: "light rain showers",
+        81: "moderate rain showers",
+        82: "violent rain showers",
+        85: "light snow showers",
+        86: "heavy snow showers",
+        95: "thunderstorm",
+        96: "thunderstorm with light hail",
+        99: "thunderstorm with heavy hail",
+    }
+    try:
+        key = int(code) if code is not None else None
+    except (TypeError, ValueError):
+        key = None
+    return mapping.get(key, "local conditions")
+
+
+def _wind_direction_cardinal(degrees: Optional[float]) -> Optional[str]:
+    if degrees is None:
+        return None
+    try:
+        deg = float(degrees) % 360.0
+    except (TypeError, ValueError):
+        return None
+    directions = [
+        "N",
+        "NNE",
+        "NE",
+        "ENE",
+        "E",
+        "ESE",
+        "SE",
+        "SSE",
+        "S",
+        "SSW",
+        "SW",
+        "WSW",
+        "W",
+        "WNW",
+        "NW",
+        "NNW",
+    ]
+    idx = int((deg / 22.5) + 0.5) % len(directions)
+    return directions[idx]
+
+
+def _format_el_paso_weather() -> Optional[str]:
+    now = time.time()
+    try:
+        cached_text = EL_PASO_WEATHER_CACHE.get("text")
+        cached_ts = float(EL_PASO_WEATHER_CACHE.get("timestamp", 0.0))
+    except Exception:
+        cached_text = None
+        cached_ts = 0.0
+    if cached_text and (now - cached_ts) < EL_PASO_WEATHER_TTL:
+        return cached_text
+
+    params = {
+        "latitude": EL_PASO_LAT,
+        "longitude": EL_PASO_LON,
+        "current_weather": "true",
+        "hourly": "relativehumidity_2m,apparent_temperature,dewpoint_2m",
+        "timezone": "America/Denver",
+    }
+    try:
+        clean_log("Fetching El Paso weather snapshot", "🌤️", show_always=True, rate_limit=False)
+        response = requests.get(EL_PASO_WEATHER_API, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        clean_log(f"Weather lookup failed: {exc}", "⚠️", show_always=True, rate_limit=False)
+        return None
+
+    current = data.get("current_weather") or {}
+    if not current:
+        return None
+
+    temp_c = current.get("temperature")
+    temp_f = None
+    if isinstance(temp_c, (int, float)):
+        temp_f = (temp_c * 9 / 5) + 32
+
+    wind_speed_kph = current.get("windspeed")
+    wind_speed_mph = None
+    if isinstance(wind_speed_kph, (int, float)):
+        wind_speed_mph = wind_speed_kph * 0.621371
+
+    wind_dir_deg = current.get("winddirection")
+    wind_dir_text = _wind_direction_cardinal(wind_dir_deg)
+
+    weather_desc = _weather_code_description(current.get("weathercode"))
+    observed_time = str(current.get("time") or "").replace("T", " ").strip()
+
+    humidity = None
+    feels_like_c = None
+    hourly = data.get("hourly") or {}
+    hourly_times = hourly.get("time") or []
+    target_index = None
+    if observed_time:
+        try:
+            target_index = hourly_times.index(current.get("time"))
+        except ValueError:
+            target_index = None
+    if target_index is not None:
+        humidity_series = hourly.get("relativehumidity_2m") or []
+        if target_index < len(humidity_series):
+            humidity = humidity_series[target_index]
+        apparent_series = hourly.get("apparent_temperature") or []
+        if target_index < len(apparent_series):
+            feels_like_c = apparent_series[target_index]
+
+    feels_like_f = None
+    if isinstance(feels_like_c, (int, float)):
+        feels_like_f = (feels_like_c * 9 / 5) + 32
+
+    parts = []
+    temp_bits = []
+    if isinstance(temp_f, (int, float)):
+        temp_bits.append(f"{temp_f:.0f}°F")
+    if isinstance(temp_c, (int, float)):
+        temp_bits.append(f"{temp_c:.1f}°C")
+    if temp_bits:
+        parts.append(" / ".join(temp_bits))
+
+    if isinstance(feels_like_f, (int, float)):
+        parts.append(f"feels like {feels_like_f:.0f}°F")
+    elif isinstance(feels_like_c, (int, float)):
+        parts.append(f"feels like {feels_like_c:.1f}°C")
+
+    if isinstance(humidity, (int, float)):
+        parts.append(f"humidity {humidity:.0f}%")
+
+    if isinstance(wind_speed_mph, (int, float)):
+        if wind_dir_text:
+            parts.append(f"wind {wind_speed_mph:.0f} mph {wind_dir_text}")
+        else:
+            parts.append(f"wind {wind_speed_mph:.0f} mph")
+
+    summary = f"El Paso Weather: {weather_desc}"
+    if parts:
+        summary += " • " + "; ".join(parts)
+    if observed_time:
+        summary += f" • updated {observed_time}"
+
+    EL_PASO_WEATHER_CACHE["timestamp"] = now
+    EL_PASO_WEATHER_CACHE["text"] = summary
+    return summary
 
 
 def _random_el_paso_fact() -> Optional[str]:
@@ -1867,7 +2183,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
   elif cmd == "/help":
     built_in = [
       "/about", "/menu", "/query", "/whereami", "/emergency", "/911", "/test",
-      "/motd", "/bible", "/chucknorris", "/elpaso", "/sms",
+      "/motd", "/weather", "/bible", "/chucknorris", "/elpaso", "/sms",
       "/changemotd", "/changeprompt", "/showprompt", "/printprompt", "/reset"
     ]
     custom_cmds = [c.get("command") for c in commands_config.get("commands", [])]
@@ -1877,6 +2193,12 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
 
   elif cmd == "/motd":
     return _cmd_reply(cmd, motd_content)
+
+  elif cmd == "/weather":
+    report = _format_el_paso_weather()
+    if report:
+      return _cmd_reply(cmd, report)
+    return _cmd_reply(cmd, "🌤️ Weather service unavailable right now.")
 
   elif cmd == "/bible":
     verse = _format_bible_verse()
@@ -2108,7 +2430,18 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
   # Commands (start with /) should be handled and given context
   if text.startswith("/"):
     raw_cmd = text.split()[0]
-    canonical_cmd, notice_reason = resolve_command_token(raw_cmd)
+    canonical_cmd, notice_reason, suggestions = resolve_command_token(raw_cmd)
+    if notice_reason == "unknown" or canonical_cmd is None:
+      if check_only:
+        return False
+      suggestion_text = ""
+      if suggestions:
+        joined = ", ".join(suggestions)
+        suggestion_text = f" Did you mean: {joined}?"
+      return PendingReply(
+        f"I didn't recognize `{raw_cmd}` as a command.{suggestion_text} Try `/help` for a list.",
+        "unknown command",
+      )
     if check_only:
       # Quick commands like /reset don't need AI processing
       cmd_lower = canonical_cmd.lower()
@@ -4008,7 +4341,25 @@ def main():
     
     # Start the async response worker
     start_response_worker()
-    
+
+    if RADIO_STALE_RX_THRESHOLD:
+        clean_log(
+            f"Radio watchdog armed (stale RX>{RADIO_STALE_RX_THRESHOLD}s)",
+            "🛡️",
+            show_always=True,
+        )
+    else:
+        clean_log("Radio watchdog RX disabled", "🛡️", show_always=True)
+
+    if RADIO_STALE_TX_THRESHOLD:
+        clean_log(
+            f"Radio watchdog armed (stale TX>{RADIO_STALE_TX_THRESHOLD}s)",
+            "🛡️",
+            show_always=True,
+        )
+    else:
+        clean_log("Radio watchdog TX disabled", "🛡️", show_always=True)
+
     # Additional startup info:
     if ENABLE_DISCORD:
         print(f"Discord configuration enabled: Inbound channel index: {DISCORD_INBOUND_CHANNEL_INDEX}, Webhook URL is {'set' if DISCORD_WEBHOOK_URL else 'not set'}, Bot Token is {'set' if DISCORD_BOT_TOKEN else 'not set'}, Channel ID is {'set' if DISCORD_CHANNEL_ID else 'not set'}.")
@@ -4175,6 +4526,19 @@ def heartbeat_worker(period_sec=30):
         'ai_age_s': None if ai_age is None else int(ai_age),
         'msgs': len(messages),
       }
+      if connection_status == "Connected":
+        if RADIO_STALE_RX_THRESHOLD and rx_age is not None and rx_age > RADIO_STALE_RX_THRESHOLD:
+          trigger_radio_reset(
+            f"Radio watchdog: no packets received for {int(rx_age)}s",
+            "🛠️",
+            debounce_key="stale_rx",
+          )
+        if RADIO_STALE_TX_THRESHOLD and tx_age is not None and tx_age > RADIO_STALE_TX_THRESHOLD:
+          trigger_radio_reset(
+            f"Radio watchdog: no transmissions recorded for {int(tx_age)}s",
+            "🛠️",
+            debounce_key="stale_tx",
+          )
       # Short, periodic heartbeat log; always show to keep logs alive
       clean_log(f"HB conn={status['conn']} q={status['queue']} rx={status['rx_age_s']}s tx={status['tx_age_s']}s ai={status['ai_age_s']}s", "💓", show_always=True, rate_limit=False)
       periodic_status_update()
