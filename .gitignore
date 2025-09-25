@@ -173,3 +173,6 @@ cython_debug/
 messages_archive.json
 script.log
 mesh-ai.log
+mesh-ai.lock
+mesh-ai.pid
+mesh-ai.app.lock
