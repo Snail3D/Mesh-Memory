@@ -19,7 +19,7 @@ import sys
 import socket  # for socket error checking
 import re
 import random
-from typing import Optional, Set, Dict, Any
+from typing import Optional, Set, Dict, Any, List
 from dataclasses import dataclass
 from meshtastic_facts import MESHTASTIC_ALERT_FACTS
 from twilio.rest import Client  # for Twilio SMS support
@@ -512,6 +512,14 @@ Modification of this code for nefarious purposes is strictly frowned upon. Pleas
 print(BANNER)
 add_script_log("Script started.")
 
+RADIO_STALE_RX_THRESHOLD_DEFAULT = 300
+RADIO_STALE_TX_THRESHOLD_DEFAULT = 300
+RADIO_WATCHDOG_DEBOUNCE = 60
+SERIAL_WARNING_KEYWORDS = (
+    "serial port disconnected",
+    "device reports readiness to read but returned no data",
+)
+
 # -----------------------------
 # Load Config Files
 # -----------------------------
@@ -561,6 +569,7 @@ if isinstance(_initial_admins, list):
             continue
         AUTHORIZED_ADMINS.add(str(entry))
 PENDING_ADMIN_REQUESTS: Dict[str, Dict[str, Any]] = {}
+PENDING_WEATHER_REQUESTS: Dict[str, Dict[str, Any]] = {}
 
 def _coerce_positive_int(value, default):
     try:
@@ -686,119 +695,211 @@ COMMAND_REPLY_DELAY = 3
 
 TRAILING_COMMAND_PUNCT = ",.;:!?)]}"
 
-RADIO_STALE_RX_THRESHOLD_DEFAULT = 300
-RADIO_STALE_TX_THRESHOLD_DEFAULT = 300
-RADIO_WATCHDOG_DEBOUNCE = 60
-SERIAL_WARNING_KEYWORDS = (
-    "serial port disconnected",
-    "device reports readiness to read but returned no data",
-)
-
 EL_PASO_LAT = 31.761877
 EL_PASO_LON = -106.485022
 EL_PASO_WEATHER_TTL = 600  # seconds
 EL_PASO_WEATHER_API = "https://api.open-meteo.com/v1/forecast"
 EL_PASO_WEATHER_CACHE: Dict[str, Any] = {"timestamp": 0.0, "text": None}
+WEATHER_DYNAMIC_CACHE: Dict[str, Dict[str, Any]] = {}
+WEATHER_CITY_SYNONYMS = {
+    "cdmx": "Ciudad de México",
+    "ciudad de mexico": "Ciudad de México",
+    "mexico df": "Ciudad de México",
+    "df": "Ciudad de México",
+    "cd juarez": "Ciudad Juárez",
+    "cdjuarez": "Ciudad Juárez",
+    "juarez": "Ciudad Juárez",
+    "gdl": "Guadalajara",
+    "guadalajara": "Guadalajara",
+    "mty": "Monterrey",
+    "monterrey": "Monterrey",
+    "tijuana": "Tijuana",
+    "tij": "Tijuana",
+    "bogota": "Bogotá",
+    "bogotá": "Bogotá",
+    "santiago": "Santiago",
+    "nyc": "New York",
+    "new york city": "New York",
+    "la": "Los Angeles",
+    "los angeles": "Los Angeles",
+    "chis": "Chihuahua",
+    "chihuahua": "Chihuahua",
+}
 
 COMMAND_ALIASES = {
     # English shortcuts / typos
-    "/menu": "/help",
-    "/commands": "/help",
-    "/command": "/help",
-    "/h": "/help",
-    "/bibleverse": "/bible",
-    "/scripture": "/bible",
-    "/verses": "/bible",
-    "/biblefact": "/bible",
-    "/biblefacts": "/bible",
-    "/chuck": "/chucknorris",
-    "/norris": "/chucknorris",
-    "/chuckfacts": "/chucknorris",
-    "/chuckfact": "/chucknorris",
-    "/facts": "/chucknorris",
-    "/elp": "/elpaso",
-    "/elpasofact": "/elpaso",
-    "/elpasofacts": "/elpaso",
-    "/where": "/whereami",
-    "/location": "/whereami",
-    "/locate": "/whereami",
-    "/setmotd": "/changemotd",
-    "/motdset": "/changemotd",
-    "/setprompt": "/changeprompt",
-    "/promptset": "/changeprompt",
-    "/promptshow": "/showprompt",
-    "/showmotd": "/motd",
-    "/resetchat": "/reset",
-    "/forecast": "/weather",
-    "/wx": "/weather",
-    "/elpweather": "/weather",
+    "/menu": {"canonical": "/help", "languages": ["en"]},
+    "/commands": {"canonical": "/help", "languages": ["en"]},
+    "/command": {"canonical": "/help", "languages": ["en"]},
+    "/h": {"canonical": "/help", "languages": ["en"]},
+    "/bibleverse": {"canonical": "/bible", "languages": ["en"]},
+    "/scripture": {"canonical": "/bible", "languages": ["en"]},
+    "/verses": {"canonical": "/bible", "languages": ["en"]},
+    "/biblefact": {"canonical": "/bible", "languages": ["en"]},
+    "/biblefacts": {"canonical": "/bible", "languages": ["en"]},
+    "/chuck": {"canonical": "/chucknorris", "languages": ["en"]},
+    "/norris": {"canonical": "/chucknorris", "languages": ["en"]},
+    "/chuckfacts": {"canonical": "/chucknorris", "languages": ["en"]},
+    "/chuckfact": {"canonical": "/chucknorris", "languages": ["en"]},
+    "/facts": {"canonical": "/chucknorris", "languages": ["en"]},
+    "/elp": {"canonical": "/elpaso", "languages": ["en"]},
+    "/elpasofact": {"canonical": "/elpaso", "languages": ["en"]},
+    "/elpasofacts": {"canonical": "/elpaso", "languages": ["en"]},
+    "/where": {"canonical": "/whereami", "languages": ["en"]},
+    "/location": {"canonical": "/whereami", "languages": ["en"]},
+    "/locate": {"canonical": "/whereami", "languages": ["en"]},
+    "/setmotd": {"canonical": "/changemotd", "languages": ["en"]},
+    "/motdset": {"canonical": "/changemotd", "languages": ["en"]},
+    "/setprompt": {"canonical": "/changeprompt", "languages": ["en"]},
+    "/fixprompt": {"canonical": "/changeprompt", "languages": ["en"]},
+    "/changetone": {"canonical": "/changeprompt", "languages": ["en"]},
+    "/promptshow": {"canonical": "/showprompt", "languages": ["en"]},
+    "/showmotd": {"canonical": "/motd", "languages": ["en"]},
+    "/seeprompt": {"canonical": "/showprompt", "languages": ["en"]},
+    "/viewprompt": {"canonical": "/showprompt", "languages": ["en"]},
+    "/bulletin": {"canonical": "/motd", "languages": ["en"]},
+    "/messageoftheday": {"canonical": "/motd", "languages": ["en"]},
+    "/dailymessage": {"canonical": "/motd", "languages": ["en"]},
+    "/message": {"canonical": "/motd", "languages": ["en"]},
+    "/notes": {"canonical": "/motd", "languages": ["en"]},
+    "/resetchat": {"canonical": "/reset", "languages": ["en"]},
+    "/forecast": {"canonical": "/weather", "languages": ["en"]},
+    "/wx": {"canonical": "/weather", "languages": ["en"]},
+    "/elpweather": {"canonical": "/weather", "languages": ["en"]},
 
     # Spanish
-    "/ayuda": "/help",
-    "/ayudame": "/help",
-    "/dondeestoy": "/whereami",
-    "/clima": "/weather",
-    "/tiempo": "/weather",
-    "/pronostico": "/weather",
-    "/mensaje": "/motd",
-    "/mensajedia": "/motd",
-    "/biblia": "/bible",
-    "/versiculo": "/bible",
-    "/versiculobiblico": "/bible",
-    "/datoelpaso": "/elpaso",
-    "/hechoelpaso": "/elpaso",
-    "/emergencia": "/emergency",
-    "/cambiarmensaje": "/changemotd",
-    "/cambiaprompt": "/changeprompt",
-    "/verprompt": "/showprompt",
-    "/reiniciar": "/reset",
-    "/enviarsms": "/sms",
+    "/ayuda": {"canonical": "/help", "languages": ["es"]},
+    "/ayudame": {"canonical": "/help", "languages": ["es"]},
+    "/dondeestoy": {"canonical": "/whereami", "languages": ["es"]},
+    "/clima": {"canonical": "/weather", "languages": ["es"]},
+    "/tiempo": {"canonical": "/weather", "languages": ["es"]},
+    "/pronostico": {"canonical": "/weather", "languages": ["es"]},
+    "/mensaje": {"canonical": "/motd", "languages": ["es"]},
+    "/mensajedia": {"canonical": "/motd", "languages": ["es"]},
+    "/biblia": {"canonical": "/bible", "languages": ["es", "pl", "sw"]},
+    "/versiculo": {"canonical": "/bible", "languages": ["es"]},
+    "/versiculobiblico": {"canonical": "/bible", "languages": ["es"]},
+    "/datoelpaso": {"canonical": "/elpaso", "languages": ["es"]},
+    "/hechoelpaso": {"canonical": "/elpaso", "languages": ["es"]},
+    "/emergencia": {"canonical": "/emergency", "languages": ["es"]},
+    "/cambiarmensaje": {"canonical": "/changemotd", "languages": ["es"]},
+    "/cambiaprompt": {"canonical": "/changeprompt", "languages": ["es"]},
+    "/verprompt": {"canonical": "/showprompt", "languages": ["es"]},
+    "/reiniciar": {"canonical": "/reset", "languages": ["es"]},
+    "/enviarsms": {"canonical": "/sms", "languages": ["es"]},
 
     # French
-    "/aide": "/help",
-    "/oujesuis": "/whereami",
-    "/meteo": "/weather",
-    "/temps": "/weather",
-    "/messagedujour": "/motd",
-    "/verset": "/bible",
-    "/blaguechuck": "/chucknorris",
-    "/faitelpaso": "/elpaso",
-    "/urgence": "/emergency",
-    "/modifiermotd": "/changemotd",
-    "/modifierprompt": "/changeprompt",
-    "/afficherprompt": "/showprompt",
-    "/reinitialiser": "/reset",
-    "/envoyersms": "/sms",
+    "/aide": {"canonical": "/help", "languages": ["fr"]},
+    "/oujesuis": {"canonical": "/whereami", "languages": ["fr"]},
+    "/meteo": {"canonical": "/weather", "languages": ["fr"]},
+    "/temps": {"canonical": "/weather", "languages": ["fr"]},
+    "/messagedujour": {"canonical": "/motd", "languages": ["fr"]},
+    "/verset": {"canonical": "/bible", "languages": ["fr"]},
+    "/blaguechuck": {"canonical": "/chucknorris", "languages": ["fr"]},
+    "/faitelpaso": {"canonical": "/elpaso", "languages": ["fr"]},
+    "/urgence": {"canonical": "/emergency", "languages": ["fr"]},
+    "/modifiermotd": {"canonical": "/changemotd", "languages": ["fr"]},
+    "/modifierprompt": {"canonical": "/changeprompt", "languages": ["fr"]},
+    "/afficherprompt": {"canonical": "/showprompt", "languages": ["fr"]},
+    "/reinitialiser": {"canonical": "/reset", "languages": ["fr"]},
+    "/envoyersms": {"canonical": "/sms", "languages": ["fr"]},
 
     # German
-    "/hilfe": "/help",
-    "/woichbin": "/whereami",
-    "/wetter": "/weather",
-    "/wetterbericht": "/weather",
-    "/tagesnachricht": "/motd",
-    "/bibel": "/bible",
-    "/bibelvers": "/bible",
-    "/chuckwitz": "/chucknorris",
-    "/elpasofakt": "/elpaso",
-    "/notfall": "/emergency",
-    "/motdaendern": "/changemotd",
-    "/promptaendern": "/changeprompt",
-    "/promptanzeigen": "/showprompt",
-    "/zuruecksetzen": "/reset",
-    "/smssenden": "/sms",
+    "/hilfe": {"canonical": "/help", "languages": ["de"]},
+    "/woichbin": {"canonical": "/whereami", "languages": ["de"]},
+    "/wetter": {"canonical": "/weather", "languages": ["de"]},
+    "/wetterbericht": {"canonical": "/weather", "languages": ["de"]},
+    "/tagesnachricht": {"canonical": "/motd", "languages": ["de"]},
+    "/bibel": {"canonical": "/bible", "languages": ["de"]},
+    "/bibelvers": {"canonical": "/bible", "languages": ["de"]},
+    "/chuckwitz": {"canonical": "/chucknorris", "languages": ["de"]},
+    "/elpasofakt": {"canonical": "/elpaso", "languages": ["de"]},
+    "/notfall": {"canonical": "/emergency", "languages": ["de"]},
+    "/motdaendern": {"canonical": "/changemotd", "languages": ["de"]},
+    "/promptaendern": {"canonical": "/changeprompt", "languages": ["de"]},
+    "/promptanzeigen": {"canonical": "/showprompt", "languages": ["de"]},
+    "/zuruecksetzen": {"canonical": "/reset", "languages": ["de"]},
+    "/smssenden": {"canonical": "/sms", "languages": ["de"]},
 
     # Chinese (pinyin)
-    "/bangzhu": "/help",
-    "/wozainali": "/whereami",
-    "/tianqi": "/weather",
-    "/shengjing": "/bible",
-    "/elpasoshishi": "/elpaso",
-    "/jinji": "/emergency",
-    "/xiugaixiaoxi": "/changemotd",
-    "/xiugaiprompt": "/changeprompt",
-    "/chakantishi": "/showprompt",
-    "/chongzhi": "/reset",
-    "/fasongduanxin": "/sms",
+    "/bangzhu": {"canonical": "/help", "languages": ["zh"]},
+    "/wozainali": {"canonical": "/whereami", "languages": ["zh"]},
+    "/tianqi": {"canonical": "/weather", "languages": ["zh"]},
+    "/shengjing": {"canonical": "/bible", "languages": ["zh"]},
+    "/elpasoshishi": {"canonical": "/elpaso", "languages": ["zh"]},
+    "/jinji": {"canonical": "/emergency", "languages": ["zh"]},
+    "/xiugaixiaoxi": {"canonical": "/changemotd", "languages": ["zh"]},
+    "/xiugaiprompt": {"canonical": "/changeprompt", "languages": ["zh"]},
+    "/chakantishi": {"canonical": "/showprompt", "languages": ["zh"]},
+    "/chongzhi": {"canonical": "/reset", "languages": ["zh"]},
+    "/fasongduanxin": {"canonical": "/sms", "languages": ["zh"]},
+
+    # Polish
+    "/pomoc": {"canonical": "/help", "languages": ["pl"]},
+    "/gdziejestem": {"canonical": "/whereami", "languages": ["pl"]},
+    "/pogoda": {"canonical": "/weather", "languages": ["pl", "uk"]},
+    "/prognoza": {"canonical": "/weather", "languages": ["pl", "hr"]},
+    "/wiadomosc": {"canonical": "/motd", "languages": ["pl"]},
+    "/wiadomoscdnia": {"canonical": "/motd", "languages": ["pl"]},
+    "/werset": {"canonical": "/bible", "languages": ["pl"]},
+    "/faktelpaso": {"canonical": "/elpaso", "languages": ["pl", "uk"]},
+    "/naglyprzypadek": {"canonical": "/emergency", "languages": ["pl"]},
+    "/zmienwiadomosc": {"canonical": "/changemotd", "languages": ["pl"]},
+    "/zmienprompt": {"canonical": "/changeprompt", "languages": ["pl"]},
+    "/naprawprompt": {"canonical": "/changeprompt", "languages": ["pl"]},
+    "/pokazprompt": {"canonical": "/showprompt", "languages": ["pl"]},
+    "/resetuj": {"canonical": "/reset", "languages": ["pl"]},
+    "/wyslijsms": {"canonical": "/sms", "languages": ["pl"]},
+
+    # Croatian (Latin, with diacritics where relevant)
+    "/pomoć": {"canonical": "/help", "languages": ["hr"]},
+    "/gdjesam": {"canonical": "/whereami", "languages": ["hr"]},
+    "/vrijeme": {"canonical": "/weather", "languages": ["hr"]},
+    "/poruka": {"canonical": "/motd", "languages": ["hr"]},
+    "/porukadana": {"canonical": "/motd", "languages": ["hr"]},
+    "/biblija": {"canonical": "/bible", "languages": ["hr"]},
+    "/stih": {"canonical": "/bible", "languages": ["hr"]},
+    "/cinjenicaelpaso": {"canonical": "/elpaso", "languages": ["hr"]},
+    "/hitno": {"canonical": "/emergency", "languages": ["hr"]},
+    "/promijeniporuku": {"canonical": "/changemotd", "languages": ["hr"]},
+    "/promijeniprompt": {"canonical": "/changeprompt", "languages": ["hr"]},
+    "/popraviprompt": {"canonical": "/changeprompt", "languages": ["hr"]},
+    "/prikaziprompt": {"canonical": "/showprompt", "languages": ["hr"]},
+    "/resetiraj": {"canonical": "/reset", "languages": ["hr"]},
+    "/poslijsms": {"canonical": "/sms", "languages": ["hr"]},
+
+    # Ukrainian (transliterated)
+    "/dopomoga": {"canonical": "/help", "languages": ["uk"]},
+    "/deya": {"canonical": "/whereami", "languages": ["uk"]},
+    "/prognoz": {"canonical": "/weather", "languages": ["uk"]},
+    "/povidomlennia": {"canonical": "/motd", "languages": ["uk"]},
+    "/povidomlennia_dnya": {"canonical": "/motd", "languages": ["uk"]},
+    "/bibliya": {"canonical": "/bible", "languages": ["uk"]},
+    "/virsh": {"canonical": "/bible", "languages": ["uk"]},
+    "/nadzvychayno": {"canonical": "/emergency", "languages": ["uk"]},
+    "/zminypovidomlennia": {"canonical": "/changemotd", "languages": ["uk"]},
+    "/zminyprompt": {"canonical": "/changeprompt", "languages": ["uk"]},
+    "/vyprompt": {"canonical": "/changeprompt", "languages": ["uk"]},
+    "/pokazhyprompt": {"canonical": "/showprompt", "languages": ["uk"]},
+    "/skynuty": {"canonical": "/reset", "languages": ["uk"]},
+    "/vidpravysms": {"canonical": "/sms", "languages": ["uk"]},
+
+    # Kiswahili
+    "/msaada": {"canonical": "/help", "languages": ["sw"]},
+    "/nipo_wapi": {"canonical": "/whereami", "languages": ["sw"]},
+    "/haliyahewa": {"canonical": "/weather", "languages": ["sw"]},
+    "/utabiri": {"canonical": "/weather", "languages": ["sw"]},
+    "/ujumbe": {"canonical": "/motd", "languages": ["sw"]},
+    "/ujumbe_wa_siku": {"canonical": "/motd", "languages": ["sw"]},
+    "/mstari": {"canonical": "/bible", "languages": ["sw"]},
+    "/fakielpaso": {"canonical": "/elpaso", "languages": ["sw"]},
+    "/dharaura": {"canonical": "/emergency", "languages": ["sw"]},
+    "/badilisha_ujumbe": {"canonical": "/changemotd", "languages": ["sw"]},
+    "/badilisha_prompt": {"canonical": "/changeprompt", "languages": ["sw"]},
+    "/rekebisha_prompt": {"canonical": "/changeprompt", "languages": ["sw"]},
+    "/onyesha_prompt": {"canonical": "/showprompt", "languages": ["sw"]},
+    "/wekaupya": {"canonical": "/reset", "languages": ["sw"]},
+    "/tumasms": {"canonical": "/sms", "languages": ["sw"]},
 }
 
 BUILTIN_COMMANDS = {
@@ -829,6 +930,107 @@ BUILTIN_COMMANDS = {
 FUZZY_COMMAND_MATCH_THRESHOLD = 0.6
 
 
+LANGUAGE_STRINGS = {
+    "en": {
+        "alias_note": "Interpreting {original} as {canonical} (alias).",
+        "fuzzy_note": "Interpreting {original} as {canonical} (closest match).",
+        "unknown_intro": "I didn't recognize `{original}` as a command.",
+        "suggestion_intro": "Maybe you meant: {suggestions}.",
+        "try_help": "Try `/help` for the full list.",
+    },
+    "es": {
+        "alias_note": "Interpretando {original} como {canonical} (alias).",
+        "fuzzy_note": "Interpretando {original} como {canonical} (coincidencia más cercana).",
+        "unknown_intro": "No reconocí `{original}` como un comando.",
+        "suggestion_intro": "Quizá quisiste decir: {suggestions}.",
+        "try_help": "Prueba `/help` para ver la lista completa.",
+    },
+    "fr": {
+        "alias_note": "Interprétation de {original} comme {canonical} (alias).",
+        "fuzzy_note": "Interprétation de {original} comme {canonical} (correspondance la plus proche).",
+        "unknown_intro": "Je n'ai pas reconnu `{original}` comme commande.",
+        "suggestion_intro": "Vouliez-vous dire : {suggestions} ?",
+        "try_help": "Essayez `/help` pour la liste complète.",
+    },
+    "de": {
+        "alias_note": "Interpretation von {original} als {canonical} (Alias).",
+        "fuzzy_note": "Interpretation von {original} als {canonical} (beste Übereinstimmung).",
+        "unknown_intro": "Ich habe `{original}` nicht als Befehl erkannt.",
+        "suggestion_intro": "Meintest du: {suggestions}?",
+        "try_help": "Nutze `/help` für alle Befehle.",
+    },
+    "zh": {
+        "alias_note": "将 {original} 解释为 {canonical}（别名）。",
+        "fuzzy_note": "将 {original} 解释为 {canonical}（最接近的匹配）。",
+        "unknown_intro": "未识别 `{original}` 这个指令。",
+        "suggestion_intro": "是否想输入：{suggestions}？",
+        "try_help": "可以发送 `/help` 查看全部指令。",
+    },
+    "pl": {
+        "alias_note": "Interpretuję {original} jako {canonical} (alias).",
+        "fuzzy_note": "Interpretuję {original} jako {canonical} (najbliższe dopasowanie).",
+        "unknown_intro": "Nie rozpoznano komendy `{original}`.",
+        "suggestion_intro": "Może chodziło o: {suggestions}.",
+        "try_help": "Użyj `/help`, aby zobaczyć pełną listę.",
+    },
+    "hr": {
+        "alias_note": "Tumačim {original} kao {canonical} (alias).",
+        "fuzzy_note": "Tumačim {original} kao {canonical} (najbliže podudaranje).",
+        "unknown_intro": "Nisam prepoznao naredbu `{original}`.",
+        "suggestion_intro": "Možda ste mislili: {suggestions}.",
+        "try_help": "Probajte `/help` za cijeli popis.",
+    },
+    "uk": {
+        "alias_note": "Інтерпретую {original} як {canonical} (аліас).",
+        "fuzzy_note": "Інтерпретую {original} як {canonical} (найближчий збіг).",
+        "unknown_intro": "Не розпізнано команду `{original}`.",
+        "suggestion_intro": "Можливо, ви мали на увазі: {suggestions}.",
+        "try_help": "Спробуйте `/help`, щоб побачити перелік команд.",
+    },
+    "sw": {
+        "alias_note": "Natafsiri {original} kuwa {canonical} (kirai).",
+        "fuzzy_note": "Natafsiri {original} kuwa {canonical} (mfanano wa karibu).",
+        "unknown_intro": "Sikutambua `{original}` kama amri.",
+        "suggestion_intro": "Je ulimaanisha: {suggestions}?",
+        "try_help": "Tumia `/help` kupata orodha kamili.",
+    },
+}
+
+
+LANGUAGE_RESPONSES = {
+    "es": {
+        "dm_only": "❌ Este comando sólo puede usarse en un mensaje directo.",
+        "motd_current": "MOTD actual:\n{motd}",
+        "changemotd_usage": "Uso: /changemotd Tu nuevo texto MOTD",
+        "changemotd_success": "✅ MOTD actualizado. Usa /motd para verlo.",
+        "changemotd_error": "❌ No se pudo actualizar el MOTD: {error}",
+        "changeprompt_usage": "Uso: /changeprompt Tu nuevo prompt del sistema",
+        "changeprompt_success": "✅ Prompt del sistema actualizado.",
+        "changeprompt_error": "❌ No se pudo actualizar el prompt del sistema: {error}",
+        "showprompt_current": "Prompt del sistema actual:\n{prompt}",
+        "showprompt_error": "❌ No se pudo mostrar el prompt del sistema: {error}",
+        "password_prompt": "responde con la contraseña",
+        "password_success": "¡Listo! Ahora estás autorizado para hacer cambios de administrador",
+        "password_failure": "ni hablar, inténtalo de nuevo... o no",
+        "weather_need_city": "No pude encontrar esa ubicación. Dame la ciudad principal más cercana y lo intento de nuevo.",
+        "weather_final_fail": "Aún no encuentro esa ubicación. Intenta con otra ciudad o código postal.",
+        "weather_service_fail": "No pude obtener el informe del clima en este momento.",
+    },
+}
+
+
+def translate(language: str, key: str, default: str, **kwargs) -> str:
+    template = LANGUAGE_RESPONSES.get(language, {}).get(key, default)
+    try:
+        return template.format(**kwargs)
+    except Exception:
+        return template
+
+
+def get_language_strings(language: Optional[str]):
+    return LANGUAGE_STRINGS.get(language or "en", LANGUAGE_STRINGS["en"])
+
+
 def _strip_command_token(cmd: str) -> str:
     token = cmd.strip()
     while token and token[-1] in TRAILING_COMMAND_PUNCT:
@@ -836,6 +1038,43 @@ def _strip_command_token(cmd: str) -> str:
     if not token.startswith("/"):
         token = f"/{token.lstrip('/')}"
     return token.lower()
+
+
+def _languages_for_alias(alias: str) -> List[str]:
+    info = COMMAND_ALIASES.get(alias)
+    if not info:
+        return []
+    langs = info.get("languages") or []
+    return [lang for lang in langs if lang]
+
+
+def _languages_for_canonical(canonical: str) -> List[str]:
+    langs: List[str] = []
+    for alias, info in COMMAND_ALIASES.items():
+        if info.get("canonical", "").lower() == canonical.lower():
+            langs.extend(info.get("languages") or [])
+    return langs
+
+
+def _detect_language_for_token(token: str) -> Optional[str]:
+    stripped = _strip_command_token(token)
+    alias_langs = _languages_for_alias(stripped)
+    if alias_langs:
+        return alias_langs[0]
+    best_lang = None
+    best_score = 0.0
+    for alias, info in COMMAND_ALIASES.items():
+        ratio = difflib.SequenceMatcher(None, stripped, alias).ratio()
+        if ratio > best_score and ratio >= 0.5:
+            langs = info.get("languages") or []
+            if langs:
+                best_lang = langs[0]
+                best_score = ratio
+    if not best_lang:
+        canonical_langs = _languages_for_canonical(stripped)
+        if canonical_langs:
+            best_lang = canonical_langs[0]
+    return best_lang
 
 
 def _known_commands() -> Set[str]:
@@ -846,43 +1085,70 @@ def _known_commands() -> Set[str]:
             continue
         normalized = custom_cmd if custom_cmd.startswith("/") else f"/{custom_cmd}"  # keep slash prefix
         known.add(normalized.lower())
-    known.update(COMMAND_ALIASES.keys())
-    known.update(COMMAND_ALIASES.values())
+    for alias, info in COMMAND_ALIASES.items():
+        known.add(alias.lower())
+        canonical = info.get("canonical")
+        if isinstance(canonical, str):
+            known.add(canonical.lower())
     return known
 
 
 def resolve_command_token(raw: str):
     """Resolve a raw slash token to a canonical command and optional notice."""
     stripped = _strip_command_token(raw)
-    alias_target = COMMAND_ALIASES.get(stripped)
-    if alias_target:
-        return alias_target, "alias", None
+    alias_info = COMMAND_ALIASES.get(stripped)
+    if alias_info:
+        canonical = alias_info.get("canonical", stripped)
+        langs = _languages_for_alias(stripped)
+        language = langs[0] if langs else None
+        return canonical, "alias", None, language
     known = _known_commands()
     if stripped in known:
-        return stripped, None, None
+        language = _detect_language_for_token(stripped)
+        return stripped, None, None, language
     candidates = difflib.get_close_matches(stripped, list(known), n=1, cutoff=FUZZY_COMMAND_MATCH_THRESHOLD)
     if candidates:
-        return candidates[0], "fuzzy", None
+        candidate = candidates[0]
+        canonical = candidate
+        language = _detect_language_for_token(candidate) or _detect_language_for_token(stripped)
+        if candidate in COMMAND_ALIASES:
+            canonical = COMMAND_ALIASES[candidate].get("canonical", candidate)
+        return canonical, "fuzzy", None, language
     suggestions = difflib.get_close_matches(stripped, list(known), n=3, cutoff=0.3)
-    return None, "unknown", suggestions
+    language = _detect_language_for_token(stripped)
+    return None, "unknown", suggestions, language
 
 
-def annotate_command_response(resp, original_cmd: str, canonical_cmd: str, reason: str):
+def annotate_command_response(resp, original_cmd: str, canonical_cmd: str, reason: str, language: Optional[str]):
     if not resp or canonical_cmd == original_cmd:
         return resp
+    strings = get_language_strings(language)
     if reason == "alias":
-        note = f"Interpreting {original_cmd} as {canonical_cmd} (alias)."
+        note = strings["alias_note"].format(original=original_cmd, canonical=canonical_cmd)
     else:
-        note = f"Interpreting {original_cmd} as {canonical_cmd} (closest match)."
+        note = strings["fuzzy_note"].format(original=original_cmd, canonical=canonical_cmd)
     if isinstance(resp, PendingReply):
         return PendingReply(f"{note}\n{resp.text}", resp.reason)
     return f"{note}\n{resp}"
+
+
+def format_unknown_command_reply(original_cmd: str, suggestions: Optional[List[str]], language: Optional[str]) -> str:
+    strings = get_language_strings(language)
+    parts = [strings["unknown_intro"].format(original=original_cmd)]
+    if suggestions:
+        suggestion_text = ", ".join(suggestions)
+        parts.append(strings["suggestion_intro"].format(suggestions=suggestion_text))
+    parts.append(strings["try_help"])
+    return " ".join(parts)
 
 
 def _process_admin_password(sender_id: Any, message: str):
     sender_key = _sender_key(sender_id)
     pending_request = PENDING_ADMIN_REQUESTS.get(sender_key)
     attempt = (message or "").strip()
+    lang = None
+    if pending_request:
+        lang = pending_request.get("language")
     if attempt == ADMIN_PASSWORD:
         AUTHORIZED_ADMINS.add(sender_key)
         if pending_request:
@@ -893,7 +1159,7 @@ def _process_admin_password(sender_id: Any, message: str):
             show_always=True,
             rate_limit=False,
         )
-        success_text = "Bingo! you're now authorized to make admin changes"
+        success_text = translate(lang or 'en', 'password_success', "Bingo! you're now authorized to make admin changes")
         follow_resp = None
         if pending_request:
             follow_resp = handle_command(
@@ -903,6 +1169,7 @@ def _process_admin_password(sender_id: Any, message: str):
                 is_direct=pending_request.get("is_direct", True),
                 channel_idx=pending_request.get("channel_idx"),
                 thread_root_ts=pending_request.get("thread_root_ts"),
+                language_hint=lang,
             )
         if isinstance(follow_resp, PendingReply):
             combined = f"{success_text}\n{follow_resp.text}" if follow_resp.text else success_text
@@ -918,7 +1185,8 @@ def _process_admin_password(sender_id: Any, message: str):
         show_always=True,
         rate_limit=False,
     )
-    return PendingReply("no way jose, try again.. or don't", "admin password")
+    failure_text = translate(lang or 'en', 'password_failure', "no way jose, try again.. or don't")
+    return PendingReply(failure_text, "admin password")
 
 
 @dataclass
@@ -955,8 +1223,8 @@ def _random_chuck_fact() -> Optional[str]:
     return random.choice(CHUCK_NORRIS_FACTS)
 
 
-def _weather_code_description(code: Optional[int]) -> str:
-    mapping = {
+def _weather_code_description(code: Optional[int], language: str = 'en') -> str:
+    mapping_en = {
         0: "clear sky",
         1: "mainly clear",
         2: "partly cloudy",
@@ -986,11 +1254,43 @@ def _weather_code_description(code: Optional[int]) -> str:
         96: "thunderstorm with light hail",
         99: "thunderstorm with heavy hail",
     }
+    mapping_es = {
+        0: "cielo despejado",
+        1: "mayormente despejado",
+        2: "parcialmente nublado",
+        3: "cubierto",
+        45: "niebla",
+        48: "niebla helada",
+        51: "llovizna ligera",
+        53: "llovizna moderada",
+        55: "llovizna densa",
+        56: "llovizna helada ligera",
+        57: "llovizna helada intensa",
+        61: "lluvia ligera",
+        63: "lluvia moderada",
+        65: "lluvia intensa",
+        66: "lluvia helada ligera",
+        67: "lluvia helada intensa",
+        71: "nieve ligera",
+        73: "nieve moderada",
+        75: "nieve intensa",
+        77: "granitos de nieve",
+        80: "chubascos ligeros",
+        81: "chubascos moderados",
+        82: "chubascos violentos",
+        85: "chubascos de nieve ligeros",
+        86: "chubascos de nieve intensos",
+        95: "tormenta",
+        96: "tormenta con granizo ligero",
+        99: "tormenta con granizo fuerte",
+    }
     try:
         key = int(code) if code is not None else None
     except (TypeError, ValueError):
         key = None
-    return mapping.get(key, "local conditions")
+    if language == 'es':
+        return mapping_es.get(key, "condiciones locales")
+    return mapping_en.get(key, "local conditions")
 
 
 def _wind_direction_cardinal(degrees: Optional[float]) -> Optional[str]:
@@ -1023,105 +1323,11 @@ def _wind_direction_cardinal(degrees: Optional[float]) -> Optional[str]:
 
 
 def _format_el_paso_weather() -> Optional[str]:
-    now = time.time()
-    try:
-        cached_text = EL_PASO_WEATHER_CACHE.get("text")
-        cached_ts = float(EL_PASO_WEATHER_CACHE.get("timestamp", 0.0))
-    except Exception:
-        cached_text = None
-        cached_ts = 0.0
-    if cached_text and (now - cached_ts) < EL_PASO_WEATHER_TTL:
-        return cached_text
-
-    params = {
-        "latitude": EL_PASO_LAT,
-        "longitude": EL_PASO_LON,
-        "current_weather": "true",
-        "hourly": "relativehumidity_2m,apparent_temperature,dewpoint_2m",
-        "timezone": "America/Denver",
-    }
-    try:
-        clean_log("Fetching El Paso weather snapshot", "🌤️", show_always=True, rate_limit=False)
-        response = requests.get(EL_PASO_WEATHER_API, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-    except Exception as exc:
-        clean_log(f"Weather lookup failed: {exc}", "⚠️", show_always=True, rate_limit=False)
-        return None
-
-    current = data.get("current_weather") or {}
-    if not current:
-        return None
-
-    temp_c = current.get("temperature")
-    temp_f = None
-    if isinstance(temp_c, (int, float)):
-        temp_f = (temp_c * 9 / 5) + 32
-
-    wind_speed_kph = current.get("windspeed")
-    wind_speed_mph = None
-    if isinstance(wind_speed_kph, (int, float)):
-        wind_speed_mph = wind_speed_kph * 0.621371
-
-    wind_dir_deg = current.get("winddirection")
-    wind_dir_text = _wind_direction_cardinal(wind_dir_deg)
-
-    weather_desc = _weather_code_description(current.get("weathercode"))
-    observed_time = str(current.get("time") or "").replace("T", " ").strip()
-
-    humidity = None
-    feels_like_c = None
-    hourly = data.get("hourly") or {}
-    hourly_times = hourly.get("time") or []
-    target_index = None
-    if observed_time:
-        try:
-            target_index = hourly_times.index(current.get("time"))
-        except ValueError:
-            target_index = None
-    if target_index is not None:
-        humidity_series = hourly.get("relativehumidity_2m") or []
-        if target_index < len(humidity_series):
-            humidity = humidity_series[target_index]
-        apparent_series = hourly.get("apparent_temperature") or []
-        if target_index < len(apparent_series):
-            feels_like_c = apparent_series[target_index]
-
-    feels_like_f = None
-    if isinstance(feels_like_c, (int, float)):
-        feels_like_f = (feels_like_c * 9 / 5) + 32
-
-    parts = []
-    temp_bits = []
-    if isinstance(temp_f, (int, float)):
-        temp_bits.append(f"{temp_f:.0f}°F")
-    if isinstance(temp_c, (int, float)):
-        temp_bits.append(f"{temp_c:.1f}°C")
-    if temp_bits:
-        parts.append(" / ".join(temp_bits))
-
-    if isinstance(feels_like_f, (int, float)):
-        parts.append(f"feels like {feels_like_f:.0f}°F")
-    elif isinstance(feels_like_c, (int, float)):
-        parts.append(f"feels like {feels_like_c:.1f}°C")
-
-    if isinstance(humidity, (int, float)):
-        parts.append(f"humidity {humidity:.0f}%")
-
-    if isinstance(wind_speed_mph, (int, float)):
-        if wind_dir_text:
-            parts.append(f"wind {wind_speed_mph:.0f} mph {wind_dir_text}")
-        else:
-            parts.append(f"wind {wind_speed_mph:.0f} mph")
-
-    summary = f"El Paso Weather: {weather_desc}"
-    if parts:
-        summary += " • " + "; ".join(parts)
-    if observed_time:
-        summary += f" • updated {observed_time}"
-
-    EL_PASO_WEATHER_CACHE["timestamp"] = now
-    EL_PASO_WEATHER_CACHE["text"] = summary
+    clean_log("Fetching El Paso weather snapshot", "🌤️", show_always=True, rate_limit=False)
+    summary = _format_weather_report("El Paso, TX", EL_PASO_LAT, EL_PASO_LON, language='en', timezone="America/Denver", cache_token="el_paso_en")
+    if summary:
+        EL_PASO_WEATHER_CACHE["timestamp"] = time.time()
+        EL_PASO_WEATHER_CACHE["text"] = summary
     return summary
 
 
@@ -1129,6 +1335,212 @@ def _random_el_paso_fact() -> Optional[str]:
     if not EL_PASO_FACTS:
         return None
     return random.choice(EL_PASO_FACTS)
+
+
+def _normalize_weather_query(query: str) -> str:
+    cleaned = query.strip().lower()
+    return WEATHER_CITY_SYNONYMS.get(cleaned, query.strip())
+
+
+def _geocode_location(query: str, language: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    normalized = _normalize_weather_query(query)
+    params = {
+        "count": 1,
+    }
+    lang_param = None
+    if language == 'es':
+        lang_param = 'es'
+    if lang_param:
+        params["language"] = lang_param
+    lat = lon = None
+    base_url = "https://geocoding-api.open-meteo.com/v1/search"
+    query_str = normalized.strip()
+    is_postal = bool(re.fullmatch(r"[0-9A-Za-z\- ]{3,12}", query_str)) and any(char.isdigit() for char in query_str)
+    try:
+        if is_postal:
+            params_postal = dict(params)
+            params_postal["postal_code"] = query_str
+            resp = requests.get(base_url, params=params_postal, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            results = data.get("results") or []
+            if results:
+                best = results[0]
+                lat = best.get("latitude")
+                lon = best.get("longitude")
+                if lat is not None and lon is not None:
+                    name = best.get("name") or query_str
+                    country = best.get("country")
+                    display = f"{name}, {country}" if country else name
+                    return {
+                        "name": display,
+                        "latitude": float(lat),
+                        "longitude": float(lon),
+                        "timezone": best.get("timezone") or "auto",
+                    }
+        params_name = dict(params)
+        params_name["name"] = query_str
+        resp = requests.get(base_url, params=params_name, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        results = data.get("results") or []
+        if not results:
+            return None
+        best = results[0]
+        lat = best.get("latitude")
+        lon = best.get("longitude")
+        if lat is None or lon is None:
+            return None
+        name = best.get("name") or query_str
+        admin1 = best.get("admin1")
+        country = best.get("country")
+        parts = [name]
+        if admin1 and admin1.lower() != name.lower():
+            parts.append(admin1)
+        if country and country.lower() not in [p.lower() for p in parts]:
+            parts.append(country)
+        display = ", ".join(parts)
+        return {
+            "name": display,
+            "latitude": float(lat),
+            "longitude": float(lon),
+            "timezone": best.get("timezone") or "auto",
+        }
+    except Exception:
+        return None
+
+
+def _format_weather_report(location_name: str, latitude: float, longitude: float, language: str = 'en', timezone: Optional[str] = None, cache_token: Optional[str] = None) -> Optional[str]:
+    key = cache_token or f"{round(latitude, 3)},{round(longitude, 3)}:{language}"
+    entry = WEATHER_DYNAMIC_CACHE.get(key)
+    now = time.time()
+    if entry and now - entry.get("timestamp", 0.0) < EL_PASO_WEATHER_TTL:
+        return entry.get("text")
+
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "current_weather": "true",
+        "hourly": "relativehumidity_2m,apparent_temperature",
+        "timezone": timezone or "auto",
+    }
+    if language == 'es':
+        params["language"] = "es"
+    try:
+        response = requests.get(EL_PASO_WEATHER_API, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+    except Exception:
+        return None
+
+    current = data.get("current_weather") or {}
+    if not current:
+        return None
+
+    temp_c = current.get("temperature")
+    temp_f = (temp_c * 9 / 5 + 32) if isinstance(temp_c, (int, float)) else None
+    wind_speed = current.get("windspeed")
+    wind_mph = wind_speed * 0.621371 if isinstance(wind_speed, (int, float)) else None
+    wind_dir_text = _wind_direction_cardinal(current.get("winddirection"))
+    weather_desc = _weather_code_description(current.get("weathercode"), language)
+    observed_time = str(current.get("time") or "").replace("T", " ").strip()
+
+    humidity = None
+    feels_like_c = None
+    hourly = data.get("hourly") or {}
+    hourly_times = hourly.get("time") or []
+    try:
+        idx = hourly_times.index(current.get("time"))
+    except ValueError:
+        idx = None
+    if idx is not None:
+        rel_humidity = hourly.get("relativehumidity_2m") or []
+        if idx < len(rel_humidity):
+            humidity = rel_humidity[idx]
+        apparent = hourly.get("apparent_temperature") or []
+        if idx < len(apparent):
+            feels_like_c = apparent[idx]
+
+    feels_like_f = (feels_like_c * 9 / 5 + 32) if isinstance(feels_like_c, (int, float)) else None
+
+    if language == 'es':
+        temp_bits = []
+        if isinstance(temp_c, (int, float)):
+            temp_bits.append(f"{temp_c:.1f}°C")
+        if isinstance(temp_f, (int, float)):
+            temp_bits.append(f"{temp_f:.0f}°F")
+        parts = []
+        if temp_bits:
+            parts.append(" / ".join(temp_bits))
+        if isinstance(feels_like_c, (int, float)):
+            parts.append(f"sensación {feels_like_c:.1f}°C")
+        elif isinstance(feels_like_f, (int, float)):
+            parts.append(f"sensación {feels_like_f:.0f}°F")
+        if isinstance(humidity, (int, float)):
+            parts.append(f"humedad {humidity:.0f}%")
+        if isinstance(wind_mph, (int, float)):
+            if wind_dir_text:
+                parts.append(f"viento {wind_mph:.0f} mph {wind_dir_text}")
+            else:
+                parts.append(f"viento {wind_mph:.0f} mph")
+        summary = f"Clima en {location_name}: {weather_desc}"
+        if parts:
+            summary += " • " + "; ".join(parts)
+        if observed_time:
+            summary += f" • actualizado {observed_time}"
+    else:
+        temp_bits = []
+        if isinstance(temp_f, (int, float)):
+            temp_bits.append(f"{temp_f:.0f}°F")
+        if isinstance(temp_c, (int, float)):
+            temp_bits.append(f"{temp_c:.1f}°C")
+        parts = []
+        if temp_bits:
+            parts.append(" / ".join(temp_bits))
+        if isinstance(feels_like_f, (int, float)):
+            parts.append(f"feels like {feels_like_f:.0f}°F")
+        elif isinstance(feels_like_c, (int, float)):
+            parts.append(f"feels like {feels_like_c:.1f}°C")
+        if isinstance(humidity, (int, float)):
+            parts.append(f"humidity {humidity:.0f}%")
+        if isinstance(wind_mph, (int, float)):
+            if wind_dir_text:
+                parts.append(f"wind {wind_mph:.0f} mph {wind_dir_text}")
+            else:
+                parts.append(f"wind {wind_mph:.0f} mph")
+        summary = f"Weather for {location_name}: {weather_desc}"
+        if parts:
+            summary += " • " + "; ".join(parts)
+        if observed_time:
+            summary += f" • updated {observed_time}"
+
+    WEATHER_DYNAMIC_CACHE[key] = {"timestamp": now, "text": summary}
+    return summary
+
+
+def _handle_weather_lookup(sender_key: Optional[str], query: str, language: Optional[str]) -> PendingReply:
+    lang = language or 'en'
+    location = _geocode_location(query, lang)
+    if location:
+        report = _format_weather_report(location["name"], location["latitude"], location["longitude"], language=lang, timezone=location.get("timezone"))
+        if report:
+            if sender_key:
+                PENDING_WEATHER_REQUESTS.pop(sender_key, None)
+            return PendingReply(report, "/weather command")
+        failure = translate(lang, 'weather_service_fail', "🌤️ Weather service unavailable right now.")
+        if sender_key:
+            PENDING_WEATHER_REQUESTS.pop(sender_key, None)
+        return PendingReply(failure, "/weather command")
+    if sender_key:
+        info = PENDING_WEATHER_REQUESTS.setdefault(sender_key, {"language": lang, "attempts": 0})
+        info["language"] = lang
+        info["attempts"] = info.get("attempts", 0) + 1
+        if info["attempts"] >= 2:
+            PENDING_WEATHER_REQUESTS.pop(sender_key, None)
+            final_msg = translate(lang, 'weather_final_fail', "I still can't find that location. Try another city or ZIP.")
+            return PendingReply(final_msg, "weather prompt")
+    retry_msg = translate(lang, 'weather_need_city', "I couldn't find that location. Tell me the nearest major city and I'll try again.")
+    return PendingReply(retry_msg, "weather prompt")
 
 def _cmd_reply(cmd_name: str, message: str) -> PendingReply:
     label = f"{cmd_name} command" if cmd_name else "command"
@@ -2132,11 +2544,12 @@ def route_message_text(user_message, channel_idx):
 # -----------------------------
 # Revised Command Handler (Case-Insensitive)
 # -----------------------------
-def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None, thread_root_ts=None):
+def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None, thread_root_ts=None, language_hint=None):
   # Globals modified by DM-only commands
   global motd_content, SYSTEM_PROMPT, config
   cmd = cmd.lower()
-  dprint(f"handle_command => cmd='{cmd}', full_text='{full_text}', sender_id={sender_id}, is_direct={is_direct}")
+  dprint(f"handle_command => cmd='{cmd}', full_text='{full_text}', sender_id={sender_id}, is_direct={is_direct}, language={language_hint}")
+  lang = language_hint or 'en'
   if cmd == "/about":
     return _cmd_reply(cmd, "MESH-AI Off Grid Chat Bot - By: MR-TBOT.com")
 
@@ -2192,13 +2605,21 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     return _cmd_reply(cmd, help_text)
 
   elif cmd == "/motd":
-    return _cmd_reply(cmd, motd_content)
+    motd_msg = translate(lang, 'motd_current', "Current MOTD:\n{motd}", motd=motd_content)
+    return _cmd_reply(cmd, motd_msg)
 
   elif cmd == "/weather":
-    report = _format_el_paso_weather()
-    if report:
-      return _cmd_reply(cmd, report)
-    return _cmd_reply(cmd, "🌤️ Weather service unavailable right now.")
+    sender_key = _sender_key(sender_id)
+    query = full_text[len(cmd):].strip()
+    if not query:
+      default_report = _format_weather_report("El Paso, TX", EL_PASO_LAT, EL_PASO_LON, language=lang, timezone="America/Denver", cache_token=f"el_paso_{lang}")
+      if default_report:
+        return _cmd_reply(cmd, default_report)
+      fallback = translate(lang, 'weather_service_fail', "🌤️ Weather service unavailable right now.")
+      return _cmd_reply(cmd, fallback)
+    PENDING_WEATHER_REQUESTS.pop(sender_key, None)
+    reply = _handle_weather_lookup(sender_key, query, lang)
+    return reply
 
   elif cmd == "/bible":
     verse = _format_bible_verse()
@@ -2220,7 +2641,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
 
   elif cmd == "/changemotd":
     if not is_direct:
-      return _cmd_reply(cmd, "❌ This command can only be used in a direct message.")
+      return _cmd_reply(cmd, translate(lang, 'dm_only', "❌ This command can only be used in a direct message."))
     sender_key = _sender_key(sender_id)
     if sender_key not in AUTHORIZED_ADMINS:
       PENDING_ADMIN_REQUESTS[sender_key] = {
@@ -2229,6 +2650,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
         "is_direct": is_direct,
         "channel_idx": channel_idx,
         "thread_root_ts": thread_root_ts,
+        "language": lang,
       }
       clean_log(
         f"Admin password required for /changemotd from {get_node_shortname(sender_id)} ({sender_id})",
@@ -2236,24 +2658,28 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
         show_always=True,
         rate_limit=False,
       )
-      return PendingReply("reply with password", "admin password")
+      prompt = translate(lang, 'password_prompt', "reply with password")
+      return PendingReply(prompt, "admin password")
     # Change the Message of the Day content and persist to MOTD_FILE
     new_motd = full_text[len(cmd):].strip()
     if not new_motd:
-      return _cmd_reply(cmd, "Usage: /changemotd Your new MOTD text")
+      usage = translate(lang, 'changemotd_usage', "Usage: /changemotd Your new MOTD text")
+      return _cmd_reply(cmd, usage)
     try:
       # Persist as a JSON string to match existing file format (atomically)
       write_atomic(MOTD_FILE, json.dumps(new_motd))
       # Update in-memory value
       motd_content = new_motd if isinstance(new_motd, str) else str(new_motd)
       info_print(f"[Info] MOTD updated by {get_node_shortname(sender_id)}")
-      return _cmd_reply(cmd, "✅ MOTD updated. Use /motd to view it.")
+      success = translate(lang, 'changemotd_success', "✅ MOTD updated. Use /motd to view it.")
+      return _cmd_reply(cmd, success)
     except Exception as e:
-      return _cmd_reply(cmd, f"❌ Failed to update MOTD: {e}")
+      error_msg = translate(lang, 'changemotd_error', "❌ Failed to update MOTD: {error}", error=e)
+      return _cmd_reply(cmd, error_msg)
 
   elif cmd == "/changeprompt":
     if not is_direct:
-      return _cmd_reply(cmd, "❌ This command can only be used in a direct message.")
+      return _cmd_reply(cmd, translate(lang, 'dm_only', "❌ This command can only be used in a direct message."))
     sender_key = _sender_key(sender_id)
     if sender_key not in AUTHORIZED_ADMINS:
       PENDING_ADMIN_REQUESTS[sender_key] = {
@@ -2262,6 +2688,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
         "is_direct": is_direct,
         "channel_idx": channel_idx,
         "thread_root_ts": thread_root_ts,
+        "language": lang,
       }
       clean_log(
         f"Admin password required for /changeprompt from {get_node_shortname(sender_id)} ({sender_id})",
@@ -2269,11 +2696,13 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
         show_always=True,
         rate_limit=False,
       )
-      return PendingReply("reply with password", "admin password")
+      prompt = translate(lang, 'password_prompt', "reply with password")
+      return PendingReply(prompt, "admin password")
     # Change the system prompt for AI providers and persist to config.json
     new_prompt = full_text[len(cmd):].strip()
     if not new_prompt:
-      return _cmd_reply(cmd, "Usage: /changeprompt Your new system prompt")
+      usage = translate(lang, 'changeprompt_usage', "Usage: /changeprompt Your new system prompt")
+      return _cmd_reply(cmd, usage)
     try:
       SYSTEM_PROMPT = new_prompt
       # Update config dict and persist (atomically)
@@ -2282,18 +2711,22 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
       config["system_prompt"] = new_prompt
       write_atomic(CONFIG_FILE, json.dumps(config, indent=2))
       info_print(f"[Info] System prompt updated by {get_node_shortname(sender_id)}")
-      return _cmd_reply(cmd, "✅ System prompt updated.")
+      success = translate(lang, 'changeprompt_success', "✅ System prompt updated.")
+      return _cmd_reply(cmd, success)
     except Exception as e:
-      return _cmd_reply(cmd, f"❌ Failed to update system prompt: {e}")
+      error_msg = translate(lang, 'changeprompt_error', "❌ Failed to update system prompt: {error}", error=e)
+      return _cmd_reply(cmd, error_msg)
 
   elif cmd in ["/showprompt", "/printprompt"]:
     if not is_direct:
-      return _cmd_reply(cmd, "❌ This command can only be used in a direct message.")
+      return _cmd_reply(cmd, translate(lang, 'dm_only', "❌ This command can only be used in a direct message."))
     try:
       info_print(f"[Info] Showing system prompt to {get_node_shortname(sender_id)}")
-      return _cmd_reply(cmd, f"Current system prompt:\n{SYSTEM_PROMPT}")
+      msg = translate(lang, 'showprompt_current', "Current system prompt:\n{prompt}", prompt=SYSTEM_PROMPT)
+      return _cmd_reply(cmd, msg)
     except Exception as e:
-      return _cmd_reply(cmd, f"❌ Failed to show system prompt: {e}")
+      error_msg = translate(lang, 'showprompt_error', "❌ Failed to show system prompt: {error}", error=e)
+      return _cmd_reply(cmd, error_msg)
 
   elif cmd == "/reset":
     # Clear chat context for either this direct DM thread (sender <-> AI)
@@ -2406,6 +2839,12 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
     if check_only:
       return False
     return _process_admin_password(sender_id, text)
+  if is_direct and sender_key in PENDING_WEATHER_REQUESTS and not text.startswith("/"):
+    info = PENDING_WEATHER_REQUESTS.get(sender_key) or {}
+    lang = info.get("language")
+    if check_only:
+      return False
+    return _handle_weather_lookup(sender_key, text, lang)
 
   sanitized = text.replace('\u0007', '').strip()
   normalized = sanitized.lower()
@@ -2430,18 +2869,12 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
   # Commands (start with /) should be handled and given context
   if text.startswith("/"):
     raw_cmd = text.split()[0]
-    canonical_cmd, notice_reason, suggestions = resolve_command_token(raw_cmd)
+    canonical_cmd, notice_reason, suggestions, language_hint = resolve_command_token(raw_cmd)
     if notice_reason == "unknown" or canonical_cmd is None:
       if check_only:
         return False
-      suggestion_text = ""
-      if suggestions:
-        joined = ", ".join(suggestions)
-        suggestion_text = f" Did you mean: {joined}?"
-      return PendingReply(
-        f"I didn't recognize `{raw_cmd}` as a command.{suggestion_text} Try `/help` for a list.",
-        "unknown command",
-      )
+      message = format_unknown_command_reply(raw_cmd, suggestions, language_hint)
+      return PendingReply(message, "unknown command")
     if check_only:
       # Quick commands like /reset don't need AI processing
       cmd_lower = canonical_cmd.lower()
@@ -2462,9 +2895,9 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
     else:
       if canonical_cmd != raw_cmd:
         text = canonical_cmd + text[len(raw_cmd):]
-      resp = handle_command(canonical_cmd, text, sender_id, is_direct=is_direct, channel_idx=channel_idx, thread_root_ts=thread_root_ts)
+      resp = handle_command(canonical_cmd, text, sender_id, is_direct=is_direct, channel_idx=channel_idx, thread_root_ts=thread_root_ts, language_hint=language_hint)
       if notice_reason:
-        resp = annotate_command_response(resp, raw_cmd, canonical_cmd, notice_reason)
+        resp = annotate_command_response(resp, raw_cmd, canonical_cmd, notice_reason, language_hint)
       return resp
 
   # Non-command messages: route to AI for direct messages, or Home Assistant if configured for this channel.
