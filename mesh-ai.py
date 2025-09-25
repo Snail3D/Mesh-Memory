@@ -12,14 +12,15 @@ import os
 import smtplib
 from email.mime.text import MIMEText
 import logging
-from collections import deque
+from collections import deque, Counter
 import traceback
 from flask import Flask, request, jsonify, redirect, url_for, stream_with_context, Response
 import sys
 import socket  # for socket error checking
 import re
 import random
-from typing import Optional, Set, Dict, Any, List
+import subprocess
+from typing import Optional, Set, Dict, Any, List, Tuple
 from dataclasses import dataclass
 from meshtastic_facts import MESHTASTIC_ALERT_FACTS
 from twilio.rest import Client  # for Twilio SMS support
@@ -397,7 +398,33 @@ RADIO_WATCHDOG_STATE = {
 }
 
 
-def trigger_radio_reset(reason: str, emoji: str = "🔄", debounce_key: str = "generic") -> None:
+def _invoke_power_command(cmd):
+    if isinstance(cmd, str):
+        subprocess.run(cmd, shell=True, check=True)
+    elif isinstance(cmd, (list, tuple)):
+        subprocess.run(cmd, check=True)
+    else:
+        raise ValueError("Unsupported command type for power cycle")
+
+
+def power_cycle_usb_port():
+    if not USB_POWER_CYCLE_ENABLED:
+        return
+    if not USB_POWER_CYCLE_LOCK.acquire(blocking=False):
+        return
+    try:
+        clean_log("Power cycling USB port for radio...", "🔌", show_always=True, rate_limit=False)
+        _invoke_power_command(USB_POWER_CYCLE_OFF_CMD)
+        time.sleep(max(1, USB_POWER_CYCLE_DELAY))
+        _invoke_power_command(USB_POWER_CYCLE_ON_CMD)
+        clean_log("USB power restored.", "🔌", show_always=True, rate_limit=False)
+    except Exception as exc:
+        clean_log(f"USB power cycle failed: {exc}", "⚠️", show_always=True, rate_limit=False)
+    finally:
+        USB_POWER_CYCLE_LOCK.release()
+
+
+def trigger_radio_reset(reason: str, emoji: str = "🔄", debounce_key: str = "generic", power_cycle: bool = False) -> None:
     now_ts = time.time()
     last_ts = RADIO_WATCHDOG_STATE.get(debounce_key, 0.0) or 0.0
     if reset_event.is_set():
@@ -411,6 +438,8 @@ def trigger_radio_reset(reason: str, emoji: str = "🔄", debounce_key: str = "g
         globals()['connection_status'] = "Disconnected"
     except Exception:
         pass
+    if power_cycle:
+        power_cycle_usb_port()
     reset_event.set()
 
 
@@ -424,7 +453,7 @@ class SerialDisconnectHandler(logging.Handler):
             return
         lower = message.lower()
         if any(keyword in lower for keyword in SERIAL_WARNING_KEYWORDS):
-            trigger_radio_reset("Serial link reported disconnect", "⚡", debounce_key="serial_warn")
+            trigger_radio_reset("Serial link reported disconnect", "⚡", debounce_key="serial_warn", power_cycle=True)
 
 
 serial_watch_handler = SerialDisconnectHandler()
@@ -571,6 +600,17 @@ if isinstance(_initial_admins, list):
 PENDING_ADMIN_REQUESTS: Dict[str, Dict[str, Any]] = {}
 PENDING_WEATHER_REQUESTS: Dict[str, Dict[str, Any]] = {}
 
+USB_POWER_CYCLE_OFF_CMD = config.get("usb_power_cycle_off_command")
+USB_POWER_CYCLE_ON_CMD = config.get("usb_power_cycle_on_command")
+try:
+    USB_POWER_CYCLE_DELAY = int(config.get("usb_power_cycle_delay", 3))
+    if USB_POWER_CYCLE_DELAY < 1:
+        USB_POWER_CYCLE_DELAY = 3
+except (TypeError, ValueError):
+    USB_POWER_CYCLE_DELAY = 3
+USB_POWER_CYCLE_ENABLED = bool(USB_POWER_CYCLE_OFF_CMD and USB_POWER_CYCLE_ON_CMD)
+USB_POWER_CYCLE_LOCK = threading.Lock()
+
 def _coerce_positive_int(value, default):
     try:
         ivalue = int(value)
@@ -646,7 +686,7 @@ except (ValueError, TypeError):
     HOME_ASSISTANT_CHANNEL_INDEX = -1
 MAX_CHUNK_SIZE = config.get("chunk_size", 200)
 MAX_CHUNKS = 5
-CHUNK_DELAY = config.get("chunk_delay", 8)
+CHUNK_DELAY = config.get("chunk_delay", 3)
 MAX_RESPONSE_LENGTH = MAX_CHUNK_SIZE * MAX_CHUNKS
 LOCAL_LOCATION_STRING = config.get("local_location_string", "Unknown Location")
 AI_NODE_NAME = config.get("ai_node_name", "AI-Bot")
@@ -673,7 +713,10 @@ try:
 except Exception:
     BIBLE_VERSES_DATA = []
 
+BIBLE_VERSES_DATA_ES = safe_load_json("bible_jesus_verses_es.json", [])
+
 CHUCK_NORRIS_FACTS = safe_load_json("chuck_api_jokes.json", [])
+CHUCK_NORRIS_FACTS_ES = safe_load_json("chuck_api_jokes_es.json", [])
 EL_PASO_FACTS = safe_load_json("el_paso_people_facts.json", [])
 
 ALERT_BELL_RESPONSES = MESHTASTIC_ALERT_FACTS
@@ -766,6 +809,9 @@ COMMAND_ALIASES = {
     "/forecast": {"canonical": "/weather", "languages": ["en"]},
     "/wx": {"canonical": "/weather", "languages": ["en"]},
     "/elpweather": {"canonical": "/weather", "languages": ["en"]},
+    "/meshinfo": {"canonical": "/meshinfo", "languages": ["en"]},
+    "/networkinfo": {"canonical": "/meshinfo", "languages": ["en"]},
+    "/meshstatus": {"canonical": "/meshinfo", "languages": ["en"]},
 
     # Spanish
     "/ayuda": {"canonical": "/help", "languages": ["es"]},
@@ -787,6 +833,9 @@ COMMAND_ALIASES = {
     "/verprompt": {"canonical": "/showprompt", "languages": ["es"]},
     "/reiniciar": {"canonical": "/reset", "languages": ["es"]},
     "/enviarsms": {"canonical": "/sms", "languages": ["es"]},
+    "/informemalla": {"canonical": "/meshinfo", "languages": ["es"]},
+    "/estadomalla": {"canonical": "/meshinfo", "languages": ["es"]},
+    "/estadomesh": {"canonical": "/meshinfo", "languages": ["es"]},
 
     # French
     "/aide": {"canonical": "/help", "languages": ["fr"]},
@@ -916,6 +965,7 @@ BUILTIN_COMMANDS = {
     "/menu",
     "/weather",
     "/motd",
+    "/meshinfo",
     "/bible",
     "/chucknorris",
     "/elpaso",
@@ -1015,6 +1065,18 @@ LANGUAGE_RESPONSES = {
         "weather_need_city": "No pude encontrar esa ubicación. Dame la ciudad principal más cercana y lo intento de nuevo.",
         "weather_final_fail": "Aún no encuentro esa ubicación. Intenta con otra ciudad o código postal.",
         "weather_service_fail": "No pude obtener el informe del clima en este momento.",
+        "meshinfo_header": "Resumen de la red (última hora)",
+        "meshinfo_new_nodes_some": "Nodos nuevos: {count} ({list})",
+        "meshinfo_new_nodes_none": "Nodos nuevos: ninguno",
+        "meshinfo_left_nodes_some": "Nodos que salieron: {count} ({list})",
+        "meshinfo_left_nodes_none": "Ningún nodo se desconectó en la última hora",
+        "meshinfo_avg_batt": "Voltaje promedio (sin alimentación USB): {voltage:.2f} V ({count} nodos)",
+        "meshinfo_avg_batt_unknown": "Sin datos suficientes de batería",
+        "meshinfo_network_usage": "Uso de red aproximado: {percent}% (última hora)",
+        "meshinfo_top_nodes": "Top nodos por tráfico: {list}",
+        "meshinfo_top_nodes_none": "Sin tráfico registrado en la última hora",
+        "bible_missing": "📜 La biblioteca de Escrituras no está disponible en este momento.",
+        "chuck_missing": "🥋 El generador de datos de Chuck Norris está fuera de línea.",
     },
 }
 
@@ -1203,10 +1265,13 @@ def _command_delay(reason: str) -> None:
     time.sleep(COMMAND_REPLY_DELAY)
 
 
-def _format_bible_verse() -> Optional[str]:
-    if not BIBLE_VERSES_DATA:
+def _format_bible_verse(language: str = 'en') -> Optional[str]:
+    dataset = BIBLE_VERSES_DATA
+    if language == 'es' and BIBLE_VERSES_DATA_ES:
+        dataset = BIBLE_VERSES_DATA_ES
+    if not dataset:
         return None
-    verse = random.choice(BIBLE_VERSES_DATA)
+    verse = random.choice(dataset)
     if isinstance(verse, dict):
         ref = verse.get("reference") or verse.get("ref")
         text = verse.get("text") or verse.get("verse")
@@ -1217,10 +1282,13 @@ def _format_bible_verse() -> Optional[str]:
     return None
 
 
-def _random_chuck_fact() -> Optional[str]:
-    if not CHUCK_NORRIS_FACTS:
+def _random_chuck_fact(language: str = 'en') -> Optional[str]:
+    dataset = CHUCK_NORRIS_FACTS
+    if language == 'es' and CHUCK_NORRIS_FACTS_ES:
+        dataset = CHUCK_NORRIS_FACTS_ES
+    if not dataset:
         return None
-    return random.choice(CHUCK_NORRIS_FACTS)
+    return random.choice(dataset)
 
 
 def _weather_code_description(code: Optional[int], language: str = 'en') -> str:
@@ -1541,6 +1609,153 @@ def _handle_weather_lookup(sender_key: Optional[str], query: str, language: Opti
             return PendingReply(final_msg, "weather prompt")
     retry_msg = translate(lang, 'weather_need_city', "I couldn't find that location. Tell me the nearest major city and I'll try again.")
     return PendingReply(retry_msg, "weather prompt")
+
+
+def _parse_timestamp(ts: Optional[str]) -> Optional[datetime]:
+    if not ts:
+        return None
+    try:
+        return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S %Z").replace(tzinfo=timezone.utc)
+    except ValueError:
+        try:
+            return datetime.fromisoformat(ts)
+        except Exception:
+            return None
+
+
+def _format_node_label(node_key: Any) -> str:
+    if node_key is None:
+        return "Unknown"
+    try:
+        if isinstance(node_key, int):
+            return get_node_shortname(node_key)
+        if isinstance(node_key, str):
+            cleaned = node_key
+            if '(' in cleaned:
+                cleaned = cleaned.split('(')[0].strip()
+            try:
+                return get_node_shortname(node_key)
+            except Exception:
+                return cleaned or str(node_key)
+    except Exception:
+        pass
+    return str(node_key)
+
+
+def _compute_average_battery_voltage() -> Tuple[Optional[float], int]:
+    if interface is None or not hasattr(interface, "nodes"):
+        return None, 0
+    nodes = getattr(interface, "nodes", {}) or {}
+    total = 0.0
+    count = 0
+    for info in nodes.values():
+        telemetry = info.get("telemetry") or {}
+        voltage = None
+        if isinstance(telemetry, dict):
+            for key in ("batteryVoltage", "voltage", "Voltage"):
+                if key in telemetry:
+                    voltage = telemetry.get(key)
+                    break
+            if voltage is None:
+                battery_block = telemetry.get("battery")
+                if isinstance(battery_block, dict):
+                    for key in ("voltage", "voltageMv", "voltage_mv"):
+                        if key in battery_block:
+                            voltage = battery_block.get(key)
+                            if key.endswith("Mv") or key.endswith("mv"):
+                                try:
+                                    voltage = float(voltage) / 1000.0
+                                except Exception:
+                                    pass
+                            break
+        if voltage is None:
+            continue
+        try:
+            voltage_val = float(voltage)
+        except (TypeError, ValueError):
+            continue
+        if voltage_val >= BATTERY_PLUGGED_THRESHOLD:
+            continue
+        total += voltage_val
+        count += 1
+    if count == 0:
+        return None, 0
+    return total / count, count
+
+
+def _format_meshinfo_report(language: str) -> str:
+    lang = language or 'en'
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=1)
+    prev_cutoff = cutoff - timedelta(hours=1)
+
+    with messages_lock:
+        snapshot = list(messages)
+
+    node_first: Dict[Any, datetime] = {}
+    node_last: Dict[Any, datetime] = {}
+    node_counts: Counter = Counter()
+    recent_messages = 0
+
+    for entry in snapshot:
+        ts = _parse_timestamp(entry.get("timestamp"))
+        if ts is None:
+            continue
+        node_key = entry.get("node_id")
+        if node_key is None:
+            node_key = entry.get("node")
+        if node_key is None:
+            continue
+        is_ai = bool(entry.get("is_ai"))
+        if not is_ai:
+            first = node_first.get(node_key)
+            if first is None or ts < first:
+                node_first[node_key] = ts
+            last = node_last.get(node_key)
+            if last is None or ts > last:
+                node_last[node_key] = ts
+            if ts >= cutoff:
+                node_counts[node_key] += 1
+        if ts >= cutoff:
+            recent_messages += 1
+
+    new_nodes = [node for node, first in node_first.items() if first >= cutoff]
+    left_nodes = [node for node, last in node_last.items() if prev_cutoff <= last < cutoff]
+
+    avg_voltage, battery_count = _compute_average_battery_voltage()
+    capacity = MAX_SENDS_PER_MINUTE * 60 if MAX_SENDS_PER_MINUTE else 1200
+    usage_percent = min(100.0, (recent_messages / capacity) * 100 if capacity else 0.0)
+    usage_percent = round(usage_percent, 1)
+    top_nodes = node_counts.most_common(3)
+
+    lines = [translate(lang, 'meshinfo_header', "Mesh network summary (last hour)")]
+
+    if new_nodes:
+        names = ", ".join(_format_node_label(node) for node in new_nodes)
+        lines.append(translate(lang, 'meshinfo_new_nodes_some', "New nodes: {count} ({list})", count=len(new_nodes), list=names))
+    else:
+        lines.append(translate(lang, 'meshinfo_new_nodes_none', "New nodes: none"))
+
+    if left_nodes:
+        names = ", ".join(_format_node_label(node) for node in left_nodes)
+        lines.append(translate(lang, 'meshinfo_left_nodes_some', "Nodes left: {count} ({list})", count=len(left_nodes), list=names))
+    else:
+        lines.append(translate(lang, 'meshinfo_left_nodes_none', "No nodes departed in the last hour."))
+
+    if avg_voltage is not None and battery_count:
+        lines.append(translate(lang, 'meshinfo_avg_batt', "Average battery voltage (off-grid): {voltage:.2f} V ({count} nodes)", voltage=avg_voltage, count=battery_count))
+    else:
+        lines.append(translate(lang, 'meshinfo_avg_batt_unknown', "No battery data available."))
+
+    lines.append(translate(lang, 'meshinfo_network_usage', "Approximate network usage: {percent}% (last hour)", percent=f"{usage_percent:.1f}"))
+
+    if top_nodes:
+        formatted = ", ".join(f"{_format_node_label(node)} ({count})" for node, count in top_nodes)
+        lines.append(translate(lang, 'meshinfo_top_nodes', "Top nodes by traffic: {list}", list=formatted))
+    else:
+        lines.append(translate(lang, 'meshinfo_top_nodes_none', "No traffic recorded in the last hour."))
+
+    return "\n".join(lines)
 
 def _cmd_reply(cmd_name: str, message: str) -> PendingReply:
     label = f"{cmd_name} command" if cmd_name else "command"
@@ -2596,7 +2811,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
   elif cmd == "/help":
     built_in = [
       "/about", "/menu", "/query", "/whereami", "/emergency", "/911", "/test",
-      "/motd", "/weather", "/bible", "/chucknorris", "/elpaso", "/sms",
+      "/motd", "/weather", "/meshinfo", "/bible", "/chucknorris", "/elpaso", "/sms",
       "/changemotd", "/changeprompt", "/showprompt", "/printprompt", "/reset"
     ]
     custom_cmds = [c.get("command") for c in commands_config.get("commands", [])]
@@ -2621,17 +2836,21 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     reply = _handle_weather_lookup(sender_key, query, lang)
     return reply
 
+  elif cmd == "/meshinfo":
+    report = _format_meshinfo_report(lang)
+    return _cmd_reply(cmd, report)
+
   elif cmd == "/bible":
-    verse = _format_bible_verse()
+    verse = _format_bible_verse(lang)
     if verse:
         return _cmd_reply(cmd, verse)
-    return _cmd_reply(cmd, "📜 Scripture library unavailable right now.")
+    return _cmd_reply(cmd, translate(lang, 'bible_missing', "📜 Scripture library unavailable right now."))
 
   elif cmd == "/chucknorris":
-    fact = _random_chuck_fact()
+    fact = _random_chuck_fact(lang)
     if fact:
         return _cmd_reply(cmd, fact)
-    return _cmd_reply(cmd, "🥋 Chuck Norris fact generator is offline.")
+    return _cmd_reply(cmd, translate(lang, 'chuck_missing', "🥋 Chuck Norris fact generator is offline."))
 
   elif cmd == "/elpaso":
     fact = _random_el_paso_fact()
@@ -4965,12 +5184,14 @@ def heartbeat_worker(period_sec=30):
             f"Radio watchdog: no packets received for {int(rx_age)}s",
             "🛠️",
             debounce_key="stale_rx",
+            power_cycle=True,
           )
         if RADIO_STALE_TX_THRESHOLD and tx_age is not None and tx_age > RADIO_STALE_TX_THRESHOLD:
           trigger_radio_reset(
             f"Radio watchdog: no transmissions recorded for {int(tx_age)}s",
             "🛠️",
             debounce_key="stale_tx",
+            power_cycle=True,
           )
       # Short, periodic heartbeat log; always show to keep logs alive
       clean_log(f"HB conn={status['conn']} q={status['queue']} rx={status['rx_age_s']}s tx={status['tx_age_s']}s ai={status['ai_age_s']}s", "💓", show_always=True, rate_limit=False)
