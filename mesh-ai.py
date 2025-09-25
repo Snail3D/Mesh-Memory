@@ -408,7 +408,11 @@ def _invoke_power_command(cmd):
 
 
 def power_cycle_usb_port():
+    global USB_POWER_CYCLE_WARNED
     if not USB_POWER_CYCLE_ENABLED:
+        if not USB_POWER_CYCLE_WARNED:
+            clean_log("USB power cycle skipped (commands not configured).", "ℹ️", show_always=True, rate_limit=False)
+            USB_POWER_CYCLE_WARNED = True
         return
     if not USB_POWER_CYCLE_LOCK.acquire(blocking=False):
         return
@@ -610,6 +614,7 @@ except (TypeError, ValueError):
     USB_POWER_CYCLE_DELAY = 3
 USB_POWER_CYCLE_ENABLED = bool(USB_POWER_CYCLE_OFF_CMD and USB_POWER_CYCLE_ON_CMD)
 USB_POWER_CYCLE_LOCK = threading.Lock()
+USB_POWER_CYCLE_WARNED = False
 
 def _coerce_positive_int(value, default):
     try:
