@@ -165,9 +165,12 @@ This fork includes significant performance, reliability, and user experience imp
   - Support for **Local** models (LM Studio, Ollama), **OpenAI**, and even **Home Assistant** integration.
 - **Home Assistant Integration**  
   - Seamlessly forward messages from a designated channel to Home Assistant’s conversation API. Optionally secure the integration using a PIN.
-- **Advanced Slash Commands**  
-  - Built‑in commands: `/about`, `/ping`, `/test`, `/help`, `/motd`, `/ai` (aliases: `/bot`, `/query`, `/data`), `/emergency` (or `/911`), `/whereami` plus custom commands via `commands_config.json`.
-  - Commands are now case‑insensitive for improved mobile usability.
+- **Comprehensive /Commands System**  
+  - **Built-in Commands**: `/about`, `/test`, `/help`, `/motd`, `/ai` (aliases: `/bot`, `/query`, `/data`), `/emergency` (or `/911`), `/whereami`, `/reset` 
+  - **Admin Commands (DM-only)**: `/changeprompt`, `/changemotd`, `/showprompt`, `/printprompt`
+  - **Custom Commands**: Fully configurable via `commands_config.json` with static responses or dynamic AI prompts
+  - **Case-insensitive**: All commands work regardless of capitalization for mobile usability
+  - **Smart Response System**: Instant replies for alarm bells 🔔 and position requests 📍
 - **Emergency Alerts**  
   - Trigger alerts that are sent via **Twilio SMS**, **SMTP Email**, and, if enabled, **Discord**.
   - Emergency notifications include GPS coordinates, UTC timestamps, and user messages.
@@ -875,8 +878,41 @@ Update your configuration file with the following keys (replace placeholder text
   - Alternatively, enable `"use_mesh_interface"` if applicable.
   - Baud Rate is optionally set if you need - this is for longer USB runs (roof nodes connected via USB) and bad USB connections.
   
-- **Message Routing & Commands:**  
-  - Custom commands can be added in `commands_config.json`.
+- **Message Routing & Commands System:**  
+  - **Built-in Commands** (case-insensitive):
+    - `/about` - Show bot information
+    - `/help` - List all available commands  
+    - `/test` - Connection test with your location
+    - `/motd` - Display Message of the Day
+    - `/ai`, `/bot`, `/query`, `/data` - AI conversation commands
+    - `/emergency`, `/911` - Trigger emergency alerts with GPS
+    - `/whereami` - Get your current GPS coordinates
+    - `/reset` - Clear conversation history for channel or DM
+    
+  - **Admin Commands (DM-only for security):**
+    - `/changeprompt <text>` - Update AI system prompt (persists to config.json)
+    - `/changemotd <text>` - Update Message of the Day (persists to motd.json)
+    - `/showprompt`, `/printprompt` - Display current system prompt
+    
+  - **Smart Auto-Responses (DM only):**
+    - **🔔 Alarm Bell Responses**: When someone sends "alert bell character!" or 🔔, bot responds with random Meshtastic facts from `meshtastic_facts.py`
+    - **📍 Position Replies**: When someone shares their position and requests yours, bot gives humorous "I'm just software" responses
+    
+  - **Custom Commands** via `commands_config.json`:
+    ```json
+    {
+      "commands": [
+        {
+          "command": "/ping",
+          "response": "Pong!"
+        },
+        {
+          "command": "/funfact", 
+          "ai_prompt": "Give me a fun fact about {user_input}"
+        }
+      ]
+    }
+    ```
   - The WebUI Dashboard (accessible at [http://localhost:5000/dashboard](http://localhost:5000/dashboard)) displays messages and node status.
   
 - **AI Provider Settings:**  
