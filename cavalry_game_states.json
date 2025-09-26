@@ -1,19 +1,4 @@
 {
-  "!89449aaa#DM": {
-    "current_scene": "peace_camp_end",
-    "gold": 4,
-    "integrity": 5,
-    "history": [
-      "rio_patrol",
-      "ysleta_farms",
-      "peace_camp_end"
-    ],
-    "completed": true,
-    "language": "en",
-    "start_scene": "rio_patrol",
-    "last_note": "They gift silver pesos and promise to alert you of raids.",
-    "intro_shown": true
-  },
   "!376be684#DM": {
     "current_scene": "mountain_recon",
     "gold": 0,
@@ -25,6 +10,21 @@
     "language": "en",
     "start_scene": "mountain_recon",
     "last_note": null,
+    "intro_shown": true
+  },
+  "!89449aaa#DM": {
+    "current_scene": "gold_tally_end",
+    "gold": 5,
+    "integrity": 1,
+    "history": [
+      "mountain_recon",
+      "outlaw_camp",
+      "gold_tally_end"
+    ],
+    "completed": true,
+    "language": "en",
+    "start_scene": "mountain_recon",
+    "last_note": "Victory is swift, yet wounded bandits cry out for mercy.",
     "intro_shown": true
   }
 }

@@ -28,5 +28,38 @@
     "channel_idx": 0,
     "is_direct": true,
     "display_name": "SnMo"
+  },
+  "!89449aaa#DM::general": {
+    "category": "general",
+    "score": 1,
+    "total": 1,
+    "asked_ids": [
+      "g1",
+      "g6"
+    ],
+    "current_id": "g6",
+    "language": "en",
+    "owner_id": "!89449aaa",
+    "channel_idx": 0,
+    "is_direct": true,
+    "display_name": "Gues"
+  },
+  "!89449aaa#DM::bible": {
+    "category": "bible",
+    "score": 3,
+    "total": 4,
+    "asked_ids": [
+      "b1",
+      "b2",
+      "b5",
+      "b6",
+      "b7"
+    ],
+    "current_id": "b1",
+    "language": "en",
+    "owner_id": "!89449aaa",
+    "channel_idx": 0,
+    "is_direct": true,
+    "display_name": "Gues"
   }
 }
