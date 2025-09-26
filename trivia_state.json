@@ -1,0 +1,32 @@
+{
+  "!376be684#DM::general": {
+    "category": "general",
+    "score": 0,
+    "total": 1,
+    "asked_ids": [
+      "g3",
+      "g7",
+      "g8"
+    ],
+    "current_id": "g7",
+    "language": "en",
+    "owner_id": "!376be684",
+    "channel_idx": 0,
+    "is_direct": true,
+    "display_name": "SnMo"
+  },
+  "!376be684#DM::bible": {
+    "category": "bible",
+    "score": 0,
+    "total": 0,
+    "asked_ids": [
+      "b8"
+    ],
+    "current_id": "b8",
+    "language": "es",
+    "owner_id": "!376be684",
+    "channel_idx": 0,
+    "is_direct": true,
+    "display_name": "SnMo"
+  }
+}

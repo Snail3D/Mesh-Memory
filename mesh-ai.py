@@ -1,6 +1,7 @@
 import meshtastic
 import meshtastic.serial_interface
 from meshtastic import BROADCAST_ADDR
+from meshtastic import portnums_pb2
 from pubsub import pub
 import json
 import difflib
@@ -21,7 +22,7 @@ import re
 import random
 import subprocess
 from typing import Optional, Set, Dict, Any, List, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from meshtastic_facts import MESHTASTIC_ALERT_FACTS
 from twilio.rest import Client  # for Twilio SMS support
 from unidecode import unidecode   # Added unidecode import for Ollama text normalization
@@ -64,6 +65,10 @@ meshtastic_log = logging.getLogger("meshtastic")
 
 for lg in (root_log, meshtastic_log):
     lg.addFilter(_ProtoNoiseFilter())
+
+# Custom exception for fatal serial exclusive-lock scenarios
+class ExclusiveLockError(Exception):
+    pass
 
 def dprint(*args, **kwargs):
     if DEBUG_ENABLED:
@@ -389,6 +394,7 @@ sys.stderr = StreamToLogger(add_script_log)
 connection_status = "Disconnected"
 last_error_message = ""
 reset_event = threading.Event()  # Global event to signal a fatal error and trigger reconnect
+CONNECTING_NOW = False
 
 RADIO_WATCHDOG_STATE = {
     "serial_warn": 0.0,
@@ -456,7 +462,7 @@ class SerialDisconnectHandler(logging.Handler):
         if not message:
             return
         lower = message.lower()
-        if any(keyword in lower for keyword in SERIAL_WARNING_KEYWORDS):
+        if any(keyword in lower for keyword in SERIAL_WARNING_KEYWORDS) and not CONNECTING_NOW:
             trigger_radio_reset("Serial link reported disconnect", "⚡", debounce_key="serial_warn", power_cycle=True)
 
 
@@ -691,7 +697,7 @@ except (ValueError, TypeError):
     HOME_ASSISTANT_CHANNEL_INDEX = -1
 MAX_CHUNK_SIZE = config.get("chunk_size", 200)
 MAX_CHUNKS = 5
-CHUNK_DELAY = config.get("chunk_delay", 3)
+CHUNK_DELAY = config.get("chunk_buffer_seconds", config.get("chunk_delay", 4))
 MAX_RESPONSE_LENGTH = MAX_CHUNK_SIZE * MAX_CHUNKS
 LOCAL_LOCATION_STRING = config.get("local_location_string", "Unknown Location")
 AI_NODE_NAME = config.get("ai_node_name", "AI-Bot")
@@ -722,6 +728,8 @@ BIBLE_VERSES_DATA_ES = safe_load_json("bible_jesus_verses_es.json", [])
 
 CHUCK_NORRIS_FACTS = safe_load_json("chuck_api_jokes.json", [])
 CHUCK_NORRIS_FACTS_ES = safe_load_json("chuck_api_jokes_es.json", [])
+BLOND_JOKES = safe_load_json("blond_jokes.json", [])
+YO_MOMMA_JOKES = safe_load_json("yo_momma_jokes.json", [])
 EL_PASO_FACTS = safe_load_json("el_paso_people_facts.json", [])
 
 ALERT_BELL_RESPONSES = MESHTASTIC_ALERT_FACTS
@@ -776,7 +784,7 @@ WEATHER_CITY_SYNONYMS = {
 
 COMMAND_ALIASES = {
     # English shortcuts / typos
-    "/menu": {"canonical": "/help", "languages": ["en"]},
+    "/menu": {"canonical": "/menu", "languages": ["en", "es"]},
     "/commands": {"canonical": "/help", "languages": ["en"]},
     "/command": {"canonical": "/help", "languages": ["en"]},
     "/h": {"canonical": "/help", "languages": ["en"]},
@@ -790,6 +798,14 @@ COMMAND_ALIASES = {
     "/chuckfacts": {"canonical": "/chucknorris", "languages": ["en"]},
     "/chuckfact": {"canonical": "/chucknorris", "languages": ["en"]},
     "/facts": {"canonical": "/chucknorris", "languages": ["en"]},
+    "/blondjoke": {"canonical": "/blond", "languages": ["en"]},
+    "/blonde": {"canonical": "/blond", "languages": ["en"]},
+    "/blondejoke": {"canonical": "/blond", "languages": ["en"]},
+    "/yomama": {"canonical": "/yomomma", "languages": ["en"]},
+    "/yomamma": {"canonical": "/yomomma", "languages": ["en"]},
+    "/momma": {"canonical": "/yomomma", "languages": ["en"]},
+    "/mommajoke": {"canonical": "/yomomma", "languages": ["en"]},
+    "/yomommajoke": {"canonical": "/yomomma", "languages": ["en"]},
     "/elp": {"canonical": "/elpaso", "languages": ["en"]},
     "/elpasofact": {"canonical": "/elpaso", "languages": ["en"]},
     "/elpasofacts": {"canonical": "/elpaso", "languages": ["en"]},
@@ -817,6 +833,44 @@ COMMAND_ALIASES = {
     "/meshinfo": {"canonical": "/meshinfo", "languages": ["en"]},
     "/networkinfo": {"canonical": "/meshinfo", "languages": ["en"]},
     "/meshstatus": {"canonical": "/meshinfo", "languages": ["en"]},
+    "/jokes": {"canonical": "/jokes", "languages": ["en"]},
+    "/joke": {"canonical": "/jokes", "languages": ["en"]},
+    "/funnies": {"canonical": "/jokes", "languages": ["en"]},
+    "/mudgame": {"canonical": "/mud", "languages": ["en"]},
+    "/cavalry": {"canonical": "/mud", "languages": ["en"]},
+    "/adventure": {"canonical": "/mud", "languages": ["en"]},
+    "/mudstart": {"canonical": "/mud", "languages": ["en"], "append": " start"},
+    "/mudstatus": {"canonical": "/mud", "languages": ["en"], "append": " status"},
+    "/mudrestart": {"canonical": "/mud", "languages": ["en"], "append": " restart"},
+    "/mudrules": {"canonical": "/mud", "languages": ["en"], "append": " rules"},
+    "/survival": {"canonical": "/survival", "languages": ["en"]},
+    "/survivaltips": {"canonical": "/survival", "languages": ["en"]},
+    "/desert": {"canonical": "/survival_desert", "languages": ["en"]},
+    "/urban": {"canonical": "/survival_urban", "languages": ["en"]},
+    "/city": {"canonical": "/survival_urban", "languages": ["en"]},
+    "/jungle": {"canonical": "/survival_jungle", "languages": ["en"]},
+    "/woodland": {"canonical": "/survival_woodland", "languages": ["en"]},
+    "/forest": {"canonical": "/survival_woodland", "languages": ["en"]},
+    "/winter": {"canonical": "/survival_winter", "languages": ["en"]},
+    "/cold": {"canonical": "/survival_winter", "languages": ["en"]},
+    "/medical": {"canonical": "/survival_medical", "languages": ["en"]},
+    "/firstaid": {"canonical": "/survival_medical", "languages": ["en"]},
+    "/quiz": {"canonical": "/trivia", "languages": ["en"]},
+    "/triviagame": {"canonical": "/trivia", "languages": ["en"]},
+    "/generaltrivia": {"canonical": "/trivia", "languages": ["en"]},
+    "/biblequiz": {"canonical": "/bibletrivia", "languages": ["en"]},
+    "/scripturetrivia": {"canonical": "/bibletrivia", "languages": ["en"]},
+    "/disasterquiz": {"canonical": "/disastertrivia", "languages": ["en"]},
+    "/prepquiz": {"canonical": "/disastertrivia", "languages": ["en"]},
+    "/morsetrainer": {"canonical": "/morsecodetrainer", "languages": ["en"]},
+    "/morsecourse": {"canonical": "/morsecodetrainer", "languages": ["en"]},
+    "/hurricaneprep": {"canonical": "/hurricanetrainer", "languages": ["en"]},
+    "/tornadoprep": {"canonical": "/tornadotrainer", "languages": ["en"]},
+    "/radiotrainer": {"canonical": "/radioprocedurestrainer", "languages": ["en"]},
+    "/navtrainer": {"canonical": "/navigationtrainer", "languages": ["en"]},
+    "/boattrainer": {"canonical": "/boatingtrainer", "languages": ["en"]},
+    "/boatprep": {"canonical": "/boatingtrainer", "languages": ["en"]},
+    "/emergencywellness": {"canonical": "/wellnesstrainer", "languages": ["en"]},
 
     # Spanish
     "/ayuda": {"canonical": "/help", "languages": ["es"]},
@@ -841,6 +895,43 @@ COMMAND_ALIASES = {
     "/informemalla": {"canonical": "/meshinfo", "languages": ["es"]},
     "/estadomalla": {"canonical": "/meshinfo", "languages": ["es"]},
     "/estadomesh": {"canonical": "/meshinfo", "languages": ["es"]},
+    "/bromas": {"canonical": "/jokes", "languages": ["es"]},
+    "/chistes": {"canonical": "/jokes", "languages": ["es"]},
+    "/aventura": {"canonical": "/mud", "languages": ["es"]},
+    "/caballeria": {"canonical": "/mud", "languages": ["es"]},
+    "/juego": {"canonical": "/mud", "languages": ["es"]},
+    "/supervivencia": {"canonical": "/survival", "languages": ["es"]},
+    "/sobrevivir": {"canonical": "/survival", "languages": ["es"]},
+    "/desierto": {"canonical": "/survival_desert", "languages": ["es"]},
+    "/urbano": {"canonical": "/survival_urban", "languages": ["es"]},
+    "/ciudad": {"canonical": "/survival_urban", "languages": ["es"]},
+    "/selva": {"canonical": "/survival_jungle", "languages": ["es"]},
+    "/jungla": {"canonical": "/survival_jungle", "languages": ["es"]},
+    "/bosque": {"canonical": "/survival_woodland", "languages": ["es"]},
+    "/invierno": {"canonical": "/survival_winter", "languages": ["es"]},
+    "/frio": {"canonical": "/survival_winter", "languages": ["es"]},
+    "/medico": {"canonical": "/survival_medical", "languages": ["es"]},
+    "/primerosauxilios": {"canonical": "/survival_medical", "languages": ["es"]},
+    "/triviabiblica": {"canonical": "/bibletrivia", "languages": ["es"]},
+    "/triviadesastres": {"canonical": "/disastertrivia", "languages": ["es"]},
+    "/triviageneral": {"canonical": "/trivia", "languages": ["es"]},
+    "/acertijos": {"canonical": "/trivia", "languages": ["es"]},
+    "/codigomorse": {"canonical": "/morsecodetrainer", "languages": ["es"]},
+    "/entrenadormorse": {"canonical": "/morsecodetrainer", "languages": ["es"]},
+    "/huracan": {"canonical": "/hurricanetrainer", "languages": ["es"]},
+    "/huracanes": {"canonical": "/hurricanetrainer", "languages": ["es"]},
+    "/entrenadorhuracan": {"canonical": "/hurricanetrainer", "languages": ["es"]},
+    "/tornado": {"canonical": "/tornadotrainer", "languages": ["es"]},
+    "/entrenadortornado": {"canonical": "/tornadotrainer", "languages": ["es"]},
+    "/radiocomunicacion": {"canonical": "/radioprocedurestrainer", "languages": ["es"]},
+    "/procedimientosradio": {"canonical": "/radioprocedurestrainer", "languages": ["es"]},
+    "/navegacion": {"canonical": "/navigationtrainer", "languages": ["es"]},
+    "/sinbrujula": {"canonical": "/navigationtrainer", "languages": ["es"]},
+    "/barco": {"canonical": "/boatingtrainer", "languages": ["es"]},
+    "/seguridadbarco": {"canonical": "/boatingtrainer", "languages": ["es"]},
+    "/bienestar": {"canonical": "/wellnesstrainer", "languages": ["es"]},
+    "/mascotas": {"canonical": "/wellnesstrainer", "languages": ["es"]},
+    "/bienestaremergencia": {"canonical": "/wellnesstrainer", "languages": ["es"]},
 
     # French
     "/aide": {"canonical": "/help", "languages": ["fr"]},
@@ -968,12 +1059,33 @@ BUILTIN_COMMANDS = {
     "/test",
     "/help",
     "/menu",
+    "/jokes",
+    "/mud",
+    "/bibletrivia",
+    "/disastertrivia",
+    "/trivia",
+    "/survival",
+    "/survival_desert",
+    "/survival_urban",
+    "/survival_jungle",
+    "/survival_woodland",
+    "/survival_winter",
+    "/survival_medical",
     "/weather",
     "/motd",
     "/meshinfo",
     "/bible",
     "/chucknorris",
     "/elpaso",
+    "/blond",
+    "/yomomma",
+    "/morsecodetrainer",
+    "/hurricanetrainer",
+    "/tornadotrainer",
+    "/radioprocedurestrainer",
+    "/navigationtrainer",
+    "/boatingtrainer",
+    "/wellnesstrainer",
     "/changemotd",
     "/changeprompt",
     "/showprompt",
@@ -983,6 +1095,2538 @@ BUILTIN_COMMANDS = {
 }
 
 FUZZY_COMMAND_MATCH_THRESHOLD = 0.6
+
+
+def _normalize_language_code(value: Optional[str]) -> str:
+    if not value:
+        return "en"
+    val = str(value).strip().lower()
+    if val.startswith("es") or "spanish" in val:
+        return "es"
+    return "en"
+
+
+LANGUAGE_SELECTION_CONFIG = config.get("language_selection", "english")
+LANGUAGE_FALLBACK = _normalize_language_code(LANGUAGE_SELECTION_CONFIG)
+
+
+def _preferred_menu_language(language: Optional[str]) -> str:
+    if language:
+        return _normalize_language_code(language)
+    return LANGUAGE_FALLBACK
+
+
+MENU_DEFINITIONS = {
+    "menu": {
+        "title": {
+            "en": "Main Menu - choose a tag to open a section",
+            "es": "Menú principal - elige una etiqueta para abrir una sección",
+        },
+        "sections": [
+            {
+                "title": {"en": "Getting started", "es": "Para comenzar"},
+                "items": [
+                    ("/help", {"en": "Complete list of commands.", "es": "Lista completa de comandos."}),
+                    ("/whereami", {"en": "Check your last known position.", "es": "Revisa tu última ubicación conocida."}),
+                    ("/weather <city>", {"en": "Quick weather briefing (default: El Paso).", "es": "Reporte rápido del clima (predeterminado: El Paso)."}),
+                    ("/motd", {"en": "Current message of the day.", "es": "Mensaje del día actual."}),
+                ],
+            },
+            {
+                "title": {"en": "Story & fun", "es": "Historia y diversión"},
+                "items": [
+                    ("/mud", {"en": "Cavalry choose-your-own-adventure in 1850s El Paso.", "es": "Aventura interactiva de caballería en El Paso de 1850."}),
+                    ("/jokes", {"en": "Humor submenu: Chuck Norris, blond, yo momma.", "es": "Submenú de humor: Chuck Norris, rubias, tu mamá."}),
+                    ("/bible", {"en": "Verse focused on Jesus and hope.", "es": "Versículo centrado en Jesús y la esperanza."}),
+                    ("/elpaso", {"en": "Local fact from the El Paso archives.", "es": "Dato local de los archivos de El Paso."}),
+                    ("/bibletrivia", {"en": "Score-keeping Bible trivia challenges.", "es": "Trivia bíblica con marcador."}),
+                    ("/disastertrivia", {"en": "Disaster preparedness quiz with scoring.", "es": "Trivia de preparación ante desastres con puntaje."}),
+                    ("/trivia", {"en": "General knowledge and riddles with live scoreboard.", "es": "Trivia general y acertijos con puntuación."}),
+                ],
+            },
+            {
+                "title": {"en": "Preparedness", "es": "Preparación"},
+                "items": [
+                    ("/survival", {"en": "Survival scenarios and medical guide.", "es": "Escenarios de supervivencia y guía médica."}),
+                    ("/meshinfo", {"en": "Mesh network health snapshot.", "es": "Estado de la red mesh."}),
+                    ("/emergency", {"en": "Broadcast an urgent alert.", "es": "Envía una alerta urgente."}),
+                ],
+            },
+            {
+                "title": {"en": "Skill trainers", "es": "Entrenadores de habilidades"},
+                "items": [
+                    ("/morsecodetrainer", {"en": "Short Morse code drills and challenges.", "es": "Ejercicios cortos de código Morse."}),
+                    ("/hurricanetrainer", {"en": "Hurricane prep: pre, during, and post checklists.", "es": "Entrenador para huracanes: antes, durante y después."}),
+                    ("/tornadotrainer", {"en": "Tornado safety rehearsal guidance.", "es": "Guía para ensayar seguridad ante tornados."}),
+                    ("/radioprocedurestrainer", {"en": "Emergency radio procedure drills.", "es": "Entrenador de procedimientos de radio de emergencia."}),
+                    ("/navigationtrainer", {"en": "Navigate without a compass practice routines.", "es": "Rutinas para navegar sin brújula."}),
+                    ("/boatingtrainer", {"en": "Boating safety briefings and drills.", "es": "Entrenador de seguridad náutica."}),
+                    ("/wellnesstrainer", {"en": "Emergency wellness for pets and homes in long outages.", "es": "Bienestar en emergencias para mascotas y hogar."}),
+                ],
+            },
+        ],
+        "footer": {
+            "en": "Tip: enter the tag (for example /survival) to open that submenu.",
+            "es": "Consejo: escribe la etiqueta (por ejemplo /survival) para abrir ese submenú.",
+        },
+    },
+    "jokes": {
+        "title": {"en": "Humor submenu", "es": "Submenú de humor"},
+        "sections": [
+            {
+                "title": {"en": "Pick a flavor", "es": "Elige un estilo"},
+                "items": [
+                    ("/chucknorris", {"en": "Legendary Chuck Norris fact.", "es": "Dato legendario de Chuck Norris."}),
+                    ("/blond", {"en": "Light-hearted blond joke.", "es": "Chiste ligero de rubias."}),
+                    ("/yomomma", {"en": "Classic yo momma joke.", "es": "Chiste clásico de tu mamá."}),
+                ],
+            },
+        ],
+        "footer": {
+            "en": "Need more laughs? Try adding your own with /funfact <topic>.",
+            "es": "¿Quieres más risas? Agrega las tuyas con /funfact <tema>.",
+        },
+    },
+    "survival": {
+        "title": {"en": "Survival submenu", "es": "Submenú de supervivencia"},
+        "sections": [
+            {
+                "title": {"en": "Choose a scenario", "es": "Elige un escenario"},
+                "items": [
+                    ("/survival_desert", {"en": "Beat the heat and ration water wisely.", "es": "Supera el calor y raciona el agua con sabiduría."}),
+                    ("/survival_urban", {"en": "Navigate cities during disruption.", "es": "Navega la ciudad durante una crisis."}),
+                    ("/survival_jungle", {"en": "Stay dry, avoid hazards, find clean water.", "es": "Mantente seco, evita riesgos y encuentra agua limpia."}),
+                    ("/survival_woodland", {"en": "Use forests for cover, food, and orientation.", "es": "Usa el bosque para cobertura, comida y orientación."}),
+                    ("/survival_winter", {"en": "Fight hypothermia and manage snow shelter.", "es": "Combate la hipotermia y gestiona refugios en nieve."}),
+                    ("/survival_medical", {"en": "Field-ready first aid essentials.", "es": "Primeros auxilios esenciales en campo."}),
+                ],
+            },
+        ],
+        "footer": {
+            "en": "Carry these notes offline and share them freely.",
+            "es": "Lleva estas notas sin conexión y compártelas con quien lo necesite.",
+        },
+    },
+}
+
+
+SURVIVAL_GUIDES = {
+    "/survival_desert": {
+        "title": {
+            "en": "Desert survival snapshot",
+            "es": "Guía rápida de supervivencia en el desierto",
+        },
+        "points": [
+            {"en": "Sip water every 15-20 minutes; shade your containers to slow evaporation.", "es": "Bebe sorbos de agua cada 15-20 minutos; mantén los recipientes a la sombra para reducir la evaporación."},
+            {"en": "Travel at dawn or dusk, rest under improvised shade during peak sun.", "es": "Viaja al amanecer o atardecer y descansa bajo sombra improvisada durante el sol intenso."},
+            {"en": "Layer clothing: loose, light fabrics trap cooler air and prevent sunburn.", "es": "Usa ropa holgada y ligera; las capas atrapan aire fresco y evitan quemaduras."},
+            {"en": "Signal rescuers with mirrors, bright cloth, or large ground symbols visible from above.", "es": "Señala a rescatistas con espejos, tela brillante o símbolos grandes en el suelo visibles desde el aire."},
+            {"en": "Ration sweat, not thirst—slow your pace, use ground cover, and avoid metal equipment in direct sun.", "es": "Raciona el esfuerzo, no la sed; camina despacio, usa coberturas y evita herramientas metálicas al sol."},
+        ],
+        "reflection": {
+            "en": "Stay calm: like water shared freely, grace grows when we lift one another.",
+            "es": "Mantén la calma: así como el agua compartida, la gracia crece cuando levantamos a otros.",
+        },
+    },
+    "/survival_urban": {
+        "title": {
+            "en": "Urban survival snapshot",
+            "es": "Guía rápida de supervivencia urbana",
+        },
+        "points": [
+            {"en": "Map safe zones: hospitals, churches, and community centers often host aid.", "es": "Identifica zonas seguras: hospitales, iglesias y centros comunitarios suelen brindar ayuda."},
+            {"en": "Keep a low profile—blend in, avoid predictable routines, and move with purpose.", "es": "Mantén un perfil bajo; evita rutinas predecibles y muévete con propósito."},
+            {"en": "Secure shelter above ground level to limit flooding and control entry points.", "es": "Busca refugio por encima del nivel del suelo para evitar inundaciones y controlar accesos."},
+            {"en": "Harvest resources: rainwater from gutters, tools from maintenance closets, info from local radio.", "es": "Aprovecha recursos: agua de lluvia de canaletas, herramientas de mantenimiento e información de radio local."},
+            {"en": "Organize neighbors for watch rotations—community care deters conflict.", "es": "Organiza turnos vecinales de vigilancia; el cuidado comunitario disuade conflictos."},
+        ],
+        "reflection": {
+            "en": "Seek peace in every doorway; a gentle word can steady a whole block.",
+            "es": "Busca la paz en cada puerta; una palabra amable puede sostener a toda la cuadra.",
+        },
+    },
+    "/survival_jungle": {
+        "title": {
+            "en": "Jungle survival snapshot",
+            "es": "Guía rápida de supervivencia en la selva",
+        },
+        "points": [
+            {"en": "Stay dry: elevated shelters and hammocks keep you above insects and runoff.", "es": "Mantente seco: refugios elevados y hamacas te aíslan de insectos y escorrentías."},
+            {"en": "Collect rainwater with tarps or broad leaves and filter before drinking.", "es": "Recolecta lluvia con lonas o hojas grandes y filtra antes de beber."},
+            {"en": "Track daylight with a machete notch on trees—helps prevent circling back.", "es": "Marca los árboles con machete para seguir el progreso y evitar caminar en círculos."},
+            {"en": "Avoid bright fruit or insects with bold patterns—they often signal toxins.", "es": "Evita frutos brillantes o insectos con patrones llamativos; suelen ser tóxicos."},
+            {"en": "Smoke damp leaves to repel mosquitoes and signal companions.", "es": "Quema hojas húmedas para ahuyentar mosquitos y señalar a los compañeros."},
+        ],
+        "reflection": {
+            "en": "Even in thick canopy, light breaks through—hold to hope and guide others gently.",
+            "es": "Aun bajo el dosel denso, la luz se abre paso; mantén la esperanza y guía con mansedumbre.",
+        },
+    },
+    "/survival_woodland": {
+        "title": {
+            "en": "Woodland survival snapshot",
+            "es": "Guía rápida de supervivencia en bosques",
+        },
+        "points": [
+            {"en": "Layer clothing and keep waterproof shells accessible as weather swings quickly.", "es": "Usa capas de ropa y ten a mano prendas impermeables; el clima cambia rápido."},
+            {"en": "Use tree moss growth and prevailing wind patterns to stay oriented.", "es": "Usa el musgo en los árboles y la dirección del viento para orientarte."},
+            {"en": "Forage responsibly: pine needles for vitamin C tea, cattails for starch.", "es": "Forrajea con responsabilidad: agujas de pino para té con vitamina C, tule para almidón."},
+            {"en": "Build reflector fires against logs or rocks to bounce heat into shelter.", "es": "Construye fogatas con reflectores usando troncos o rocas para reflejar calor al refugio."},
+            {"en": "Mark trails with biodegradable ribbon or carved arrows to aid rescue teams.", "es": "Marca el camino con cintas biodegradables o flechas talladas para ayudar a rescatistas."},
+        ],
+        "reflection": {
+            "en": "Walk softly; stewardship of creation mirrors the Shepherd who restores souls.",
+            "es": "Camina con suavidad; cuidar la creación refleja al Pastor que restaura almas.",
+        },
+    },
+    "/survival_winter": {
+        "title": {
+            "en": "Winter survival snapshot",
+            "es": "Guía rápida de supervivencia invernal",
+        },
+        "points": [
+            {"en": "Stack layers: wicking base, insulating core, windproof shell.", "es": "Usa capas: base que absorba humedad, capa aislante y exterior a prueba de viento."},
+            {"en": "Vent shelters to prevent carbon monoxide when using stoves or fires.", "es": "Ventila los refugios para evitar monóxido de carbono al usar estufas o fogatas."},
+            {"en": "Keep water in insulated containers upside-down so the surface ice forms near the lid.", "es": "Guarda el agua en recipientes aislados boca abajo para que el hielo se forme cerca de la tapa."},
+            {"en": "Travel with snowshoes or improvised platforms to avoid postholing and conserve energy.", "es": "Camina con raquetas o plataformas improvisadas para evitar hundirte y ahorrar energía."},
+            {"en": "Warm companions by sharing shelter, hot drinks, and songs that lift morale.", "es": "Calienta a tus compañeros compartiendo refugio, bebidas calientes y cantos que animen."},
+        ],
+        "reflection": {
+            "en": "Hope is a shared fire—tend it together until the thaw arrives.",
+            "es": "La esperanza es un fuego compartido; cuídenlo juntos hasta que llegue el deshielo.",
+        },
+    },
+    "/survival_medical": {
+        "title": {
+            "en": "Field medical snapshot",
+            "es": "Guía rápida de primeros auxilios",
+        },
+        "points": [
+            {"en": "Check ABCs: airway clear, breathing steady, circulation supported with direct pressure.", "es": "Revisa ABC: vía aérea despejada, respiración estable, circulación apoyada con presión directa."},
+            {"en": "Stop severe bleeding with pressure dressings or improvised tourniquets two inches above the wound.", "es": "Detén hemorragias con vendajes a presión o torniquetes improvisados a 5 cm por encima de la herida."},
+            {"en": "Stabilize fractures using splints padded with cloth; immobilize joints above and below.", "es": "Estabiliza fracturas con férulas acolchadas; inmoviliza las articulaciones arriba y abajo."},
+            {"en": "Track vitals every 10 minutes—note pulse, breathing rate, and responsiveness.", "es": "Registra signos vitales cada 10 minutos: pulso, respiración y nivel de respuesta."},
+            {"en": "Document allergies, meds, and events; hand the notes to first responders.", "es": "Anota alergias, medicamentos y eventos; entrega las notas a los rescatistas."},
+        ],
+        "reflection": {
+            "en": "Serve with compassion—healing hands point to the Great Physician.",
+            "es": "Sirve con compasión; las manos que sanan señalan al Gran Médico.",
+        },
+    },
+}
+
+SURVIVAL_REFLECTION_LABEL = {"en": "Faith focus", "es": "Enfoque de fe"}
+
+CAVALRY_SCENE_ICONS = {
+    "fort_bliss_muster": "🏇",
+    "chapel_reflection": "🕯️",
+    "rio_patrol": "🌊",
+    "mountain_recon": "🗻",
+    "mesilla_market": "🛍️",
+    "contraband_shootout": "⚠️",
+}
+
+CAVALRY_ASCII_BANNER = (
+    "    /\\",
+    "   /::\\   Frontier Riders",
+    "  /::::\\  Keep hope alive",
+    " /::::::\\ Choose the peaceful trail",
+    "/::::::::\\"
+)
+
+CAVALRY_CHOICE_MARKERS = ("🌵", "🪶", "🛤️", "🔥")
+
+CAVALRY_INTRO_LINES = {
+    "en": [
+        "🏜️ Scenario: 1858 Fort Bliss cavalry patrols guarding the new border around El Paso.",
+        "🧭 How to move: reply with `/mud <number>` to follow a choice, `/mud status` to reread, `/mud restart` to begin anew.",
+        "🎖️ Goal: gather gold with integrity—mercy often unlocks redemption. Use `/mud rules` for full guidance.",
+    ],
+    "es": [
+        "🏜️ Escenario: caballería de Fort Bliss en 1858 cuidando la nueva frontera de El Paso.",
+        "🧭 Cómo moverte: responde con `/mud <numero>` para escoger, `/mud status` para releer, `/mud restart` para reiniciar.",
+        "🎖️ Meta: reúne oro con integridad; la misericordia abre finales de redención. Usa `/mud rules` para la guía completa.",
+    ],
+}
+
+CAVALRY_RULES_TEXT = {
+    "en": "MUD Rules:\n- 📅 Timeline: 1858 Fort Bliss cavalry posts across the Rio Grande valley.\n- 🎯 Aim: collect gold ethically; decisions adjust your Gold and Integrity meters. Integrity below zero risks bleak endings.\n- 🧭 Navigation: `/mud start`, then answer with `/mud <number>`. Use `/mud status` to reread, `/mud restart` for a new run, `/mud rules` for this recap.\n- 🤝 Etiquette: wait for each reply; chunks pace about every 5s to respect the mesh bandwidth.",
+    "es": "Reglas del MUD:\n- 📅 Época: caballería de Fort Bliss en 1858 a lo largo del valle del Río Grande.\n- 🎯 Objetivo: reunir oro con ética; las decisiones ajustan tus medidores de Oro e Integridad. Con integridad negativa llegan finales duros.\n- 🧭 Navegación: `/mud start` y luego responde con `/mud <numero>`. Usa `/mud status` para releer, `/mud restart` para reiniciar, `/mud rules` para este resumen.\n- 🤝 Etiqueta: espera cada respuesta; los fragmentos se envían cada 5 s para cuidar el ancho de banda de la malla.",
+}
+
+@dataclass
+class TriviaSession:
+    player_key: str
+    category: str
+    score: int = 0
+    total: int = 0
+    asked_ids: Set[str] = field(default_factory=set)
+    current_id: Optional[str] = None
+    language: str = "en"
+    owner_id: Optional[str] = None
+    channel_idx: Optional[int] = None
+    is_direct: bool = True
+    display_name: Optional[str] = None
+
+
+TRIVIA_STATE_FILE = "trivia_state.json"
+TRIVIA_SESSIONS: Dict[str, TriviaSession] = {}
+
+TRIVIA_CATEGORY_TITLES = {
+    "bible": {"en": "Bible Trivia", "es": "Trivia Bíblica"},
+    "disaster": {"en": "Disaster Prep Trivia", "es": "Trivia de preparación"},
+    "general": {"en": "General Trivia", "es": "Trivia general"},
+}
+
+TRIVIA_CATEGORY_EMOJI = {
+    "bible": "📖",
+    "disaster": "🛡️",
+    "general": "🧠",
+}
+
+TRIVIA_STRINGS = {
+    "en": {
+        "question_intro": "{icon} {title} challenge:",
+        "choices_intro": "📝 Choices:",
+        "answer_prompt": "✍️ Reply with `{command} <answer>`.",
+        "correct": "✅ Correct! 🎉 {explanation}",
+        "correct_no_expl": "✅ Correct! 🎉",
+        "incorrect": "❌ Not quite. The answer is {answer}. ℹ️ {explanation}",
+        "incorrect_no_expl": "❌ Not quite. The answer is {answer}.",
+        "score_line": "📊 Score: {score}/{total} correct ({percent}%).",
+        "new_question": "✨ Next question:",
+        "skipped": "⏭️ Skipped! Here's a fresh question:",
+        "no_question": "🪧 Request a new question first with `{command}`.",
+        "no_questions": "😅 No questions available in this category right now.",
+        "no_scores": "📭 No scores yet for this category.",
+        "leaderboard_title": "🏆 Leaderboard — {title}",
+        "leaderboard_entry": "{rank}. {name}: {score}/{total} ({percent}%)",
+        "your_score": "🎯 Your score: {score}/{total} ({percent}%).",
+    },
+    "es": {
+        "question_intro": "{icon} Pregunta de {title}:",
+        "choices_intro": "📝 Opciones:",
+        "answer_prompt": "✍️ Responde con `{command} <respuesta>`.",
+        "correct": "✅ ¡Correcto! 🎉 {explanation}",
+        "correct_no_expl": "✅ ¡Correcto! 🎉",
+        "incorrect": "❌ Casi. La respuesta es {answer}. ℹ️ {explanation}",
+        "incorrect_no_expl": "❌ Casi. La respuesta es {answer}.",
+        "score_line": "📊 Puntaje: {score}/{total} aciertos ({percent}%).",
+        "new_question": "✨ Siguiente pregunta:",
+        "skipped": "⏭️ ¡Pregunta saltada! Aquí tienes una nueva:",
+        "no_question": "🪧 Primero pide una pregunta nueva con `{command}`.",
+        "no_questions": "😅 No hay preguntas disponibles en esta categoría por ahora.",
+        "no_scores": "📭 Aún no hay puntuaciones para esta categoría.",
+        "leaderboard_title": "🏆 Tabla de posiciones — {title}",
+        "leaderboard_entry": "{rank}. {name}: {score}/{total} ({percent}%)",
+        "your_score": "🎯 Tu puntaje: {score}/{total} ({percent}%).",
+    },
+}
+
+def _localized_text(value: Any, language: str) -> str:
+    if isinstance(value, dict):
+        lang_order: List[str] = []
+        normalized = _normalize_language_code(language)
+        if normalized:
+            lang_order.append(normalized)
+        if LANGUAGE_FALLBACK not in lang_order:
+            lang_order.append(LANGUAGE_FALLBACK)
+        if "en" not in lang_order:
+            lang_order.append("en")
+        for key in lang_order:
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        for candidate in value.values():
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        return ""
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _localized_list(value: Any, language: str) -> List[str]:
+    if isinstance(value, dict):
+        lang_order: List[str] = []
+        normalized = _normalize_language_code(language)
+        if normalized:
+            lang_order.append(normalized)
+        if LANGUAGE_FALLBACK not in lang_order:
+            lang_order.append(LANGUAGE_FALLBACK)
+        if "en" not in lang_order:
+            lang_order.append("en")
+        for key in lang_order:
+            candidate = value.get(key)
+            if isinstance(candidate, list) and candidate:
+                return [str(item) for item in candidate]
+            if isinstance(candidate, str) and candidate:
+                return [str(candidate)]
+        for candidate in value.values():
+            if isinstance(candidate, list) and candidate:
+                return [str(item) for item in candidate]
+            if isinstance(candidate, str) and candidate:
+                return [str(candidate)]
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    if isinstance(value, str) and value:
+        return [value]
+    return []
+
+
+
+TRIVIA_BANK: Dict[str, List[Dict[str, Any]]] = {
+    "bible": [
+        {
+            "id": "b1",
+            "question": {
+                "en": "Who interpreted Pharaoh's dreams about seven years of plenty and seven years of famine?",
+                "es": "¿Quién interpretó los sueños del faraón sobre siete años de abundancia y siete de hambre?",
+            },
+            "answers": ["joseph", "jose", "josé"],
+            "answer_display": {"en": "Joseph", "es": "José"},
+            "choices": {
+                "en": ["Joseph", "Moses", "Daniel", "Aaron"],
+                "es": ["José", "Moisés", "Daniel", "Aarón"],
+            },
+            "explanation": {
+                "en": "Genesis 41 records Joseph interpreting Pharaoh's dreams and planning to store grain.",
+                "es": "Génesis 41 relata cómo José interpretó los sueños del faraón y planificó almacenar grano.",
+            },
+        },
+        {
+            "id": "b2",
+            "question": {
+                "en": "On which road was Saul travelling when he encountered a blinding light from heaven?",
+                "es": "¿En qué camino viajaba Saulo cuando encontró una luz cegadora del cielo?",
+            },
+            "answers": ["damascus", "road to damascus", "camino a damasco"],
+            "answer_display": {"en": "Road to Damascus", "es": "Camino a Damasco"},
+            "choices": {
+                "en": ["Road to Damascus", "Emmaus Road", "Bethany Road", "Jericho Road"],
+                "es": ["Camino a Damasco", "Camino a Emaús", "Camino a Betania", "Camino a Jericó"],
+            },
+            "explanation": {
+                "en": "Acts 9 describes Saul meeting Jesus on the road to Damascus.",
+                "es": "Hechos 9 describe a Saulo encontrándose con Jesús en el camino a Damasco.",
+            },
+        },
+        {
+            "id": "b3",
+            "question": {
+                "en": "Which prophet confronted King Ahab and the prophets of Baal on Mount Carmel?",
+                "es": "¿Qué profeta enfrentó al rey Acab y a los profetas de Baal en el monte Carmelo?",
+            },
+            "answers": ["elijah", "elias", "elías"],
+            "answer_display": {"en": "Elijah", "es": "Elías"},
+            "choices": {
+                "en": ["Elijah", "Elisha", "Isaiah", "Micah"],
+                "es": ["Elías", "Eliseo", "Isaías", "Miqueas"],
+            },
+            "explanation": {
+                "en": "1 Kings 18 recounts Elijah calling down fire on Mount Carmel.",
+                "es": "1 Reyes 18 narra cómo Elías invocó fuego en el monte Carmelo.",
+            },
+        },
+        {
+            "id": "b4",
+            "question": {
+                "en": "In the Gospel of John, what was Jesus' first recorded miracle?",
+                "es": "Según el evangelio de Juan, ¿cuál fue el primer milagro registrado de Jesús?",
+            },
+            "answers": [
+                "water into wine",
+                "turned water into wine",
+                "water to wine",
+                "wine",
+                "agua en vino",
+                "convertir el agua en vino",
+            ],
+            "answer_display": {"en": "Turning water into wine", "es": "Convertir el agua en vino"},
+            "choices": {
+                "en": [
+                    "Turning water into wine",
+                    "Feeding the 5,000",
+                    "Walking on water",
+                    "Healing a blind man",
+                ],
+                "es": [
+                    "Convertir el agua en vino",
+                    "Alimentar a los 5,000",
+                    "Caminar sobre el agua",
+                    "Sanar a un ciego",
+                ],
+            },
+            "explanation": {
+                "en": "John 2 narrates Jesus turning water into wine at the wedding in Cana.",
+                "es": "Juan 2 narra cómo Jesús convirtió el agua en vino en las bodas de Caná.",
+            },
+        },
+        {
+            "id": "b5",
+            "question": {
+                "en": "Which Old Testament book contains the verse, 'The LORD is my shepherd'?",
+                "es": "¿Qué libro del Antiguo Testamento contiene el versículo 'El Señor es mi pastor'?",
+            },
+            "answers": ["psalms", "psalm", "psalm 23", "salmos", "salmo 23"],
+            "answer_display": {"en": "Psalms", "es": "Salmos"},
+            "choices": {
+                "en": ["Psalms", "Proverbs", "Isaiah", "Deuteronomy"],
+                "es": ["Salmos", "Proverbios", "Isaías", "Deuteronomio"],
+            },
+            "explanation": {
+                "en": "Psalm 23 opens with 'The LORD is my shepherd; I shall not want.'",
+                "es": "El Salmo 23 comienza con 'El Señor es mi pastor; nada me faltará.'",
+            },
+        },
+        {
+            "id": "b6",
+            "question": {
+                "en": "Who was the only disciple to walk on water toward Jesus before beginning to sink?",
+                "es": "¿Qué discípulo caminó sobre el agua hacia Jesús antes de comenzar a hundirse?",
+            },
+            "answers": ["peter", "simon peter", "pedro"],
+            "answer_display": {"en": "Peter", "es": "Pedro"},
+            "choices": {
+                "en": ["Peter", "John", "Andrew", "Thomas"],
+                "es": ["Pedro", "Juan", "Andrés", "Tomás"],
+            },
+            "explanation": {
+                "en": "Matthew 14:28-31 describes Peter stepping out of the boat toward Jesus.",
+                "es": "Mateo 14:28-31 describe a Pedro saliendo de la barca hacia Jesús.",
+            },
+        },
+        {
+            "id": "b7",
+            "question": {
+                "en": "What did God provide for the Israelites each morning in the wilderness to eat?",
+                "es": "¿Qué proporcionó Dios cada mañana en el desierto para que comieran los israelitas?",
+            },
+            "answers": ["manna", "mana", "maná"],
+            "answer_display": {"en": "Manna", "es": "Maná"},
+            "choices": {
+                "en": ["Manna", "Quail", "Bread from Egypt", "Figs"],
+                "es": ["Maná", "Codornices", "Pan de Egipto", "Higos"],
+            },
+            "explanation": {
+                "en": "Exodus 16 notes that manna appeared with the dew each morning.",
+                "es": "Éxodo 16 indica que el maná aparecía con el rocío cada mañana.",
+            },
+        },
+        {
+            "id": "b8",
+            "question": {
+                "en": "Which apostle is known for doubting the resurrection until he saw Jesus' wounds?",
+                "es": "¿Qué apóstol dudó de la resurrección hasta ver las heridas de Jesús?",
+            },
+            "answers": ["thomas", "doubting thomas", "tomas", "tomás"],
+            "answer_display": {"en": "Thomas", "es": "Tomás"},
+            "choices": {
+                "en": ["Thomas", "Philip", "James", "Bartholomew"],
+                "es": ["Tomás", "Felipe", "Santiago", "Bartolomé"],
+            },
+            "explanation": {
+                "en": "John 20 describes Thomas insisting on touching Jesus' wounds before believing.",
+                "es": "Juan 20 describe a Tomás insistiendo en tocar las heridas de Jesús antes de creer.",
+            },
+        },
+    ],
+    "disaster": [
+        {
+            "id": "d1",
+            "question": {
+                "en": "How much water should you store per person per day for emergency readiness?",
+                "es": "¿Cuánta agua debes almacenar por persona por día para estar preparado ante emergencias?",
+            },
+            "answers": [
+                "1 gallon",
+                "one gallon",
+                "about 1 gallon",
+                "3.8 liters",
+                "38 liters",
+                "un galon",
+                "un galón",
+                "38 litros",
+            ],
+            "answer_display": {"en": "1 gallon (3.8 L)", "es": "1 galón (3.8 L)"},
+            "choices": {
+                "en": ["1 gallon (3.8 L)", "Half gallon", "2 gallons", "One quart"],
+                "es": ["1 galón (3.8 L)", "Medio galón", "2 galones", "Un cuarto"],
+            },
+            "explanation": {
+                "en": "FEMA recommends about one gallon (3.8 liters) of water per person per day.",
+                "es": "FEMA recomienda alrededor de un galón (3.8 litros) de agua por persona por día.",
+            },
+        },
+        {
+            "id": "d2",
+            "question": {
+                "en": "During a tornado warning inside a sturdy building, where should you shelter?",
+                "es": "Durante una alerta de tornado dentro de un edificio sólido, ¿dónde debes refugiarte?",
+            },
+            "answers": [
+                "interior room",
+                "lowest level interior room",
+                "basement",
+                "safe room",
+                "bathroom",
+                "closet",
+                "cuarto interior",
+                "sotano",
+                "sótano",
+                "cuarto seguro",
+                "banera",
+                "baño",
+                "closet interior",
+            ],
+            "answer_display": {"en": "Interior room on the lowest floor", "es": "Cuarto interior en el nivel más bajo"},
+            "choices": {
+                "en": ["Interior room on the lowest floor", "Near exterior windows", "Top floor balcony", "Garage"],
+                "es": ["Cuarto interior en el nivel más bajo", "Cerca de ventanas exteriores", "Balcón del último piso", "Garaje"],
+            },
+            "explanation": {
+                "en": "Emergency managers advise sheltering in an interior room on the lowest level, away from windows.",
+                "es": "Los servicios de emergencia aconsejan refugiarse en un cuarto interior en el nivel más bajo, lejos de las ventanas.",
+            },
+        },
+        {
+            "id": "d3",
+            "question": {
+                "en": "Which item is best to include in a go-bag for prolonged power outages?",
+                "es": "¿Qué artículo es mejor incluir en una mochila de emergencia para apagones prolongados?",
+            },
+            "answers": [
+                "battery radio",
+                "hand crank radio",
+                "hand-crank radio",
+                "radio",
+                "radio de manivela",
+                "radio a baterias",
+                "radio a baterías",
+            ],
+            "answer_display": {"en": "Hand-crank or battery-powered radio", "es": "Radio de manivela o a baterías"},
+            "choices": {
+                "en": ["Hand-crank or battery-powered radio", "Electric can opener", "Desktop computer", "Metal detector"],
+                "es": ["Radio de manivela o a baterías", "Abrelatas eléctrico", "Computadora de escritorio", "Detector de metales"],
+            },
+            "explanation": {
+                "en": "A hand-crank or battery-powered radio keeps you informed when power and internet fail.",
+                "es": "Una radio de manivela o a baterías te mantiene informado cuando falla la energía y el internet.",
+            },
+        },
+        {
+            "id": "d4",
+            "question": {
+                "en": "When a hurricane is approaching, what should you do with important documents?",
+                "es": "Cuando se aproxima un huracán, ¿qué debes hacer con los documentos importantes?",
+            },
+            "answers": [
+                "waterproof container",
+                "seal them",
+                "store in waterproof bag",
+                "scan them",
+                "contenedor impermeable",
+                "bolsa impermeable",
+                "escanealos",
+                "respaldo digital",
+            ],
+            "answer_display": {"en": "Seal them in a waterproof container", "es": "Sellarlos en un contenedor impermeable"},
+            "choices": {
+                "en": ["Seal them in a waterproof container", "Leave them on the desk", "Mail them to friends", "Recycle them"],
+                "es": ["Sellarlos en un contenedor impermeable", "Dejarlos sobre el escritorio", "Enviarlos por correo a amigos", "Reciclarlos"],
+            },
+            "explanation": {
+                "en": "Store vital documents in waterproof containers or cloud backups before a storm.",
+                "es": "Guarda los documentos vitales en recipientes impermeables o respaldos digitales antes de la tormenta.",
+            },
+        },
+        {
+            "id": "d5",
+            "question": {
+                "en": "What is the recommended action if you smell gas after an earthquake?",
+                "es": "¿Qué acción se recomienda si hueles gas después de un terremoto?",
+            },
+            "answers": [
+                "leave immediately",
+                "evacuate",
+                "get outside",
+                "turn off gas and leave",
+                "salir de inmediato",
+                "evacuar",
+                "apagar el gas y salir",
+            ],
+            "answer_display": {"en": "Leave immediately and notify authorities", "es": "Salir de inmediato y avisar a las autoridades"},
+            "choices": {
+                "en": ["Leave the building immediately and notify authorities", "Light a candle to see better", "Open all electrical switches", "Stay and investigate"],
+                "es": ["Salir de inmediato y avisar a las autoridades", "Encender una vela para ver mejor", "Abrir todos los interruptores", "Quedarse a investigar"],
+            },
+            "explanation": {
+                "en": "Leave immediately to avoid ignition and notify professionals to inspect the leak.",
+                "es": "Sal de inmediato para evitar una ignición y avisa a los profesionales para que inspeccionen la fuga.",
+            },
+        },
+        {
+            "id": "d6",
+            "question": {
+                "en": "How often should you test the batteries in smoke alarms?",
+                "es": "¿Con qué frecuencia debes probar las baterías de las alarmas de humo?",
+            },
+            "answers": ["monthly", "once a month", "every month", "mensualmente", "cada mes"],
+            "answer_display": {"en": "Monthly", "es": "Mensualmente"},
+            "choices": {
+                "en": ["Monthly", "Once a year", "Only after a fire", "Never"],
+                "es": ["Mensualmente", "Una vez al año", "Solo después de un incendio", "Nunca"],
+            },
+            "explanation": {
+                "en": "Fire safety guidelines advise testing smoke alarms monthly.",
+                "es": "Las normas de seguridad contra incendios aconsejan probar las alarmas de humo cada mes.",
+            },
+        },
+        {
+            "id": "d7",
+            "question": {
+                "en": "What is the minimum recommended length of non-perishable food supply for at-home sheltering?",
+                "es": "¿Cuál es la reserva mínima recomendada de alimentos no perecederos para refugiarse en casa?",
+            },
+            "answers": ["3 days", "three days", "72 hours", "tres dias", "tres días", "72 horas"],
+            "answer_display": {"en": "3 days", "es": "3 días"},
+            "choices": {
+                "en": ["3 days", "12 hours", "1 day", "8 days"],
+                "es": ["3 días", "12 horas", "1 día", "8 días"],
+            },
+            "explanation": {
+                "en": "Most emergency planners advise at least a three-day (72-hour) supply per person.",
+                "es": "La mayoría de los planificadores recomiendan al menos tres días (72 horas) de alimentos por persona.",
+            },
+        },
+        {
+            "id": "d8",
+            "question": {
+                "en": "During a wildfire evacuation notice, what should you avoid doing with the windows?",
+                "es": "Si hay una orden de evacuación por incendio forestal, ¿qué debes evitar hacer con las ventanas?",
+            },
+            "answers": ["leave them open", "open", "opening", "dejarlas abiertas", "abrirlas"],
+            "answer_display": {"en": "Keep them closed", "es": "Mantenerlas cerradas"},
+            "choices": {
+                "en": ["Keep them closed to prevent embers entering", "Prop them open for air", "Remove the screens", "Cover with foil"],
+                "es": ["Mantenerlas cerradas para evitar que entren brasas", "Dejarlas abiertas para ventilar", "Quitar las mallas", "Cubrirlas con papel aluminio"],
+            },
+            "explanation": {
+                "en": "Keeping windows closed helps stop embers and smoke from entering the structure.",
+                "es": "Mantener las ventanas cerradas evita que entren brasas y humo en la vivienda.",
+            },
+        },
+    ],
+    "general": [
+        {
+            "id": "g1",
+            "question": {
+                "en": "What is the largest planet in our solar system?",
+                "es": "¿Cuál es el planeta más grande de nuestro sistema solar?",
+            },
+            "answers": ["jupiter", "júpiter"],
+            "answer_display": {"en": "Jupiter", "es": "Júpiter"},
+            "choices": {
+                "en": ["Jupiter", "Saturn", "Neptune", "Earth"],
+                "es": ["Júpiter", "Saturno", "Neptuno", "Tierra"],
+            },
+            "explanation": {
+                "en": "Jupiter is the largest planet with a diameter of about 143,000 km.",
+                "es": "Júpiter es el planeta más grande con un diámetro de unos 143,000 km.",
+            },
+        },
+        {
+            "id": "g2",
+            "question": {
+                "en": "Riddle: I speak without a mouth and hear without ears. I have nobody, but I come alive with wind. What am I?",
+                "es": "Adivinanza: Hablo sin boca y escucho sin oídos. No tengo cuerpo, pero cobro vida con el viento. ¿Qué soy?",
+            },
+            "answers": ["echo", "eco"],
+            "answer_display": {"en": "Echo", "es": "Eco"},
+            "choices": {"en": [], "es": []},
+            "explanation": {
+                "en": "An echo reflects sound even without a body.",
+                "es": "Un eco refleja el sonido incluso sin un cuerpo físico.",
+            },
+        },
+        {
+            "id": "g3",
+            "question": {
+                "en": "Which scientist presented the three laws of motion in 'Philosophiæ Naturalis Principia Mathematica'?",
+                "es": "¿Qué científico presentó las tres leyes del movimiento en 'Philosophiæ Naturalis Principia Mathematica'?",
+            },
+            "answers": ["isaac newton", "newton", "sir isaac newton"],
+            "answer_display": {"en": "Isaac Newton", "es": "Isaac Newton"},
+            "choices": {
+                "en": ["Isaac Newton", "Albert Einstein", "Galileo Galilei", "Niels Bohr"],
+                "es": ["Isaac Newton", "Albert Einstein", "Galileo Galilei", "Niels Bohr"],
+            },
+            "explanation": {
+                "en": "Isaac Newton published the Principia in 1687 outlining the laws of motion.",
+                "es": "Isaac Newton publicó los Principia en 1687, delineando las leyes del movimiento.",
+            },
+        },
+        {
+            "id": "g4",
+            "question": {
+                "en": "In what year did humans first walk on the Moon?",
+                "es": "¿En qué año caminaron por primera vez los humanos en la Luna?",
+            },
+            "answers": ["1969", "nineteen sixty nine", "mil novecientos sesenta y nueve"],
+            "answer_display": {"en": "1969", "es": "1969"},
+            "choices": {
+                "en": ["1969", "1959", "1972", "1981"],
+                "es": ["1969", "1959", "1972", "1981"],
+            },
+            "explanation": {
+                "en": "Apollo 11 landed on July 20, 1969.",
+                "es": "El Apolo 11 alunizó el 20 de julio de 1969.",
+            },
+        },
+        {
+            "id": "g5",
+            "question": {
+                "en": "Riddle: What has keys but can't open locks, space but no room, and you can enter but not go outside?",
+                "es": "Adivinanza: ¿Qué tiene teclas pero no abre cerraduras, tiene espacio pero no habitaciones, y puedes entrar pero no salir?",
+            },
+            "answers": ["keyboard", "teclado"],
+            "answer_display": {"en": "Keyboard", "es": "Teclado"},
+            "choices": {"en": [], "es": []},
+            "explanation": {
+                "en": "A computer keyboard fits all the clues.",
+                "es": "Un teclado de computadora encaja con todas las pistas.",
+            },
+        },
+        {
+            "id": "g6",
+            "question": {
+                "en": "Which ocean current keeps Western Europe warmer than other regions at similar latitudes?",
+                "es": "¿Qué corriente oceánica mantiene a Europa occidental más cálida que otras regiones de latitud similar?",
+            },
+            "answers": ["gulf stream", "north atlantic drift", "corriente del golfo", "deriva noratlántica"],
+            "answer_display": {"en": "The Gulf Stream", "es": "La corriente del Golfo"},
+            "choices": {
+                "en": ["The Gulf Stream", "California Current", "Canary Current", "Oyashio Current"],
+                "es": ["La corriente del Golfo", "Corriente de California", "Corriente de Canarias", "Corriente de Oyashio"],
+            },
+            "explanation": {
+                "en": "The Gulf Stream/North Atlantic Drift carries warm water toward Europe.",
+                "es": "La corriente del Golfo o deriva noratlántica lleva agua cálida hacia Europa.",
+            },
+        },
+        {
+            "id": "g7",
+            "question": {
+                "en": "Which gas do plants primarily absorb from the atmosphere during photosynthesis?",
+                "es": "¿Qué gas absorben principalmente las plantas de la atmósfera durante la fotosíntesis?",
+            },
+            "answers": ["carbon dioxide", "co2", "dioxido de carbono", "dióxido de carbono"],
+            "answer_display": {"en": "Carbon dioxide", "es": "Dióxido de carbono"},
+            "choices": {
+                "en": ["Carbon dioxide", "Oxygen", "Nitrogen", "Hydrogen"],
+                "es": ["Dióxido de carbono", "Oxígeno", "Nitrógeno", "Hidrógeno"],
+            },
+            "explanation": {
+                "en": "Plants take in carbon dioxide and release oxygen.",
+                "es": "Las plantas absorben dióxido de carbono y liberan oxígeno.",
+            },
+        },
+        {
+            "id": "g8",
+            "question": {
+                "en": "Riddle: The more of this there is, the less you see. What is it?",
+                "es": "Adivinanza: Cuanto más hay de esto, menos ves. ¿Qué es?",
+            },
+            "answers": ["darkness", "oscuridad"],
+            "answer_display": {"en": "Darkness", "es": "Oscuridad"},
+            "choices": {"en": [], "es": []},
+            "explanation": {
+                "en": "Darkness obscures vision as it increases.",
+                "es": "La oscuridad dificulta la visión a medida que aumenta.",
+            },
+        },
+    ],
+}
+
+TRIVIA_LOOKUP: Dict[str, Dict[str, Dict[str, Any]]] = {
+    category: {entry["id"]: entry for entry in entries}
+    for category, entries in TRIVIA_BANK.items()
+}
+
+
+def _serialize_trivia_session(session: TriviaSession) -> Dict[str, Any]:
+    return {
+        "category": session.category,
+        "score": session.score,
+        "total": session.total,
+        "asked_ids": sorted(list(session.asked_ids)),
+        "current_id": session.current_id,
+        "language": session.language,
+        "owner_id": session.owner_id,
+        "channel_idx": session.channel_idx,
+        "is_direct": session.is_direct,
+        "display_name": session.display_name,
+    }
+
+
+def _deserialize_trivia_session(player_key: str, data: Dict[str, Any]) -> TriviaSession:
+    asked = data.get("asked_ids") or []
+    if not isinstance(asked, list):
+        asked = []
+    session = TriviaSession(
+        player_key=player_key,
+        category=data.get("category", "general"),
+        score=int(data.get("score", 0)),
+        total=int(data.get("total", 0)),
+        asked_ids=set(str(x) for x in asked),
+        current_id=data.get("current_id"),
+        language=data.get("language", "en"),
+        owner_id=data.get("owner_id"),
+        channel_idx=data.get("channel_idx"),
+        is_direct=bool(data.get("is_direct", True)),
+        display_name=data.get("display_name"),
+    )
+    return session
+
+
+def _load_trivia_state_store() -> None:
+    loaded = safe_load_json(TRIVIA_STATE_FILE, {})
+    if not isinstance(loaded, dict):
+        return
+    for player_key, data in loaded.items():
+        if isinstance(player_key, str) and isinstance(data, dict):
+            session = _deserialize_trivia_session(player_key, data)
+            TRIVIA_SESSIONS[player_key] = session
+
+
+def _save_trivia_state_store() -> None:
+    try:
+        payload = {
+            key: _serialize_trivia_session(session)
+            for key, session in TRIVIA_SESSIONS.items()
+        }
+        with open(TRIVIA_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        clean_log(f"Could not persist trivia state: {e}", "⚠️")
+
+
+_load_trivia_state_store()
+
+
+TRIVIA_SKIP_WORDS = {"skip", "pass", "next", "omitir", "saltar", "pasar", "siguiente", "continuar"}
+TRIVIA_SCORE_WORDS = {"score", "leaderboard", "puntaje", "tabla", "ranking", "marcador", "puntuacion", "puntuación"}
+
+
+def _normalize_trivia_answer_text(text: str) -> str:
+    return "".join(ch.lower() for ch in text if ch.isalnum())
+
+
+def _trivia_category_title(category: str, language: str) -> str:
+    titles = TRIVIA_CATEGORY_TITLES.get(category, {})
+    return titles.get(language) or titles.get("en") or category.title()
+
+
+def _trivia_player_key(sender_id: Any, is_direct: bool, channel_idx: Optional[int], category: str) -> str:
+    scope = "DM" if is_direct else f"CH{channel_idx if channel_idx is not None else 'broadcast'}"
+    return f"{sender_id}#{scope}::{category}"
+
+
+def _compute_trivia_display_name(sender_id: Any, is_direct: bool, channel_idx: Optional[int]) -> str:
+    try:
+        base = get_node_shortname(sender_id)
+    except Exception:
+        base = str(sender_id)
+    if is_direct:
+        return base
+    channel_names = config.get("channel_names", {}) if isinstance(config, dict) else {}
+    if channel_idx is None:
+        channel_label = "Broadcast"
+    else:
+        channel_label = channel_names.get(str(channel_idx), f"Ch{channel_idx}")
+    return f"{base} @ {channel_label}"
+
+
+def _get_trivia_session(
+    sender_id: Any,
+    is_direct: bool,
+    channel_idx: Optional[int],
+    category: str,
+    language: str,
+) -> TriviaSession:
+    key = _trivia_player_key(sender_id, is_direct, channel_idx, category)
+    session = TRIVIA_SESSIONS.get(key)
+    created = False
+    if session is None:
+        session = TriviaSession(
+            player_key=key,
+            category=category,
+            language=language,
+            owner_id=str(sender_id) if sender_id is not None else None,
+            channel_idx=channel_idx,
+            is_direct=is_direct,
+        )
+        TRIVIA_SESSIONS[key] = session
+        created = True
+    session.owner_id = str(sender_id) if sender_id is not None else session.owner_id
+    session.channel_idx = channel_idx
+    session.is_direct = is_direct
+    session.language = language
+    session.display_name = _compute_trivia_display_name(sender_id, is_direct, channel_idx)
+    if created:
+        _save_trivia_state_store()
+    return session
+
+
+def _get_trivia_question_by_id(category: str, question_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if question_id is None:
+        return None
+    return TRIVIA_LOOKUP.get(category, {}).get(question_id)
+
+
+def _pick_trivia_question(session: TriviaSession) -> Optional[Dict[str, Any]]:
+    bank = TRIVIA_BANK.get(session.category, [])
+    if not bank:
+        return None
+    available = [q for q in bank if q["id"] not in session.asked_ids]
+    if not available:
+        session.asked_ids.clear()
+        available = list(bank)
+    question = random.choice(available)
+    session.current_id = question["id"]
+    session.asked_ids.add(question["id"])
+    return question
+
+
+def _trivia_percentage(score: int, total: int) -> int:
+    if total <= 0:
+        return 0
+    return int(round((score / total) * 100))
+
+
+def _format_trivia_question_text(category: str, question: Dict[str, Any], command_name: str, language: str) -> str:
+    strings = TRIVIA_STRINGS.get(language, TRIVIA_STRINGS["en"])
+    title = _trivia_category_title(category, language)
+    lines: List[str] = []
+    icon = TRIVIA_CATEGORY_EMOJI.get(category, "❓")
+    lines.append(strings["question_intro"].format(title=title, icon=icon))
+    question_text = _localized_text(question.get("question"), language)
+    if question_text:
+        lines.append(question_text)
+    choices = _localized_list(question.get("choices"), language)
+    if choices:
+        lines.append("")
+        lines.append(strings["choices_intro"])
+        for idx, choice in enumerate(choices):
+            label = chr(ord("A") + idx)
+            lines.append(f"  {label}) {choice}")
+    lines.append("")
+    lines.append(strings["answer_prompt"].format(command=command_name))
+    return "\n".join(lines)
+
+
+def _format_trivia_score_line(session: TriviaSession, strings: Dict[str, str]) -> Optional[str]:
+    if session.total <= 0:
+        return None
+    percent = _trivia_percentage(session.score, session.total)
+    return strings["score_line"].format(score=session.score, total=session.total, percent=percent)
+
+
+def _format_trivia_leaderboard(category: str, current_session: TriviaSession, language: str) -> str:
+    strings = TRIVIA_STRINGS.get(language, TRIVIA_STRINGS["en"])
+    title = _trivia_category_title(category, language)
+    lines: List[str] = []
+
+    if current_session.total > 0:
+        percent = _trivia_percentage(current_session.score, current_session.total)
+        lines.append(strings["your_score"].format(score=current_session.score, total=current_session.total, percent=percent))
+        lines.append("")
+
+    sessions = [s for s in TRIVIA_SESSIONS.values() if s.category == category and s.total > 0]
+    if not sessions:
+        lines.append(strings["no_scores"])
+        return "\n".join(lines)
+
+    sessions.sort(key=lambda s: (-s.score, s.total, s.display_name or s.player_key))
+    lines.append(strings["leaderboard_title"].format(title=title))
+    for idx, entry in enumerate(sessions[:5], start=1):
+        percent = _trivia_percentage(entry.score, entry.total)
+        name = entry.display_name or entry.player_key
+        lines.append(strings["leaderboard_entry"].format(rank=idx, name=name, score=entry.score, total=entry.total, percent=percent))
+    return "\n".join(lines)
+
+
+def _evaluate_trivia_answer(
+    session: TriviaSession,
+    question: Dict[str, Any],
+    user_answer: str,
+    command_name: str,
+    language: str,
+) -> str:
+    strings = TRIVIA_STRINGS.get(language, TRIVIA_STRINGS["en"])
+    choices = _localized_list(question.get("choices"), language)
+    acceptable = question.get("answers") or []
+    acceptable_norm = [_normalize_trivia_answer_text(ans) for ans in acceptable]
+
+    user_input = user_answer.strip()
+    normalized = _normalize_trivia_answer_text(user_input)
+    if choices and user_input.strip().upper() in [chr(ord("A") + i) for i in range(len(choices))]:
+        idx = ord(user_input.strip().upper()) - ord("A")
+        if 0 <= idx < len(choices):
+            normalized = _normalize_trivia_answer_text(choices[idx])
+
+    session.total += 1
+    correct = normalized in acceptable_norm
+    if correct:
+        session.score += 1
+
+    explanation = _localized_text(question.get("explanation"), language)
+    answer_display = _localized_text(question.get("answer_display"), language)
+    if correct:
+        result_line = strings["correct"].format(explanation=explanation) if explanation else strings["correct_no_expl"]
+    else:
+        correct_text = answer_display or (acceptable[0] if acceptable else question.get("answer", ""))
+        if explanation:
+            result_line = strings["incorrect"].format(answer=correct_text, explanation=explanation)
+        else:
+            result_line = strings["incorrect_no_expl"].format(answer=correct_text)
+
+    score_line = _format_trivia_score_line(session, strings)
+
+    next_question = _pick_trivia_question(session)
+    next_block = None
+    if next_question:
+        next_block = _format_trivia_question_text(session.category, next_question, command_name, language)
+
+    _save_trivia_state_store()
+
+    response_lines = [result_line]
+    if score_line:
+        response_lines.append(score_line)
+    if next_block:
+        response_lines.append("")
+        response_lines.append(strings["new_question"])
+        response_lines.append(next_block)
+    return "\n".join(response_lines)
+
+
+def handle_trivia_command(
+    command_name: str,
+    category: str,
+    arguments: str,
+    sender_id: Any,
+    is_direct: bool,
+    channel_idx: Optional[int],
+    language_hint: Optional[str],
+) -> str:
+    language = _normalize_language_code(language_hint) if language_hint else LANGUAGE_FALLBACK
+    strings = TRIVIA_STRINGS.get(language, TRIVIA_STRINGS["en"])
+
+    session = _get_trivia_session(sender_id, is_direct, channel_idx, category, language)
+
+    args = arguments.strip()
+    if not args:
+        question = _pick_trivia_question(session)
+        if not question:
+            return strings["no_questions"]
+        _save_trivia_state_store()
+        question_text = _format_trivia_question_text(category, question, command_name, language)
+        score_line = _format_trivia_score_line(session, strings)
+        if score_line:
+            return f"{question_text}\n\n{score_line}"
+        return question_text
+
+    lower_args = args.lower()
+    if lower_args in TRIVIA_SCORE_WORDS:
+        return _format_trivia_leaderboard(category, session, language)
+
+    if lower_args in TRIVIA_SKIP_WORDS:
+        session.current_id = None
+        question = _pick_trivia_question(session)
+        if not question:
+            _save_trivia_state_store()
+            return strings["no_questions"]
+        _save_trivia_state_store()
+        question_text = _format_trivia_question_text(category, question, command_name, language)
+        score_line = _format_trivia_score_line(session, strings)
+        response = f"{strings['skipped']}\n\n{question_text}"
+        if score_line:
+            response += f"\n\n{score_line}"
+        return response
+
+    if session.current_id is None:
+        return strings["no_question"].format(command=command_name)
+
+    question = _get_trivia_question_by_id(session.category, session.current_id)
+    if question is None:
+        # Question data rotated; fetch a fresh one and prompt again.
+        question = _pick_trivia_question(session)
+        if not question:
+            _save_trivia_state_store()
+            return strings["no_questions"]
+        _save_trivia_state_store()
+        question_text = _format_trivia_question_text(category, question, command_name, language)
+        return f"{strings['no_question'].format(command=command_name)}\n\n{question_text}"
+
+    response = _evaluate_trivia_answer(session, question, args, command_name, language)
+    return response
+
+
+
+TRAINER_CONTENT: Dict[str, Dict[str, Any]] = {
+    "morsecodetrainer": {
+        "title": {"en": "📻 Morse Code Trainer", "es": "📻 Entrenador de código Morse"},
+        "sections": [
+            {
+                "title": {"en": "🔔 Core signals to memorize", "es": "🔔 Señales básicas para memorizar"},
+                "bullets": [
+                    {"en": "🔤 A = · – (di-dah), N = – · (dah-di)", "es": "🔤 A = · – (di-dah), N = – · (dah-di)"},
+                    {"en": "🆘 SOS = · · · – – – · · · (three short, three long, three short)", "es": "🆘 SOS = · · · – – – · · · (tres cortos, tres largos, tres cortos)"},
+                    {"en": "🔢 Numbers: 1 = · – – – –, 5 = · · · · ·, 0 = – – – – –", "es": "🔢 Números: 1 = · – – – –, 5 = · · · · ·, 0 = – – – – –"},
+                    {"en": "📡 Prosigns: AR = · – · – · (end of message), SK = · · · – · – (clear)", "es": "📡 Prosignos: AR = · – · – · (fin del mensaje), SK = · · · – · – (libre)"},
+                ],
+            },
+            {
+                "title": {"en": "🔥 Practice drill", "es": "🔥 Ejercicio de práctica"},
+                "bullets": [
+                    {"en": "⏱️ Spend 3 minutes copying five random letters at 12 WPM; keep spacing steady.", "es": "⏱️ Dedica 3 minutos a copiar cinco letras aleatorias a 12 WPM; mantén el espaciado uniforme."},
+                    {"en": "📻 Send your name and grid square using rhythmic taps or flashlight pulses.", "es": "📻 Envía tu nombre y cuadrícula usando toques rítmicos o pulsos de linterna."},
+                    {"en": "🎧 Record yourself and play it back to spot uneven dits/dahs.", "es": "🎧 Grábate y reprodúcelo para detectar dits/dahs irregulares."}
+                ],
+            },
+            {
+                "title": {"en": "🌐 Mesh challenge", "es": "🌐 Desafío en la malla"},
+                "bullets": [
+                    {"en": "🤝 Pick a partner: trade short weather reports in Morse, then translate within 1 minute.", "es": "🤝 Elige un compañero: intercambien reportes breves del clima en Morse y traduzcan en menos de 1 minuto."},
+                    {"en": "🌐 Post a three-word encouragement in Morse; wait for someone to decode before revealing the plaintext.", "es": "🌐 Publica un mensaje de aliento de tres palabras en Morse; espera a que alguien lo descifre antes de revelar el texto."}
+                ],
+            },
+        ],
+        "challenge": {"en": "⭐ Pro tip: set a metronome around 60 BPM so each beat equals one dit for smooth rhythm.", "es": "⭐ Consejo: ajusta un metrónomo a unos 60 BPM para que cada pulso sea un dit y mantengas el ritmo."},
+    },
+    "hurricanetrainer": {
+        "title": {"en": "🌀 Hurricane Safety Trainer", "es": "🌀 Entrenador de seguridad ante huracanes"},
+        "sections": [
+            {
+                "title": {"en": "☀️ Before the storm (watch issued)", "es": "☀️ Antes de la tormenta (aviso emitido)"},
+                "bullets": [
+                    {"en": "📸 Document home exterior with photos; store a copy in the cloud.", "es": "📸 Documenta el exterior de la casa con fotos; guarda una copia en la nube."},
+                    {"en": "✂️ Trim weak branches and secure propane tanks or grills.", "es": "✂️ Recorta ramas débiles y asegura tanques de propano o parrillas."},
+                    {"en": "🎒 Stage a go-bag with waterproof IDs, cash, spare keys, and prescription refills.", "es": "🎒 Prepara una mochila de emergencia con identificaciones impermeables, efectivo, llaves de repuesto y medicamentos recetados."}
+                ],
+            },
+            {
+                "title": {"en": "🌧️ During impact", "es": "🌧️ Durante el impacto"},
+                "bullets": [
+                    {"en": "🛡️ Shelter in an interior room, away from windows; keep helmets for kids.", "es": "🛡️ Refúgiate en un cuarto interior, lejos de las ventanas; reserva cascos para los niños."},
+                    {"en": "📻 Listen to NOAA alerts or mesh updates every 30 minutes; conserve phone battery.", "es": "📻 Escucha alertas de NOAA o actualizaciones de la malla cada 30 minutos; conserva la batería del teléfono."},
+                    {"en": "⬆️ If storm surge threatens, move to higher floors—never to an attic without a way out.", "es": "⬆️ Si amenaza una marejada, sube a pisos superiores; nunca al ático sin una salida."}
+                ],
+            },
+            {
+                "title": {"en": "🌈 Post-storm checklist", "es": "🌈 Lista posterior a la tormenta"},
+                "bullets": [
+                    {"en": "🚫 Avoid floodwater—it can hide debris, live wires, or sewage.", "es": "🚫 Evita el agua de inundación; puede ocultar escombros, cables energizados o aguas residuales."},
+                    {"en": "📷 Snap damage photos before temporary repairs for insurance.", "es": "📷 Toma fotos de los daños antes de reparaciones temporales para el seguro."},
+                    {"en": "🤝 Coordinate neighborhood wellness checks; share generator power rotations.", "es": "🤝 Coordina revisiones de bienestar en el vecindario; compartan turnos de generador."}
+                ],
+            },
+        ],
+        "challenge": {"en": "⭐ Drill idea: run a 10-minute family briefing using this list and time how long it takes to secure shutters.", "es": "⭐ Ejercicio: realiza un informe familiar de 10 minutos con esta lista y mide cuánto tardan en asegurar las contraventanas."},
+    },
+    "tornadotrainer": {
+        "title": {"en": "🌪️ Tornado Safety Trainer", "es": "🌪️ Entrenador de seguridad ante tornados"},
+        "sections": [
+            {
+                "title": {"en": "🧰 Preparedness phase", "es": "🧰 Fase de preparación"},
+                "bullets": [
+                    {"en": "🏚️ Identify your lowest-level safe room; stock water, helmets, gloves, and whistle.", "es": "🏚️ Identifica tu refugio seguro en el nivel más bajo; almacena agua, cascos, guantes y un silbato."},
+                    {"en": "👢 Keep sturdy shoes under every bed for debris-filled evacuations.", "es": "👢 Guarda zapatos resistentes bajo cada cama para evacuaciones entre escombros."},
+                    {"en": "⏱️ Sign up for local siren tests; practice dropping into shelter under 60 seconds.", "es": "⏱️ Inscríbete en pruebas de sirenas locales; practica entrar al refugio en menos de 60 segundos."}
+                ],
+            },
+            {
+                "title": {"en": "⚠️ Warning in effect", "es": "⚠️ Advertencia en vigor"},
+                "bullets": [
+                    {"en": "🏃 Move instantly to shelter—no window watching, no driving to outrun it.", "es": "🏃 Muévete de inmediato al refugio: nada de mirar por la ventana ni intentar huir en auto."},
+                    {"en": "🛏️ Cover yourself with mattress, cushions, or heavy blankets to guard against debris.", "es": "🛏️ Cúbrete con un colchón, cojines o mantas pesadas para protegerte de los escombros."},
+                    {"en": "📡 Use your mesh device or radio in receive-only mode to avoid stray RF during lightning.", "es": "📡 Usa tu dispositivo de malla o radio en modo solo recepción para evitar RF errante durante los relámpagos."}
+                ],
+            },
+            {
+                "title": {"en": "🌤️ After the funnel passes", "es": "🌤️ Después de que pase el embudo"},
+                "bullets": [
+                    {"en": "⚡ Beware downed lines and leaking gas; shut mains off only if trained.", "es": "⚡ Cuidado con cables caídos y fugas de gas; cierra las llaves principales solo si sabes cómo."},
+                    {"en": "🚧 Mark hazards (nails, glass) with bright tape for neighbors and responders.", "es": "🚧 Marca peligros (clavos, vidrios) con cinta brillante para vecinos y rescatistas."},
+                    {"en": "📝 Log damage and survivor status in the mesh network to speed mutual aid.", "es": "📝 Registra daños y el estado de las personas en la malla para agilizar la ayuda mutua."}
+                ],
+            },
+        ],
+        "challenge": {"en": "⭐ Run a 5-minute shelter drill, then share a 'status OK' message with your call sign once you're secured.", "es": "⭐ Realiza un simulacro de refugio de 5 minutos y comparte un mensaje 'estado OK' con tu indicativo cuando estés a salvo."},
+    },
+    "radioprocedurestrainer": {
+        "title": {"en": "📡 Emergency Radio Procedures Trainer", "es": "📡 Entrenador de procedimientos de radio de emergencia"},
+        "sections": [
+            {
+                "title": {"en": "🗒️ Message format", "es": "🗒️ Formato del mensaje"},
+                "bullets": [
+                    {"en": "📣 Call: 'This is [your call sign], priority traffic for [station].'", "es": "📣 Llamada: 'Aquí [tu indicativo], tráfico prioritario para [estación].'"},
+                    {"en": "🧭 Include: who you are, location (lat/long or landmark), need, and action requested.", "es": "🧭 Incluye: quién eres, ubicación (lat/lon o referencia), necesidad y acción solicitada."},
+                    {"en": "🔚 Close with 'Over' to hand the channel back; use 'Out' only when terminating.", "es": "🔚 Cierra con 'Cambio' para devolver el canal; usa 'Fuera' solo al terminar."}
+                ],
+            },
+            {
+                "title": {"en": "🎙️ Clarity tips", "es": "🎙️ Consejos de claridad"},
+                "bullets": [
+                    {"en": "🗣️ Speak in short blocks under 10 seconds; pause for relays or acks.", "es": "🗣️ Habla en bloques cortos de menos de 10 segundos; haz pausas para relevos o acuses."},
+                    {"en": "🔡 Spell critical words with NATO alphabet (e.g., 'MEDIC is Mike-Echo-Delta-India-Charlie').", "es": "🔡 Deletrea palabras críticas con el alfabeto NATO (ej., 'MEDIC es Mike-Echo-Delta-India-Charlie')."},
+                    {"en": "📝 Log every send/receive time in a notebook for after-action review.", "es": "📝 Registra cada hora de envío y recepción en un cuaderno para la revisión posterior."}
+                ],
+            },
+            {
+                "title": {"en": "🔁 Mesh practice", "es": "🔁 Práctica en la malla"},
+                "bullets": [
+                    {"en": "🛰️ Send a simulated SITREP (situation report) to your group; request an acknowledgement.", "es": "🛰️ Envía un SITREP (reporte de situación) simulado a tu grupo; solicita un acuse de recibo."},
+                    {"en": "🔄 Practice relaying a message exactly as received—note when you add clarifying remarks.", "es": "🔄 Practica retransmitir un mensaje exactamente como lo recibiste; anota si agregas aclaraciones."},
+                    {"en": "🎛️ Rotate net control duty so everyone learns to queue and release the channel.", "es": "🎛️ Roten el control de la red para que todos practiquen cómo ordenar turnos y liberar el canal."}
+                ],
+            },
+        ],
+        "challenge": {"en": "⭐ Every weekend, log a 3-line SITREP to your mesh channel and note the fastest acknowledgement time.", "es": "⭐ Cada fin de semana registra un SITREP de 3 líneas en tu canal de malla y anota el acuse más rápido."},
+    },
+    "navigationtrainer": {
+        "title": {"en": "🧭 Navigation Without a Compass", "es": "🧭 Navegación sin brújula"},
+        "sections": [
+            {
+                "title": {"en": "☀️ Daytime cues", "es": "☀️ Referencias diurnas"},
+                "bullets": [
+                    {"en": "🌞 Track the sun: it rises roughly east and sets west—map shadow angles at noon.", "es": "🌞 Sigue al sol: sale aproximadamente por el este y se oculta al oeste; registra los ángulos de sombra al mediodía."},
+                    {"en": "🌿 Observe vegetation: moss prefers northern shade in many regions (verify locally).", "es": "🌿 Observa la vegetación: el musgo prefiere la sombra del norte en muchas regiones (verifícalo localmente)."},
+                    {"en": "💧 Follow water flow downhill; streams often converge toward populated valleys.", "es": "💧 Sigue el flujo del agua cuesta abajo; los arroyos suelen converger hacia valles poblados."}
+                ],
+            },
+            {
+                "title": {"en": "🌌 Night-sky guides", "es": "🌌 Guías del cielo nocturno"},
+                "bullets": [
+                    {"en": "⭐ Northern Hemisphere: locate the Big Dipper; the pointer stars aim at Polaris (North).", "es": "⭐ Hemisferio norte: localiza la Osa Mayor; las estrellas guía apuntan a Polaris (norte)."},
+                    {"en": "🌠 Southern Hemisphere: use the Southern Cross—extend the long axis 4.5 times to find south.", "es": "🌠 Hemisferio sur: usa la Cruz del Sur; prolonga su eje largo 4.5 veces para ubicar el sur."},
+                    {"en": "🌙 Track the Moon: in its first quarter, the illuminated side roughly faces west at sunset.", "es": "🌙 Observa la Luna: en su primer cuarto, el lado iluminado mira aproximadamente hacia el oeste al atardecer."}
+                ],
+            },
+            {
+                "title": {"en": "🥾 Field drill", "es": "🥾 Práctica en campo"},
+                "bullets": [
+                    {"en": "🪵 Shadow stick method: mark the tip of a stick's shadow every 15 min to draw an east-west line.", "es": "🪵 Método del palo y sombra: marca la punta de la sombra cada 15 min para trazar una línea este-oeste."},
+                    {"en": "🚶 Travel using handrail features (roads, rivers) and pace-count landmarks every 100 meters.", "es": "🚶 Avanza usando elementos guía (caminos, ríos) y cuenta pasos entre puntos de referencia cada 100 metros."},
+                    {"en": "📓 Log bearings and estimated distances in a notebook to compare with actual map data later.", "es": "📓 Anota rumbos y distancias estimadas en un cuaderno para compararlos luego con el mapa real."}
+                ],
+            },
+        ],
+        "challenge": {"en": "⭐ Choose a trail—navigate out using only natural cues, then verify accuracy with a compass on return.", "es": "⭐ Elige un sendero: navega solo con referencias naturales y verifica la precisión con una brújula al regresar."},
+    },
+    "boatingtrainer": {
+        "title": {"en": "⛵ Boating Safety Trainer", "es": "⛵ Entrenador de seguridad náutica"},
+        "sections": [
+            {
+                "title": {"en": "🛠️ Pre-launch checks", "es": "🛠️ Revisiones previas al zarpe"},
+                "bullets": [
+                    {"en": "🦺 Verify flotation devices for every passenger plus one spare.", "es": "🦺 Verifica dispositivos de flotación para cada pasajero y uno de repuesto."},
+                    {"en": "🔧 Check bilge pump, nav lights, horn/whistle, and fire extinguishers.", "es": "🔧 Revisa la bomba de achique, luces de navegación, bocina/silbato y extintores."},
+                    {"en": "🗺️ File a float plan with route, crew list, and ETA; share via mesh or text.", "es": "🗺️ Presenta un plan de navegación con ruta, tripulación y ETA; compártelo por la malla o mensaje."}
+                ],
+            },
+            {
+                "title": {"en": "🌊 Underway habits", "es": "🌊 Hábitos en navegación"},
+                "bullets": [
+                    {"en": "👀 Keep a 360° lookout every few minutes—assign a dedicated spotter in busy waters.", "es": "👀 Mantén una vigilancia 360° cada pocos minutos; asigna un vigía dedicado en aguas concurridas."},
+                    {"en": "⏱️ Maintain safe speed for conditions; post a bow watch in low visibility.", "es": "⏱️ Mantén una velocidad segura según las condiciones; coloca un vigía en proa con baja visibilidad."},
+                    {"en": "🌤️ Hydrate and shade crew; heat sickness is common on open water.", "es": "🌤️ Hidrata y da sombra a la tripulación; el golpe de calor es común en mar abierto."}
+                ],
+            },
+            {
+                "title": {"en": "🚨 Emergency response", "es": "🚨 Respuesta ante emergencias"},
+                "bullets": [
+                    {"en": "🛟 If someone falls overboard: shout, point, throw flotation, then circle back downwind.", "es": "🛟 Si alguien cae al agua: grita, señala, lanza flotación y regresa haciendo un giro a sotavento."},
+                    {"en": "🔥 Engine fire: shut fuel, aim extinguisher at base, issue mayday if uncontrolled.", "es": "🔥 Incendio en motor: corta el combustible, apunta el extintor a la base y emite mayday si no se controla."},
+                    {"en": "🛑 Grounding: cut engine, assess hull breach, deploy anchor to prevent further damage.", "es": "🛑 Varadura: apaga el motor, evalúa brechas en el casco y fondea el ancla para evitar más daños."}
+                ],
+            },
+        ],
+        "challenge": {"en": "⭐ Conduct a mock man-overboard drill within your crew and log the recovery time each month.", "es": "⭐ Realicen un simulacro de hombre al agua y registren el tiempo de recuperación cada mes."},
+    },
+    "wellnesstrainer": {
+        "title": {"en": "🏠 Emergency Wellness & Home Care Trainer", "es": "🏠 Entrenador de bienestar y cuidado del hogar en emergencias"},
+        "sections": [
+            {
+                "title": {"en": "🐾 Pet safety essentials", "es": "🐾 Esenciales de seguridad para mascotas"},
+                "bullets": [
+                    {"en": "🎒 Prepare a pet go-bag: food, collapsible bowls, meds, vet records, and comfort item.", "es": "🎒 Prepara una mochila para mascotas: alimento, platos plegables, medicinas, historial veterinario y objeto de consuelo."},
+                    {"en": "🏷️ Label carriers with contact info; practice quick loading drills.", "es": "🏷️ Etiqueta transportadoras con datos de contacto; practica cargarlas rápidamente."},
+                    {"en": "🧺 Keep extra litter or waste bags to maintain sanitation indoors.", "es": "🧺 Ten arena extra o bolsas para desechos y así mantener la sanidad en interiores."}
+                ],
+            },
+            {
+                "title": {"en": "🕯️ Home care during long blackouts", "es": "🕯️ Cuidado del hogar durante apagones prolongados"},
+                "bullets": [
+                    {"en": "🚪 Rotate fridge opening—group meals to limit cold loss and use thermometers to monitor temp.", "es": "🚪 Limita la apertura del refrigerador agrupando comidas y usa termómetros para vigilar la temperatura."},
+                    {"en": "🌬️ Ventilate with cross-breeze during daylight; insulate windows with blankets at night.", "es": "🌬️ Ventila con corrientes cruzadas de día; aísla ventanas con cobijas por la noche."},
+                    {"en": "🔋 Charge devices via solar panels by day; reserve battery banks for critical comms at night.", "es": "🔋 Carga dispositivos con paneles solares de día; reserva baterías para comunicaciones críticas por la noche."}
+                ],
+            },
+            {
+                "title": {"en": "🤝 Community wellness", "es": "🤝 Bienestar comunitario"},
+                "bullets": [
+                    {"en": "🗓️ Schedule neighborhood wellness check-ins twice daily via mesh or door knock.", "es": "🗓️ Programa revisiones de bienestar vecinal dos veces al día por la malla o tocando puertas."},
+                    {"en": "📋 Share surplus supplies using a visible whiteboard or shared spreadsheet.", "es": "📋 Comparte suministros sobrantes con un pizarrón visible o una hoja compartida."},
+                    {"en": "🩺 Log medical needs and stress signals to refer volunteers or telehealth resources.", "es": "🩺 Registra necesidades médicas y señales de estrés para asignar voluntarios o recursos de telemedicina."}
+                ],
+            },
+        ],
+        "challenge": {"en": "⭐ Host a 30-minute blackout simulation: run devices off battery and note any comfort gaps to fix.", "es": "⭐ Organiza un simulacro de apagón de 30 minutos: usa solo baterías y anota carencias de comodidad por resolver."},
+    },
+}
+
+
+TRAINER_COMMAND_MAP = {
+    "/morsecodetrainer": "morsecodetrainer",
+    "/hurricanetrainer": "hurricanetrainer",
+    "/tornadotrainer": "tornadotrainer",
+    "/radioprocedurestrainer": "radioprocedurestrainer",
+    "/navigationtrainer": "navigationtrainer",
+    "/boatingtrainer": "boatingtrainer",
+    "/wellnesstrainer": "wellnesstrainer",
+}
+
+
+def format_trainer_response(trainer_key: str, language: str) -> str:
+    content = TRAINER_CONTENT.get(trainer_key)
+    if not content:
+        return "Trainer module is still loading. Try again soon."
+    lang = _normalize_language_code(language) if language else LANGUAGE_FALLBACK
+    lines: List[str] = []
+    title = _localized_text(content.get("title"), lang)
+    if not title:
+        title = trainer_key.replace("trainer", "Trainer").title()
+    lines.append(title)
+
+    sections = content.get("sections", [])
+    for section in sections:
+        section_title = _localized_text(section.get("title"), lang)
+        bullets = section.get("bullets", [])
+        bullet_lines: List[str] = []
+        for bullet in bullets:
+            bullet_text = _localized_text(bullet, lang)
+            if bullet_text:
+                bullet_lines.append(bullet_text)
+        if section_title or bullet_lines:
+            lines.append("")
+        if section_title:
+            lines.append(section_title)
+        for bullet_text in bullet_lines:
+            lines.append(f"- {bullet_text}")
+
+    challenge = _localized_text(content.get("challenge"), lang)
+    if challenge:
+        lines.append("")
+        lines.append(challenge)
+    return "\n".join(lines)
+
+
+def format_structured_menu(menu_key: str, language: Optional[str]) -> str:
+    lang = _preferred_menu_language(language)
+    data = MENU_DEFINITIONS.get(menu_key)
+    if not data:
+        return "Menu is not available yet."
+    lines: List[str] = []
+    title = data.get("title", {}).get(lang) or data.get("title", {}).get("en")
+    if title:
+        lines.append(title)
+    for section in data.get("sections", []):
+        section_title = section.get("title", {}).get(lang) or section.get("title", {}).get("en")
+        if lines:
+            lines.append("")
+        if section_title:
+            lines.append(section_title)
+        for command, desc_map in section.get("items", []):
+            description = desc_map.get(lang) or desc_map.get("en") or ""
+            lines.append(f"  {command} - {description}")
+    footer = data.get("footer", {}).get(lang) or data.get("footer", {}).get("en")
+    if footer:
+        lines.append("")
+        lines.append(footer)
+    return "\n".join(lines)
+
+
+def format_survival_guide(cmd: str, language: Optional[str]) -> str:
+    lang = _preferred_menu_language(language)
+    guide = SURVIVAL_GUIDES.get(cmd)
+    if not guide:
+        return "Survival notes are not available yet."
+    lines: List[str] = []
+    title = guide.get("title", {}).get(lang) or guide.get("title", {}).get("en")
+    if title:
+        lines.append(title)
+    points = guide.get("points", [])
+    if points:
+        lines.append("")
+        for point in points:
+            text = point.get(lang) or point.get("en")
+            if text:
+                lines.append(f"- {text}")
+    reflection = guide.get("reflection", {}).get(lang) or guide.get("reflection", {}).get("en")
+    if reflection:
+        label = SURVIVAL_REFLECTION_LABEL.get(lang) or SURVIVAL_REFLECTION_LABEL.get("en")
+        lines.append("")
+        lines.append(f"{label}: {reflection}")
+    return "\n".join(lines)
+
+
+@dataclass
+class CavalryGameState:
+    player_key: str
+    current_scene: str
+    gold: int = 0
+    integrity: int = 3
+    history: List[str] = field(default_factory=list)
+    completed: bool = False
+    language: str = "en"
+    start_scene: str = ""
+    last_note: Optional[str] = None
+    intro_shown: bool = False
+
+
+def _cavalry_language(language: Optional[str]) -> str:
+    return _preferred_menu_language(language)
+
+
+def _cavalry_player_key(sender_id: str, is_direct: bool, channel_idx: Optional[int]) -> str:
+    channel_label = "DM" if is_direct else f"CH{channel_idx if channel_idx is not None else 'broadcast'}"
+    return f"{sender_id}#{channel_label}"
+
+
+CAVALRY_STATE_FILE = "cavalry_game_states.json"
+CAVALRY_STATE_LOCK = threading.Lock()
+
+
+CAVALRY_SCENES = {
+    "fort_bliss_muster": {
+        "start": True,
+        "title": {
+            "en": "Parade Ground at Fort Bliss, 1858",
+            "es": "Plaza de armas de Fort Bliss, 1858",
+        },
+        "text": {
+            "en": "Magoffinsville hums with bugles and dust as the relocated post readies Dragoons and cavalry troopers. The Franklin Mountains watch over the adobe buildings and cottonwood shade. Captain orders riders to choose their duty for the week.",
+            "es": "Magoffinsville vibra entre cornetas y polvo mientras el puesto trasladado alista a dragones y jinetes. Las montanas Franklin vigilan los edificios de adobe y los alamos. El capitan ordena a los soldados elegir su deber para la semana.",
+        },
+        "fact": {
+            "en": "Fort Bliss moved near Magoffinsville in 1854 to guard the new US-Mexico boundary set by the Treaty of Guadalupe Hidalgo.",
+            "es": "Fort Bliss se traslado cerca de Magoffinsville en 1854 para proteger la nueva frontera nacida del Tratado de Guadalupe Hidalgo.",
+        },
+        "choices": [
+            {
+                "description": {
+                    "en": "Inspect the quartermaster wagons arriving from San Antonio.",
+                    "es": "Inspeccionar los vagones del intendente llegados de San Antonio.",
+                },
+                "next": "supply_yard",
+                "effects": {"gold": 2, "note": {
+                    "en": "You log two dollars in spare tack legally redistributed to the unit.",
+                    "es": "Registras dos dolares en equipo sobrante repartido legalmente a la unidad.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Attend evening prayer with Chaplain Lathrop before night guard.",
+                    "es": "Asistir a la oracion vespertina con el capellan Lathrop antes de la guardia nocturna.",
+                },
+                "next": "chapel_reflection",
+                "effects": {"integrity": 1, "note": {
+                    "en": "Quiet hymns steady your resolve to serve with mercy.",
+                    "es": "Los himnos tranquilos afianzan tu decision de servir con misericordia.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Volunteer for a Rio Grande boundary patrol toward Ysleta.",
+                    "es": "Ser voluntario para una patrulla del rio Grande rumbo a Ysleta.",
+                },
+                "next": "rio_patrol",
+                "effects": {"gold": 1, "note": {
+                    "en": "The adjutant slips you a bonus coin for quick readiness.",
+                    "es": "El ayudante te entrega una moneda extra por la rapidez.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Ride with scouts into the Franklin Mountains to chart passes.",
+                    "es": "Cabalgar con los exploradores en las montanas Franklin para trazar pasos.",
+                },
+                "next": "mountain_recon",
+                "effects": {"note": {
+                    "en": "You saddle the grey mare famed for sure footing on shale.",
+                    "es": "Ensillas a la yegua gris famosa por su pisada firme en la pizarra.",
+                }},
+            },
+        ],
+        "start_aliases": ["fort", "muster", "bliss"],
+    },
+    "chapel_reflection": {
+        "title": {
+            "en": "Adobe Chapel Beside the Parade",
+            "es": "Capilla de adobe junto a la plaza",
+        },
+        "text": {
+            "en": "Chaplain Lathrop recounts how the garrison tends not only sabers but souls. Candles flicker against earthen walls as you kneel among troopers weary from frontier rides.",
+            "es": "El capellan Lathrop recuerda que la guarnicion cuida no solo sables sino almas. Las velas titilan contra las paredes de tierra mientras te arrodillas entre jinetes cansados de la frontera.",
+        },
+        "choices": [
+            {
+                "description": {
+                    "en": "Write letters home for privates who cannot read.",
+                    "es": "Escribir cartas para los soldados que no saben leer.",
+                },
+                "next": "mesilla_market",
+                "effects": {"gold": 1, "integrity": 1, "note": {
+                    "en": "Families send gratitude coins tucked in Mesilla parcels.",
+                    "es": "Las familias envian monedas de agradecimiento en paquetes de Mesilla.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Carry hymnbooks to the hospital tents on the riverbank.",
+                    "es": "Llevar himnarios a las carpas del hospital en la ribera.",
+                },
+                "next": "river_hospital",
+                "effects": {"integrity": 2, "note": {
+                    "en": "Patients whisper thanks as scripture gives them courage.",
+                    "es": "Los pacientes susurran gracias mientras la Escritura les da valor.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Return to the parade ground renewed for duty.",
+                    "es": "Regresar a la plaza renovado para el servicio.",
+                },
+                "next": "fort_bliss_muster",
+                "effects": {"integrity": 1, "note": {
+                    "en": "Your calm demeanor lifts the morale of the watch detail.",
+                    "es": "Tu calma eleva la moral de la guardia.",
+                }},
+            },
+        ],
+    },
+    "supply_yard": {
+        "title": {
+            "en": "Quartermaster Yard at Magoffinsville",
+            "es": "Patio del intendente en Magoffinsville",
+        },
+        "text": {
+            "en": "Crates marked SAN ANTONIO arrive with oats, repeater parts, and mail. Sergeant Juarez notes the Butterfield Overland Mail will depend on honest tallies.",
+            "es": "Cajas marcadas SAN ANTONIO traen avena, piezas de repetidor y correo. El sargento Juarez recuerda que la ruta Butterfield depende de cuentas honestas.",
+        },
+        "choices": [
+            {
+                "description": {
+                    "en": "Audit the grain and share surplus with acequia farmers at Ysleta.",
+                    "es": "Auditar el grano y compartir el excedente con los agricultores de la acequia en Ysleta.",
+                },
+                "next": "ysleta_farms",
+                "effects": {"gold": 3, "integrity": 1, "note": {
+                    "en": "The farmers repay you with a pouch of trade pesos.",
+                    "es": "Los agricultores te devuelven una bolsa de pesos de trueque.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Sell captured muskets to a Comanchero trader lurking nearby.",
+                    "es": "Vender mosquetes capturados a un comerciante comanchero cercano.",
+                },
+                "next": "outlaw_camp",
+                "effects": {"gold": 4, "integrity": -2, "note": {
+                    "en": "Gold jingles, yet your conscience notes the weapons may spill innocent blood.",
+                    "es": "Oro tintinea, pero tu conciencia advierte que las armas podrian causar sangre inocente.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Volunteer to break remount horses for the frontier companies.",
+                    "es": "Ofrecerte para domar caballos de reemplazo para las companias de frontera.",
+                },
+                "next": "livestock_care",
+                "effects": {"gold": 2, "integrity": 1, "note": {
+                    "en": "You earn hazard pay and the respect of the remount sergeant.",
+                    "es": "Ganas paga de riesgo y el respeto del sargento de remonta.",
+                }},
+            },
+        ],
+    },
+    "livestock_care": {
+        "title": {
+            "en": "Remount Corrals on the Franklin Foothills",
+            "es": "Corrales de remonta en las faldas Franklin",
+        },
+        "text": {
+            "en": "Spooked cavalry mounts snort as you brush them down. Fort Bliss relies on steady horses to patrol the Chihuahua Trail and the Camino Real.",
+            "es": "Las monturas se agitan mientras las cepillas. Fort Bliss depende de caballos firmes para patrullar el Camino Real y la ruta a Chihuahua.",
+        },
+        "choices": [
+            {
+                "description": {
+                    "en": "Lead the herd to a hidden spring the Mescalero scouts mentioned.",
+                    "es": "Guiar la manada a un manantial oculto que mencionaron los exploradores mescaleros.",
+                },
+                "next": "hidden_spring",
+                "effects": {"gold": 1, "note": {
+                    "en": "Cool water keeps the horses strong for coming rides.",
+                    "es": "El agua fresca mantiene fuertes a los caballos.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Teach recruits humane handling before night picket duty.",
+                    "es": "Ensenar a los reclutas trato humano antes de la guardia nocturna.",
+                },
+                "next": "peace_camp_end",
+                "effects": {"integrity": 2, "note": {
+                    "en": "Their gratitude reminds you that gentleness calms the frontier.",
+                    "es": "Su gratitud te recuerda que la mansedumbre calma la frontera.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Report the herd condition to headquarters for extra pay.",
+                    "es": "Informar el estado de la manada al cuartel para obtener paga extra.",
+                },
+                "next": "gold_tally_end",
+                "effects": {"gold": 3, "note": {
+                    "en": "The paymaster credits you for safeguarding army property.",
+                    "es": "El pagador te acredita por proteger bienes del ejercito.",
+                }},
+            },
+        ],
+    },
+    "rio_patrol": {
+        "start": True,
+        "title": {
+            "en": "Rio Grande Boundary Patrol",
+            "es": "Patrulla de la frontera del rio Grande",
+        },
+        "text": {
+            "en": "Dusty levees mark the 1848 line. Farmers from Ysleta and El Paso del Norte trade news of bandits and cross-border tensions. Your squad watches the ferry crossings.",
+            "es": "Los diques polvorientos marcan la linea de 1848. Agricultores de Ysleta y El Paso del Norte comparten noticias de bandoleros y tensiones fronterizas. Tu escuadron vigila los cruces de balsa.",
+        },
+        "fact": {
+            "en": "The Treaty of Guadalupe Hidalgo made the Rio Grande the international boundary, demanding new patrols in the 1850s.",
+            "es": "El Tratado de Guadalupe Hidalgo hizo del rio Grande la frontera internacional, exigiendo nuevas patrullas en la decada de 1850.",
+        },
+        "choices": [
+            {
+                "description": {
+                    "en": "Reassure Ysleta farmers and inspect their acequia gates.",
+                    "es": "Reafirmar a los agricultores de Ysleta e inspeccionar sus compuertas.",
+                },
+                "next": "ysleta_farms",
+                "effects": {"integrity": 1, "note": {
+                    "en": "They share tamales and stories of the Tigua mission.",
+                    "es": "Comparten tamales e historias de la mision Tigua.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Investigate Comanchero smugglers sighted near the sand hills.",
+                    "es": "Investigar a los contrabandistas comancheros vistos cerca de las dunas.",
+                },
+                "next": "contraband_shootout",
+                "effects": {"gold": 1, "note": {
+                    "en": "Your patrol pockets cartridge bounties before the chase.",
+                    "es": "La patrulla guarda recompensas de cartuchos antes de la persecucion.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Hold ferry watch near El Paso del Norte with the customs agent.",
+                    "es": "Vigilar el transbordador cerca de El Paso del Norte con el agente de aduanas.",
+                },
+                "next": "river_hospital",
+                "effects": {"integrity": 1, "note": {
+                    "en": "A fever outbreak diverts you toward compassion duty.",
+                    "es": "Un brote de fiebre te desvía hacia el deber de compasion.",
+                }},
+            },
+        ],
+        "start_aliases": ["rio", "patrol", "river"],
+    },
+    "ysleta_farms": {
+        "title": {
+            "en": "Acequias of Ysleta del Sur",
+            "es": "Acequias de Ysleta del Sur",
+        },
+        "text": {
+            "en": "Tigua elders welcome you with blue corn at the 1680s mission. Irrigation channels need repairs after spring floods.",
+            "es": "Los ancianos Tigua te reciben con maiz azul en la mision de 1680. Las acequias requieren reparacion tras las crecidas de primavera.",
+        },
+        "choices": [
+            {
+                "description": {
+                    "en": "Organize a fair water rotation and pray with the farmers.",
+                    "es": "Organizar un reparto justo de agua y orar con los agricultores.",
+                },
+                "next": "peace_camp_end",
+                "effects": {"gold": 4, "integrity": 1, "note": {
+                    "en": "They gift silver pesos and promise to alert you of raids.",
+                    "es": "Te obsequian pesos de plata y prometen avisar sobre incursiones.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Buy chile ristras to resell at the post canteen.",
+                    "es": "Comprar ristras de chile para revender en la cantina del puesto.",
+                },
+                "next": "mesilla_market",
+                "effects": {"gold": 3, "note": {
+                    "en": "Spice sales promise tidy profit on payday.",
+                    "es": "Las ventas picantes prometen ganancias en dia de paga.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Return to the river patrol line before nightfall.",
+                    "es": "Regresar a la linea de patrulla antes del anochecer.",
+                },
+                "next": "rio_patrol",
+                "effects": {"note": {
+                    "en": "You carry Tigua blessings back to camp.",
+                    "es": "Llevas bendiciones Tigua de regreso al campamento.",
+                }},
+            },
+        ],
+    },
+    "contraband_shootout": {
+        "title": {
+            "en": "Skirmish at the Sand Hills",
+            "es": "Escaramuza en las dunas",
+        },
+        "text": {
+            "en": "Shots crack as Comanchero riders trade lead for kegs of black powder. A Mescalero scout watches from the ridgeline, uncertain whether to join.",
+            "es": "Los disparos resuenan mientras jinetes comancheros intercambian plomo por barriles de polvora. Un explorador mescalero observa desde la cresta, dudando si unirse.",
+        },
+        "choices": [
+            {
+                "description": {
+                    "en": "Call for parley, trading blankets for their surrender.",
+                    "es": "Pedir parlamento ofreciendo mantas a cambio de su rendicion.",
+                },
+                "next": "peace_camp_end",
+                "effects": {"gold": 2, "integrity": 2, "note": {
+                    "en": "A peaceful surrender spares lives and earns you commendation.",
+                    "es": "Una rendicion pacifica salva vidas y te gana elogios.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Fire warning shots and seize their contraband outright.",
+                    "es": "Disparar de advertencia y confiscar el contrabando.",
+                },
+                "next": "gold_tally_end",
+                "effects": {"gold": 5, "integrity": -1, "note": {
+                    "en": "Spoils pile high, yet rumors spread of harsh tactics.",
+                    "es": "El botin se amontona, pero corren rumores de tacticas duras.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Pursue the Mescalero scout into the foothills.",
+                    "es": "Perseguir al explorador mescalero hacia las lomas.",
+                },
+                "next": "apache_encounter",
+                "effects": {"note": {
+                    "en": "You chase hoofprints toward the Franklin ridges.",
+                    "es": "Sigues huellas hacia las crestas Franklin.",
+                }},
+            },
+        ],
+    },
+    "mesilla_market": {
+        "title": {
+            "en": "Market Square at Mesilla",
+            "es": "Plaza del mercado en Mesilla",
+        },
+        "text": {
+            "en": "The 1850s plaza bustles with traders selling copper ore, beef, and rosaries. News of the Gadsden Purchase still shapes loyalties across the valley.",
+            "es": "La plaza de 1850 bulle con comerciantes de cobre, carne y rosarios. La Compra de Gadsden aun moldea las lealtades del valle.",
+        },
+        "choices": [
+            {
+                "description": {
+                    "en": "Invest in a prospector's claim near the Organ Mountains.",
+                    "es": "Invertir en una concesion minera cerca de las montanas Organ.",
+                },
+                "next": "mining_claim",
+                "effects": {"gold": 1, "note": {
+                    "en": "A miner hands you a share certificate payable in dusted nuggets.",
+                    "es": "Un minero te entrega un certificado pagadero en pepitas.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Donate half your pay to rebuild the Socorro chapel roof.",
+                    "es": "Donar la mitad de tu paga para reparar el techo de la capilla de Socorro.",
+                },
+                "next": "peace_camp_end",
+                "effects": {"gold": -1, "integrity": 2, "note": {
+                    "en": "The priest blesses you, reminding that treasure serves people.",
+                    "es": "El sacerdote te bendice recordando que el tesoro sirve a la gente.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Carry the supplies back to Fort Bliss before reveille.",
+                    "es": "Llevar los suministros de regreso a Fort Bliss antes de la diana.",
+                },
+                "next": "fort_bliss_muster",
+                "effects": {"note": {
+                    "en": "Your pack mules clatter across the Camino Real.",
+                    "es": "Tus mulas resuenan sobre el Camino Real.",
+                }},
+            },
+        ],
+    },
+    "mining_claim": {
+        "title": {
+            "en": "Claim Shacks near the Organ Mountains",
+            "es": "Campamentos mineros en las montanas Organ",
+        },
+        "text": {
+            "en": "Prospectors pan for placer gold where rumors say Apache once traded for copper. Your investment partners await your decision.",
+            "es": "Los buscadores lavan oro aluvial donde se dice que los apaches comerciaban cobre. Tus socios esperan tu decision.",
+        },
+        "choices": [
+            {
+                "description": {
+                    "en": "Work alongside Mexican vaqueros, splitting the yield equally.",
+                    "es": "Trabajar junto a vaqueros mexicanos, dividiendo el rendimiento por igual.",
+                },
+                "next": "gold_tally_end",
+                "effects": {"gold": 6, "integrity": 1, "note": {
+                    "en": "Shared labor teaches respect and fills your saddlebag with honest ore.",
+                    "es": "El trabajo compartido ensena respeto y llena tus alforjas con mineral honesto.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Hire mercenaries to drive away nearby Mescalero families.",
+                    "es": "Contratar mercenarios para expulsar a familias mescaleras cercanas.",
+                },
+                "next": "apache_encounter",
+                "effects": {"integrity": -2, "note": {
+                    "en": "Fear shadows the claim as displaced families vanish into the hills.",
+                    "es": "El temor cubre la mina mientras las familias desplazadas desaparecen en las colinas.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Sell the claim and fund a schoolroom at the mission.",
+                    "es": "Vender la concesion y financiar un aula en la mision.",
+                },
+                "next": "peace_camp_end",
+                "effects": {"gold": 4, "integrity": 2, "note": {
+                    "en": "Children will learn to read with the wealth you redirected.",
+                    "es": "Los ninos aprenderan a leer con la riqueza que redirigiste.",
+                }},
+            },
+        ],
+    },
+    "mountain_recon": {
+        "start": True,
+        "title": {
+            "en": "Franklin Mountain Recon Patrol",
+            "es": "Patrulla de reconocimiento en las montanas Franklin",
+        },
+        "text": {
+            "en": "High basalt ridges hide caves and springs. Mescalero Apache scouts know every pass, and a storm brews toward Hueco Tanks.",
+            "es": "Las crestas de basalto ocultan cuevas y manantiales. Los exploradores mescaleros conocen cada paso y se acerca una tormenta hacia Hueco Tanks.",
+        },
+        "choices": [
+            {
+                "description": {
+                    "en": "Follow the old Mescalero trail toward a hidden spring.",
+                    "es": "Seguir la antigua senda mescalera hacia un manantial oculto.",
+                },
+                "next": "hidden_spring",
+                "effects": {"note": {
+                    "en": "You mark petroglyphs that guide your path.",
+                    "es": "Marcas petroglifos que guian tu camino.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Shadow a rumored bandit camp near Hueco Tanks.",
+                    "es": "Seguir un campamento de bandidos cerca de Hueco Tanks.",
+                },
+                "next": "outlaw_camp",
+                "effects": {"gold": 1, "note": {
+                    "en": "Scavenged spurs jingle as you track the outlaws.",
+                    "es": "Espuelas recuperadas tintinean mientras rastreas a los bandidos.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Survey routes for the Butterfield Overland Mail engineers.",
+                    "es": "Levant ar rutas para los ingenieros del Butterfield Overland Mail.",
+                },
+                "next": "stagecoach_run",
+                "effects": {"integrity": 1, "note": {
+                    "en": "Your maps may speed the mail between St. Louis and San Francisco.",
+                    "es": "Tus mapas podrian acelerar el correo entre St. Louis y San Francisco.",
+                }},
+            },
+        ],
+        "start_aliases": ["mountain", "scout", "franklin"],
+    },
+    "hidden_spring": {
+        "title": {
+            "en": "Hidden Spring below Mount Cristo Rey",
+            "es": "Manantial oculto bajo el monte Cristo Rey",
+        },
+        "text": {
+            "en": "Water seeps from volcanic rock, feeding sotol and cottonwood. Mescalero scouts sometimes leave offerings here for safe passage.",
+            "es": "El agua brota de la roca volcanica alimentando sotol y alamos. Los exploradores mescaleros dejan ofrendas para un paso seguro.",
+        },
+        "choices": [
+            {
+                "description": {
+                    "en": "Invite nearby scouts to share water and trade news.",
+                    "es": "Invitar a los exploradores cercanos a compartir agua y noticias.",
+                },
+                "next": "peace_camp_end",
+                "effects": {"gold": 2, "integrity": 2, "note": {
+                    "en": "Trust grows and they guide you to safer canyons.",
+                    "es": "La confianza crece y te guian a canones mas seguros.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Chart the spring precisely and report to headquarters.",
+                    "es": "Trazar el manantial con precision y reportarlo al cuartel.",
+                },
+                "next": "gold_tally_end",
+                "effects": {"gold": 3, "note": {
+                    "en": "Your map earns an exploration bonus.",
+                    "es": "Tu mapa obtiene una bonificacion de exploracion.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Explore deeper toward the Organ Mountains.",
+                    "es": "Explorar mas a fondo hacia las montanas Organ.",
+                },
+                "next": "outlaw_camp",
+                "effects": {"note": {
+                    "en": "Storm clouds gather as you press farther north.",
+                    "es": "Nubes de tormenta se reúnen mientras avanzas al norte.",
+                }},
+            },
+        ],
+    },
+    "outlaw_camp": {
+        "title": {
+            "en": "Bandit Hideout near Hueco Tanks",
+            "es": "Guarida de bandidos cerca de Hueco Tanks",
+        },
+        "text": {
+            "en": "Stagecoach robbers warm beans over a mesquite fire. They clutch coins stolen from the Butterfield Overland strongbox.",
+            "es": "Ladrones de diligencias calientan frijoles sobre mezquite. Empunan monedas del cofre del Butterfield Overland.",
+        },
+        "choices": [
+            {
+                "description": {
+                    "en": "Listen unseen to learn who they plan to rob next.",
+                    "es": "Escuchar sin ser visto para saber a quien planean asaltar.",
+                },
+                "next": "stagecoach_run",
+                "effects": {"integrity": 1, "note": {
+                    "en": "You overhear a plot against the next mail coach.",
+                    "es": "Escuchas un complot contra la proxima diligencia.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Charge the camp, sabers flashing in the moonlight.",
+                    "es": "Cargar contra el campamento con sables al claro de luna.",
+                },
+                "next": "gold_tally_end",
+                "effects": {"gold": 4, "integrity": -2, "note": {
+                    "en": "Victory is swift, yet wounded bandits cry out for mercy.",
+                    "es": "La victoria es rapida, pero los bandidos heridos claman misericordia.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Offer them amnesty through the chaplain if they lay down arms.",
+                    "es": "Ofrecer amnistia mediante el capellan si depone las armas.",
+                },
+                "next": "peace_camp_end",
+                "effects": {"gold": 1, "integrity": 2, "note": {
+                    "en": "Several accept, handing over loot for restitution.",
+                    "es": "Varios aceptan y entregan el botin para restitucion.",
+                }},
+            },
+        ],
+    },
+    "apache_encounter": {
+        "title": {
+            "en": "Mescalero Camp on the Foothills",
+            "es": "Campamento mescalero en las lomas",
+        },
+        "text": {
+            "en": "A small Mescalero band observes you warily. Elders remember treaties broken, yet a young scout studies the Christian medallion on your chest.",
+            "es": "Una pequena banda mescalera te observa con cautela. Los mayores recuerdan tratados rotos, pero un joven explorador mira el medallon cristiano en tu pecho.",
+        },
+        "choices": [
+            {
+                "description": {
+                    "en": "Lower your carbine and share coffee beside the fire.",
+                    "es": "Bajar el fusil y compartir cafe junto al fuego.",
+                },
+                "next": "peace_camp_end",
+                "effects": {"gold": 1, "integrity": 3, "note": {
+                    "en": "Stories of hardship are traded, and a new friendship is forged.",
+                    "es": "Intercambian historias de dificultad y nace una amistad.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Set a pre-dawn trap to capture their ponies.",
+                    "es": "Tender una trampa antes del amanecer para capturar sus ponis.",
+                },
+                "next": "gold_tally_end",
+                "effects": {"gold": 5, "integrity": -3, "note": {
+                    "en": "You seize livestock, yet guilt weighs heavier than the saddlebags.",
+                    "es": "Capturas ganado, pero la culpa pesa mas que las alforjas.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Ask them to guide you through safer mountain passes.",
+                    "es": "Pedir que te guien por pasos mas seguros.",
+                },
+                "next": "hidden_spring",
+                "effects": {"gold": 2, "integrity": 1, "note": {
+                    "en": "They accept gifts and share knowledge of the land.",
+                    "es": "Aceptan obsequios y comparten conocimiento del territorio.",
+                }},
+            },
+        ],
+    },
+    "stagecoach_run": {
+        "title": {
+            "en": "Butterfield Overland Escort",
+            "es": "Escolta del Butterfield Overland",
+        },
+        "text": {
+            "en": "The Overland Mail began service in 1858, racing through El Paso with passengers bound from St. Louis to San Francisco. Drivers beg for protection over the Jornada del Muerto stretch.",
+            "es": "El Overland Mail inicio servicio en 1858, cruzando El Paso con pasajeros de St. Louis a San Francisco. Los conductores suplican proteccion en la Jornada del Muerto.",
+        },
+        "choices": [
+            {
+                "description": {
+                    "en": "Escort the coach through San Elizario and back to the fort.",
+                    "es": "Escoltar la diligencia por San Elizario y regresar al fuerte.",
+                },
+                "next": "gold_tally_end",
+                "effects": {"gold": 4, "integrity": 1, "note": {
+                    "en": "Safe mail earns a commendation and a courier bonus.",
+                    "es": "El correo seguro te gana un elogio y bonificacion de correo.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Ride ahead to warn settlers of looming bandits.",
+                    "es": "Cab algar por delante para avisar a los colonos de bandidos.",
+                },
+                "next": "outlaw_camp",
+                "effects": {"integrity": 1, "note": {
+                    "en": "Families along the Camino Real light lanterns in thanks.",
+                    "es": "Las familias del Camino Real encienden faroles agradecidas.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Share gospel pamphlets with weary passengers.",
+                    "es": "Compartir folletos del evangelio con pasajeros cansados.",
+                },
+                "next": "peace_camp_end",
+                "effects": {"integrity": 2, "note": {
+                    "en": "Hope rises among travelers facing the desert night.",
+                    "es": "La esperanza crece entre los viajeros ante la noche del desierto.",
+                }},
+            },
+        ],
+    },
+    "river_hospital": {
+        "title": {
+            "en": "Hospital Tents by the Rio Grande",
+            "es": "Carpas del hospital junto al rio Grande",
+        },
+        "text": {
+            "en": "Cholera and rifle wounds keep surgeons busy on the riverbank. Volunteers boil water and read scripture for comfort.",
+            "es": "El colera y las balas mantienen ocupados a los cirujanos en la ribera. Voluntarios hierven agua y leen Escritura para consolar.",
+        },
+        "choices": [
+            {
+                "description": {
+                    "en": "Tend the wounded and sing psalms of peace.",
+                    "es": "Atender a los heridos y entonar salmos de paz.",
+                },
+                "next": "peace_camp_end",
+                "effects": {"integrity": 3, "note": {
+                    "en": "Patients call you Chaplain's right hand as calm settles.",
+                    "es": "Los pacientes te llaman la mano derecha del capellan mientras llega la calma.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Requisition silverware to sell for extra medical supplies.",
+                    "es": "Requisar cubiertos de plata para vender y comprar suministros.",
+                },
+                "next": "gold_tally_end",
+                "effects": {"gold": 3, "integrity": -2, "note": {
+                    "en": "Supplies arrive, yet some whisper about heavy-handed methods.",
+                    "es": "Llegan suministros, aunque algunos murmuran sobre metodos duros.",
+                }},
+            },
+            {
+                "description": {
+                    "en": "Return to the fort when the surgeons relieve you.",
+                    "es": "Regresar al fuerte cuando los cirujanos te relevan.",
+                },
+                "next": "fort_bliss_muster",
+                "effects": {"note": {
+                    "en": "You carry prayer requests back to the chapel ledger.",
+                    "es": "Llevas peticiones de oracion al registro de la capilla.",
+                }},
+            },
+        ],
+    },
+    "peace_camp_end": {
+        "title": {
+            "en": "Camp of Peace",
+            "es": "Campamento de paz",
+        },
+        "text": {
+            "en": "Dusk settles over El Paso as those you served break bread together. From Mescalero scouts to Tigua farmers, reconciliation circles the campfires.",
+            "es": "El atardecer cubre El Paso mientras quienes serviste comparten el pan. Desde exploradores mescaleros hasta agricultores Tigua, la reconciliacion rodea las fogatas.",
+        },
+        "end": True,
+        "choices": [],
+    },
+    "gold_tally_end": {
+        "title": {
+            "en": "Paymaster's Ledger",
+            "es": "Libro mayor del pagador",
+        },
+        "text": {
+            "en": "At Fort Bliss headquarters, Lieutenant DeRosey tallies your deeds. Gold clinks upon the desk as reports of your conduct spread across the frontier.",
+            "es": "En el cuartel de Fort Bliss, el teniente DeRosey registra tus hechos. El oro tintinea sobre el escritorio mientras los informes de tu conducta recorren la frontera.",
+        },
+        "end": True,
+        "choices": [],
+    },
+}
+
+
+CAVALRY_START_SCENES = [scene for scene, data in CAVALRY_SCENES.items() if data.get("start")]
+CAVALRY_GAME_STATES: Dict[str, CavalryGameState] = {}
+
+
+def _serialize_cavalry_state(state: CavalryGameState) -> Dict[str, Any]:
+    return {
+        "current_scene": state.current_scene,
+        "gold": state.gold,
+        "integrity": state.integrity,
+        "history": list(state.history),
+        "completed": state.completed,
+        "language": state.language,
+        "start_scene": state.start_scene,
+        "last_note": state.last_note,
+        "intro_shown": state.intro_shown,
+    }
+
+
+def _deserialize_cavalry_state(player_key: str, data: Dict[str, Any]) -> Optional[CavalryGameState]:
+    try:
+        current_scene = data.get("current_scene")
+        if not current_scene or current_scene not in CAVALRY_SCENES:
+            return None
+        history = data.get("history") or [current_scene]
+        if not isinstance(history, list):
+            history = [current_scene]
+        language = data.get("language") or "en"
+        state = CavalryGameState(
+            player_key=player_key,
+            current_scene=current_scene,
+            gold=int(data.get("gold", 0)),
+            integrity=int(data.get("integrity", 3)),
+            history=[str(item) for item in history],
+            completed=bool(data.get("completed", False)),
+            language=language,
+            start_scene=data.get("start_scene", current_scene),
+            last_note=data.get("last_note"),
+            intro_shown=bool(data.get("intro_shown", False)),
+        )
+        return state
+    except Exception:
+        return None
+
+
+def _load_cavalry_state_store() -> None:
+    loaded = safe_load_json(CAVALRY_STATE_FILE, {})
+    if not isinstance(loaded, dict):
+        return
+    with CAVALRY_STATE_LOCK:
+        for player_key, entry in loaded.items():
+            if not isinstance(player_key, str) or not isinstance(entry, dict):
+                continue
+            state = _deserialize_cavalry_state(player_key, entry)
+            if state:
+                CAVALRY_GAME_STATES[player_key] = state
+
+
+def _save_cavalry_state_store() -> None:
+    try:
+        with CAVALRY_STATE_LOCK:
+            payload = {pk: _serialize_cavalry_state(st) for pk, st in CAVALRY_GAME_STATES.items()}
+        with open(CAVALRY_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        clean_log(f"Could not persist cavalry states: {e}", "⚠️")
+
+
+_load_cavalry_state_store()
+
+
+def _cavalry_scene_title(scene_id: str, language: str) -> str:
+    data = CAVALRY_SCENES.get(scene_id, {})
+    return data.get("title", {}).get(language) or data.get("title", {}).get("en") or scene_id
+
+
+def _start_cavalry_game(player_key: str, language: str, requested: Optional[str] = None) -> CavalryGameState:
+    chosen = None
+    if requested:
+        request_norm = requested.lower()
+        for scene_id in CAVALRY_START_SCENES:
+            data = CAVALRY_SCENES.get(scene_id, {})
+            aliases = data.get("start_aliases", [])
+            if request_norm == scene_id or request_norm in aliases:
+                chosen = scene_id
+                break
+        if not chosen:
+            for scene_id in CAVALRY_START_SCENES:
+                if request_norm in scene_id:
+                    chosen = scene_id
+                    break
+    if not chosen:
+        chosen = random.choice(CAVALRY_START_SCENES)
+    state = CavalryGameState(
+        player_key=player_key,
+        current_scene=chosen,
+        gold=0,
+        integrity=3,
+        history=[chosen],
+        completed=False,
+        language=language,
+        start_scene=chosen,
+        last_note=None,
+        intro_shown=False,
+    )
+    with CAVALRY_STATE_LOCK:
+        CAVALRY_GAME_STATES[player_key] = state
+    _save_cavalry_state_store()
+    return state
+
+
+def _apply_choice(state: CavalryGameState, choice_idx: int, language: str) -> Optional[str]:
+    scene = CAVALRY_SCENES.get(state.current_scene)
+    if not scene:
+        return "Scene data missing."
+    choices = scene.get("choices") or []
+    if choice_idx < 1 or choice_idx > len(choices):
+        return translate(language, 'invalid_choice', "Invalid choice number. Try again.")
+    choice = choices[choice_idx - 1]
+    effects = choice.get("effects", {})
+    note_map = effects.get("note")
+    if isinstance(effects.get("gold"), (int, float)):
+        state.gold += int(effects.get("gold"))
+    if isinstance(effects.get("integrity"), (int, float)):
+        state.integrity += int(effects.get("integrity"))
+    state.last_note = None
+    if isinstance(note_map, dict):
+        state.last_note = note_map.get(language) or note_map.get("en")
+    next_scene = choice.get("next")
+    if not next_scene:
+        return translate(language, 'missing_destination', "That path is not ready yet.")
+    state.current_scene = next_scene
+    state.history.append(next_scene)
+    state.completed = CAVALRY_SCENES.get(next_scene, {}).get("end", False)
+    with CAVALRY_STATE_LOCK:
+        CAVALRY_GAME_STATES[state.player_key] = state
+    _save_cavalry_state_store()
+    return None
+
+
+def _format_cavalry_status(state: CavalryGameState, language: str) -> str:
+    lang = _cavalry_language(language or state.language)
+    state.language = lang
+    scene = CAVALRY_SCENES.get(state.current_scene)
+    if not scene:
+        return "Adventure data missing."
+    lines: List[str] = []
+    raw_title = scene.get("title", {}).get(lang) or scene.get("title", {}).get("en") or state.current_scene
+    icon = CAVALRY_SCENE_ICONS.get(state.current_scene)
+    title_line = f"{icon} {raw_title}" if icon else raw_title
+    lines.append(title_line)
+    text = scene.get("text", {}).get(lang) or scene.get("text", {}).get("en")
+    if text:
+        lines.append("")
+        lines.append(text)
+    fact = scene.get("fact", {}).get(lang) or scene.get("fact", {}).get("en")
+    if fact:
+        lines.append("")
+        fact_label = "Historical note" if lang == "en" else "Nota historica"
+        lines.append(f"📝 {fact_label}: {fact}")
+    status_label = "Status" if lang == "en" else "Estado"
+    gold_label = "Gold" if lang == "en" else "Oro"
+    integrity_label = "Integrity" if lang == "en" else "Integridad"
+    lines.append("")
+    lines.append(f"🛡️ {status_label}: {gold_label} {state.gold} | {integrity_label} {state.integrity}")
+    if len(state.history) > 1:
+        path_label = "Trail so far" if lang == "en" else "Ruta hasta ahora"
+        history_titles = [
+            _cavalry_scene_title(scene_id, lang)
+            for scene_id in state.history[:-1]
+        ]
+        lines.append(f"🧭 {path_label}: {', '.join(history_titles)}")
+    if state.last_note:
+        update_label = "Update" if lang == "en" else "Actualizacion"
+        lines.append("")
+        lines.append(f"🗞️ {update_label}: {state.last_note}")
+        state.last_note = None
+    if scene.get("end"):
+        lines.append("")
+        blessing = "Peaceful choices brought folks together." if lang == "en" else "Las decisiones pacificas unieron a la gente."
+        if state.integrity < 0:
+            blessing = "Riches feel heavy without integrity." if lang == "en" else "Las riquezas pesan sin integridad."
+        summary_label = "Finale" if lang == "en" else "Final"
+        lines.append(f"🙏 {summary_label}: {blessing}")
+        outcome_label = "Outcome" if lang == "en" else "Resultado"
+        lines.append(f"📜 {outcome_label}: {gold_label} {state.gold} | {integrity_label} {state.integrity}")
+        invitation = "Type `/mud restart` to ride again with a new starting post." if lang == "en" else "Escribe `/mud restart` para cabalgar de nuevo desde otro puesto."
+        lines.append(f"🐎 {invitation}")
+    else:
+        choices = scene.get("choices") or []
+        if choices:
+            prompt = "🤠 Choose a path:" if lang == "en" else "🤠 Elige un camino:"
+            lines.append("")
+            lines.append(prompt)
+            for idx, choice in enumerate(choices, start=1):
+                desc = choice.get("description", {}).get(lang) or choice.get("description", {}).get("en") or ""
+                marker = CAVALRY_CHOICE_MARKERS[(idx - 1) % len(CAVALRY_CHOICE_MARKERS)]
+                lines.append(f"  {idx}. {marker} {desc}")
+            instruction = "➡️ Reply with `/mud <number>`" if lang == "en" else "➡️ Responde con `/mud <numero>`"
+            lines.append(instruction)
+
+    if not state.intro_shown:
+        guidance = CAVALRY_INTRO_LINES.get(lang) or CAVALRY_INTRO_LINES.get("en")
+        if guidance:
+            lines.append("")
+            lines.extend(CAVALRY_ASCII_BANNER)
+            lines.append("")
+            lines.extend(guidance)
+        state.intro_shown = True
+        with CAVALRY_STATE_LOCK:
+            CAVALRY_GAME_STATES[state.player_key] = state
+        _save_cavalry_state_store()
+    return "\n".join(lines)
+
+
+def handle_cavalry_command(arguments: str, sender_id: Optional[str], is_direct: bool, channel_idx: Optional[int], language_hint: Optional[str]) -> str:
+    language = _cavalry_language(language_hint)
+    if not sender_id:
+        return "Mud tracking requires a sender id."
+    player_key = _cavalry_player_key(str(sender_id), is_direct, channel_idx)
+    state = CAVALRY_GAME_STATES.get(player_key)
+    args = arguments.strip()
+    lower_args = args.lower()
+    parts = lower_args.split()
+    if not args:
+        if not state:
+            if language == "en":
+                intro_lines = [
+                    "El Paso Cavalry Adventure",
+                    "",
+                    "Step into the 1858 Fort Bliss frontier as a US cavalry trooper.",
+                    "Collect gold honorably, favor peace, and see how the frontier remembers you.",
+                    "",
+                    "Commands:",
+                    "  /mud start - begin a new story (random starting post).",
+                    "  /mud start fort|rio|mountain - begin at a specific assignment.",
+                    "  /mud <number> - choose an option when presented.",
+                    "  /mud status - review your current scene.",
+                    "  /mud restart - close this run and start fresh.",
+                    "  /mud rules - review the full rules and etiquette.",
+                    "",
+                    "Type `/mud start` to saddle up.",
+                ]
+            else:
+                intro_lines = [
+                    "Aventura de caballeria en El Paso",
+                    "",
+                    "Adentrate en los fuertes y fronteras de 1858 como soldado de caballeria estadounidense.",
+                    "Reune oro con honor, favorece la paz y descubre como la frontera te recuerda.",
+                    "",
+                    "Comandos:",
+                    "  /mud start - iniciar una historia (puesto aleatorio).",
+                    "  /mud start fort|rio|mountain - iniciar en una asignacion especifica.",
+                    "  /mud <numero> - elegir una opcion cuando aparezca.",
+                    "  /mud status - revisar tu escena actual.",
+                    "  /mud restart - cerrar esta partida y comenzar otra.",
+                    "  /mud rules - repasar todas las reglas y la etiqueta.",
+                    "",
+                    "Escribe `/mud start` para ensillar.",
+                ]
+            return "\n".join(intro_lines)
+        return _format_cavalry_status(state, language)
+    if parts and parts[0] == "rules":
+        rules_text = CAVALRY_RULES_TEXT.get(language) or CAVALRY_RULES_TEXT.get("en")
+        return rules_text
+    if parts and parts[0] == "start":
+        requested = " ".join(parts[1:]).strip()
+        state = _start_cavalry_game(player_key, language, requested or None)
+        return _format_cavalry_status(state, language)
+    if parts and parts[0] == "restart" and len(parts) == 1:
+        with CAVALRY_STATE_LOCK:
+            CAVALRY_GAME_STATES.pop(player_key, None)
+        _save_cavalry_state_store()
+        state = _start_cavalry_game(player_key, language, None)
+        return _format_cavalry_status(state, language)
+    if parts and parts[0] == "status" and len(parts) == 1:
+        if not state:
+            return "No adventure in progress. Use `/mud start`." if language == "en" else "No hay aventura en curso. Usa `/mud start`."
+        return _format_cavalry_status(state, language)
+    if not state:
+        return "Start the adventure first with `/mud start`." if language == "en" else "Inicia la aventura primero con `/mud start`."
+    if state.completed:
+        return "Story complete. Use `/mud restart` for a new ride." if language == "en" else "Historia concluida. Usa `/mud restart` para otra cabalgata."
+    try:
+        choice_number = int(args.split()[0])
+    except ValueError:
+        return "Provide a choice number like `/mud 1`." if language == "en" else "Indica un numero como `/mud 1`."
+    err = _apply_choice(state, choice_number, language)
+    if err:
+        return err
+    return _format_cavalry_status(state, language)
 
 
 LANGUAGE_STRINGS = {
@@ -1082,12 +3726,17 @@ LANGUAGE_RESPONSES = {
         "meshinfo_top_nodes_none": "Sin tráfico registrado en la última hora",
         "bible_missing": "📜 La biblioteca de Escrituras no está disponible en este momento.",
         "chuck_missing": "🥋 El generador de datos de Chuck Norris está fuera de línea.",
+        "blond_missing": "😅 La biblioteca de chistes de rubias está vacía por ahora.",
+        "yomomma_missing": "😅 La biblioteca de chistes de tu mamá está vacía por ahora.",
+        "invalid_choice": "Opción inválida. Inténtalo de nuevo.",
+        "missing_destination": "Ese camino aún no está listo.",
     },
 }
 
 
 def translate(language: str, key: str, default: str, **kwargs) -> str:
-    template = LANGUAGE_RESPONSES.get(language, {}).get(key, default)
+    lang = _normalize_language_code(language)
+    template = LANGUAGE_RESPONSES.get(lang, {}).get(key, default)
     try:
         return template.format(**kwargs)
     except Exception:
@@ -1095,7 +3744,8 @@ def translate(language: str, key: str, default: str, **kwargs) -> str:
 
 
 def get_language_strings(language: Optional[str]):
-    return LANGUAGE_STRINGS.get(language or "en", LANGUAGE_STRINGS["en"])
+    lang = _normalize_language_code(language) if language else LANGUAGE_FALLBACK
+    return LANGUAGE_STRINGS.get(lang, LANGUAGE_STRINGS["en"])
 
 
 def _strip_command_token(cmd: str) -> str:
@@ -1123,11 +3773,31 @@ def _languages_for_canonical(canonical: str) -> List[str]:
     return langs
 
 
+def _pick_preferred_language(candidates: List[str]) -> Optional[str]:
+    if not candidates:
+        return None
+    normalized_fallback = LANGUAGE_FALLBACK
+    if normalized_fallback in candidates:
+        return normalized_fallback
+    if "en" in candidates:
+        return "en"
+    return candidates[0]
+
+
 def _detect_language_for_token(token: str) -> Optional[str]:
     stripped = _strip_command_token(token)
+    if stripped in BUILTIN_COMMANDS:
+        return LANGUAGE_FALLBACK
     alias_langs = _languages_for_alias(stripped)
     if alias_langs:
-        return alias_langs[0]
+        preferred = _pick_preferred_language(alias_langs)
+        if preferred:
+            return preferred
+    canonical_langs = _languages_for_canonical(stripped)
+    if canonical_langs:
+        preferred = _pick_preferred_language(canonical_langs)
+        if preferred:
+            return preferred
     best_lang = None
     best_score = 0.0
     for alias, info in COMMAND_ALIASES.items():
@@ -1135,12 +3805,12 @@ def _detect_language_for_token(token: str) -> Optional[str]:
         if ratio > best_score and ratio >= 0.5:
             langs = info.get("languages") or []
             if langs:
-                best_lang = langs[0]
+                best_lang = _pick_preferred_language([lang for lang in langs if lang]) or best_lang
                 best_score = ratio
     if not best_lang:
         canonical_langs = _languages_for_canonical(stripped)
         if canonical_langs:
-            best_lang = canonical_langs[0]
+            best_lang = _pick_preferred_language(canonical_langs)
     return best_lang
 
 
@@ -1167,12 +3837,13 @@ def resolve_command_token(raw: str):
     if alias_info:
         canonical = alias_info.get("canonical", stripped)
         langs = _languages_for_alias(stripped)
-        language = langs[0] if langs else None
-        return canonical, "alias", None, language
+        language = _pick_preferred_language(langs) if langs else None
+        append_text = alias_info.get("append", "")
+        return canonical, "alias", None, language, append_text
     known = _known_commands()
     if stripped in known:
         language = _detect_language_for_token(stripped)
-        return stripped, None, None, language
+        return stripped, None, None, language, ""
     candidates = difflib.get_close_matches(stripped, list(known), n=1, cutoff=FUZZY_COMMAND_MATCH_THRESHOLD)
     if candidates:
         candidate = candidates[0]
@@ -1180,23 +3851,25 @@ def resolve_command_token(raw: str):
         language = _detect_language_for_token(candidate) or _detect_language_for_token(stripped)
         if candidate in COMMAND_ALIASES:
             canonical = COMMAND_ALIASES[candidate].get("canonical", candidate)
-        return canonical, "fuzzy", None, language
+        return canonical, "fuzzy", None, language, ""
     suggestions = difflib.get_close_matches(stripped, list(known), n=3, cutoff=0.3)
     language = _detect_language_for_token(stripped)
-    return None, "unknown", suggestions, language
+    return None, "unknown", suggestions, language, ""
 
 
 def annotate_command_response(resp, original_cmd: str, canonical_cmd: str, reason: str, language: Optional[str]):
-    if not resp or canonical_cmd == original_cmd:
+    if canonical_cmd == original_cmd:
         return resp
     strings = get_language_strings(language)
     if reason == "alias":
         note = strings["alias_note"].format(original=original_cmd, canonical=canonical_cmd)
     else:
         note = strings["fuzzy_note"].format(original=original_cmd, canonical=canonical_cmd)
-    if isinstance(resp, PendingReply):
-        return PendingReply(f"{note}\n{resp.text}", resp.reason)
-    return f"{note}\n{resp}"
+    try:
+        clean_log(note, "ℹ️", show_always=True, rate_limit=False)
+    except Exception:
+        pass
+    return resp
 
 
 def format_unknown_command_reply(original_cmd: str, suggestions: Optional[List[str]], language: Optional[str]) -> str:
@@ -1260,14 +3933,17 @@ def _process_admin_password(sender_id: Any, message: str):
 class PendingReply:
     text: str
     reason: str = "command"
+    chunk_delay: Optional[float] = None
+    pre_send_delay: Optional[float] = None
 
 
-def _command_delay(reason: str) -> None:
+def _command_delay(reason: str, delay: Optional[float] = None) -> None:
+    wait = COMMAND_REPLY_DELAY if delay is None else max(delay, 0)
     try:
-        clean_log(f"Buffering {COMMAND_REPLY_DELAY}s before replying to {reason}", "⏳", show_always=True, rate_limit=False)
+        clean_log(f"Buffering {wait}s before replying to {reason}", "⏳", show_always=True, rate_limit=False)
     except Exception:
         pass
-    time.sleep(COMMAND_REPLY_DELAY)
+    time.sleep(wait)
 
 
 def _format_bible_verse(language: str = 'en') -> Optional[str]:
@@ -1294,6 +3970,18 @@ def _random_chuck_fact(language: str = 'en') -> Optional[str]:
     if not dataset:
         return None
     return random.choice(dataset)
+
+
+def _random_blond_joke(language: str = 'en') -> Optional[str]:
+    if not BLOND_JOKES:
+        return None
+    return random.choice(BLOND_JOKES)
+
+
+def _random_yo_momma_joke(language: str = 'en') -> Optional[str]:
+    if not YO_MOMMA_JOKES:
+        return None
+    return random.choice(YO_MOMMA_JOKES)
 
 
 def _weather_code_description(code: Optional[int], language: str = 'en') -> str:
@@ -1894,7 +4582,7 @@ def process_responses_worker():
 
                 # Reduced collision delay for async processing
                 if pending:
-                    _command_delay(pending.reason)
+                    _command_delay(pending.reason, delay=pending.pre_send_delay)
                 else:
                     time.sleep(1)
 
@@ -1920,11 +4608,12 @@ def process_responses_worker():
                         pass
 
                 # Send the response via mesh
+                chunk_delay = pending.chunk_delay if pending else None
                 if interface_ref and response_text:
                     if is_direct:
-                        send_direct_chunks(interface_ref, response_text, sender_node)
+                        send_direct_chunks(interface_ref, response_text, sender_node, chunk_delay=chunk_delay)
                     else:
-                        send_broadcast_chunks(interface_ref, response_text, ch_idx)
+                        send_broadcast_chunks(interface_ref, response_text, ch_idx, chunk_delay=chunk_delay)
                         
                 try:
                     globals()['last_ai_response_time'] = _now()
@@ -2144,7 +4833,7 @@ def split_message(text):
         return []
     return [text[i: i + MAX_CHUNK_SIZE] for i in range(0, len(text), MAX_CHUNK_SIZE)][:MAX_CHUNKS]
 
-def send_broadcast_chunks(interface, text, channelIndex):
+def send_broadcast_chunks(interface, text, channelIndex, chunk_delay: Optional[float] = None):
     dprint(f"send_broadcast_chunks: text='{text}', channelIndex={channelIndex}")
     clean_log(f"Broadcasting on Ch{channelIndex}: {text}", "📡")
     if interface is None:
@@ -2160,6 +4849,7 @@ def send_broadcast_chunks(interface, text, channelIndex):
         if not check_send_rate_limit():
             print("❌ Still rate limited, dropping message to prevent spam")
             return
+    delay = CHUNK_DELAY if chunk_delay is None else max(chunk_delay, 0)
     chunks = split_message(text)
     for i, chunk in enumerate(chunks):
         # Retry logic for timeout resilience
@@ -2169,7 +4859,7 @@ def send_broadcast_chunks(interface, text, channelIndex):
         
         for attempt in range(max_retries):
             try:
-                interface.sendText(chunk, destinationId=BROADCAST_ADDR, channelIndex=channelIndex, wantAck=True)
+                interface.sendText(chunk, destinationId=BROADCAST_ADDR, channelIndex=channelIndex, wantAck=False)
                 success = True
                 # mark last transmit time on success
                 try:
@@ -2202,70 +4892,80 @@ def send_broadcast_chunks(interface, text, channelIndex):
             
         # Adaptive delay based on success
         if success and i < len(chunks) - 1:  # Don't delay after last chunk
-            time.sleep(CHUNK_DELAY)
+            time.sleep(delay)
 
-def send_direct_chunks(interface, text, destinationId):
+
+def send_direct_chunks(interface, text, destinationId, chunk_delay: Optional[float] = None):
     dprint(f"send_direct_chunks: text='{text}', destId={destinationId}")
-    clean_log(f"Sending direct to {destinationId}: {text}", "📤")
+    dest_display = get_node_shortname(destinationId)
+    if not dest_display:
+        dest_display = str(destinationId)
+    clean_log(f"Sending direct to {dest_display}: {text}", "📤")
     if interface is None:
         print("❌ Cannot send direct message: interface is None.")
         return
     if not text:
         return
-    
+
     # Check rate limiting to prevent network overload
     if not check_send_rate_limit():
         print("⚠️ Send rate limit exceeded, delaying message...")
-        time.sleep(3)  # Brief pause before trying again
+        time.sleep(3)
         if not check_send_rate_limit():
             print("❌ Still rate limited, dropping message to prevent spam")
             return
-    ephemeral_ok = hasattr(interface, "sendDirectText")
+
+    delay = CHUNK_DELAY if chunk_delay is None else max(chunk_delay, 0)
     chunks = split_message(text)
-    for i, chunk in enumerate(chunks):
-        # Retry logic for timeout resilience
+    if not chunks:
+        return
+
+    ephemeral_ok = hasattr(interface, "sendDirectText")
+
+    for idx, chunk in enumerate(chunks):
         max_retries = 3
         retry_delay = 2
         success = False
-        
+
         for attempt in range(max_retries):
             try:
                 if ephemeral_ok:
-                    interface.sendDirectText(destinationId, chunk, wantAck=True)
+                    interface.sendDirectText(destinationId, chunk, wantAck=False)
                 else:
-                    interface.sendText(chunk, destinationId=destinationId, wantAck=True)
-                success = True
-                # mark last transmit time on success
+                    interface.sendText(chunk, destinationId=destinationId, wantAck=False)
                 try:
                     globals()['last_tx_time'] = _now()
                 except Exception:
                     pass
-                clean_log(f"Sent chunk {i+1}/{len(chunks)} to {destinationId}", "📤")
+                success = True
+                clean_log(f"Sent chunk {idx + 1}/{len(chunks)} to {dest_display}", "📤")
                 break
             except Exception as e:
                 error_msg = str(e).lower()
                 if "timed out" in error_msg or "timeout" in error_msg:
                     if attempt < max_retries - 1:
-                        clean_log(f"Chunk {i+1} timeout, retrying in {retry_delay}s (attempt {attempt+2}/{max_retries})", "⚠️")
+                        clean_log(
+                            f"Chunk {idx + 1} timeout, retrying in {retry_delay}s (attempt {attempt + 2}/{max_retries})",
+                            "⚠️",
+                        )
                         time.sleep(retry_delay)
-                        retry_delay *= 1.5  # Progressive backoff
+                        retry_delay *= 1.5
                         continue
                     else:
-                        print(f"❌ Failed to send chunk {i+1} after {max_retries} attempts: {e}")
+                        print(f"❌ Failed to send chunk {idx + 1} after {max_retries} attempts: {e}")
                 else:
                     print(f"❌ Error sending direct chunk: {e}")
                     error_code = getattr(e, 'errno', None) or getattr(e, 'winerror', None)
                     if error_code in (10053, 10054, 10060):
                         reset_event.set()
                 break
-        
+
         if not success:
-            print(f"❌ Stopping chunk transmission due to persistent failures")
+            print("❌ Stopping chunk transmission due to persistent failures")
             break
-            
-        # Adaptive delay based on success
-        if success and i < len(chunks) - 1:  # Don't delay after last chunk
-            time.sleep(CHUNK_DELAY)
+
+        if success and idx < len(chunks) - 1:
+            time.sleep(delay)
 
 def send_to_lmstudio(user_message: str):
     """Chat/completion request to LM Studio with explicit model name."""
@@ -2769,7 +5469,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
   global motd_content, SYSTEM_PROMPT, config
   cmd = cmd.lower()
   dprint(f"handle_command => cmd='{cmd}', full_text='{full_text}', sender_id={sender_id}, is_direct={is_direct}, language={language_hint}")
-  lang = language_hint or 'en'
+  lang = _normalize_language_code(language_hint) if language_hint else LANGUAGE_FALLBACK
   if cmd == "/about":
     return _cmd_reply(cmd, "MESH-AI Off Grid Chat Bot - By: MR-TBOT.com")
 
@@ -2816,13 +5516,18 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
   elif cmd == "/help":
     built_in = [
       "/about", "/menu", "/query", "/whereami", "/emergency", "/911", "/test",
-      "/motd", "/weather", "/meshinfo", "/bible", "/chucknorris", "/elpaso", "/sms",
+      "/motd", "/weather", "/meshinfo", "/bible", "/chucknorris", "/elpaso", "/blond", "/yomomma", "/sms",
       "/changemotd", "/changeprompt", "/showprompt", "/printprompt", "/reset"
     ]
     custom_cmds = [c.get("command") for c in commands_config.get("commands", [])]
     help_text = "Commands:\n" + ", ".join(built_in + custom_cmds)
     help_text += "\nNote: /changeprompt, /changemotd, /showprompt, and /printprompt are DM-only."
+    help_text += "\nBrowse highlights with /menu."
     return _cmd_reply(cmd, help_text)
+
+  elif cmd == "/menu":
+    menu_text = format_structured_menu("menu", lang)
+    return _cmd_reply(cmd, menu_text)
 
   elif cmd == "/motd":
     motd_msg = translate(lang, 'motd_current', "Current MOTD:\n{motd}", motd=motd_content)
@@ -2845,6 +5550,43 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     report = _format_meshinfo_report(lang)
     return _cmd_reply(cmd, report)
 
+  elif cmd == "/jokes":
+    jokes_menu = format_structured_menu("jokes", lang)
+    return _cmd_reply(cmd, jokes_menu)
+
+  elif cmd in ("/bibletrivia", "/disastertrivia", "/trivia"):
+    category = {
+      "/bibletrivia": "bible",
+      "/disastertrivia": "disaster",
+      "/trivia": "general",
+    }[cmd]
+    args = full_text[len(cmd):].strip()
+    result = handle_trivia_command(cmd, category, args, sender_id, is_direct, channel_idx, lang)
+    return _cmd_reply(cmd, result)
+
+  elif cmd == "/mud":
+    if not is_direct:
+      msg = translate(lang, 'dm_only', "❌ This command can only be used in a direct message.")
+      return _cmd_reply(cmd, msg)
+    args = full_text[len(cmd):].strip()
+    adventure = handle_cavalry_command(args, sender_id, is_direct, channel_idx, lang)
+    if isinstance(adventure, str):
+        return PendingReply(adventure, "/mud command")
+    return adventure
+
+  elif cmd in TRAINER_COMMAND_MAP:
+    trainer_key = TRAINER_COMMAND_MAP[cmd]
+    trainer_text = format_trainer_response(trainer_key, lang)
+    return _cmd_reply(cmd, trainer_text)
+
+  elif cmd == "/survival":
+    survival_menu = format_structured_menu("survival", lang)
+    return _cmd_reply(cmd, survival_menu)
+
+  elif cmd in SURVIVAL_GUIDES:
+    guide = format_survival_guide(cmd, lang)
+    return _cmd_reply(cmd, guide)
+
   elif cmd == "/bible":
     verse = _format_bible_verse(lang)
     if verse:
@@ -2862,6 +5604,20 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     if fact:
         return _cmd_reply(cmd, fact)
     return _cmd_reply(cmd, "🌵 El Paso fact bank is empty right now.")
+
+  elif cmd == "/blond":
+    joke = _random_blond_joke(lang)
+    if joke:
+        return _cmd_reply(cmd, joke)
+    fallback = translate(lang, 'blond_missing', "😅 Blond joke library is empty right now.")
+    return _cmd_reply(cmd, fallback)
+
+  elif cmd == "/yomomma":
+    joke = _random_yo_momma_joke(lang)
+    if joke:
+        return _cmd_reply(cmd, joke)
+    fallback = translate(lang, 'yomomma_missing', "😅 Yo momma joke library is empty right now.")
+    return _cmd_reply(cmd, fallback)
 
   elif cmd == "/changemotd":
     if not is_direct:
@@ -3093,7 +5849,7 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
   # Commands (start with /) should be handled and given context
   if text.startswith("/"):
     raw_cmd = text.split()[0]
-    canonical_cmd, notice_reason, suggestions, language_hint = resolve_command_token(raw_cmd)
+    canonical_cmd, notice_reason, suggestions, language_hint, alias_append = resolve_command_token(raw_cmd)
     if notice_reason == "unknown" or canonical_cmd is None:
       if check_only:
         return False
@@ -3117,8 +5873,11 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
           return True  # Needs AI processing
       return False  # Other commands can be processed immediately
     else:
-      if canonical_cmd != raw_cmd:
-        text = canonical_cmd + text[len(raw_cmd):]
+      if canonical_cmd != raw_cmd or alias_append:
+        remainder = text[len(raw_cmd):]
+        if alias_append:
+          remainder = f"{alias_append}{remainder}"
+        text = canonical_cmd + remainder
       resp = handle_command(canonical_cmd, text, sender_id, is_direct=is_direct, channel_idx=channel_idx, thread_root_ts=thread_root_ts, language_hint=language_hint)
       if notice_reason:
         resp = annotate_command_response(resp, raw_cmd, canonical_cmd, notice_reason, language_hint)
@@ -4953,7 +7712,11 @@ def connect_interface():
                     time.sleep(wait)
             else:
                 # All attempts failed
-                raise RuntimeError(f"Could not open serial device {SERIAL_PORT}: {last_exc}")
+                msg = str(last_exc) if last_exc is not None else "unknown"
+                if "exclusively lock" in msg or "Resource temporarily unavailable" in msg:
+                    # escalate so systemd restarts the process to clear any stale FDs
+                    raise ExclusiveLockError(f"Could not open serial device {SERIAL_PORT}: {msg}")
+                raise RuntimeError(f"Could not open serial device {SERIAL_PORT}: {msg}")
         else:
             print(f"SerialInterface auto‑detect (default baud, will switch to {SERIAL_BAUD}) …")
             iface = meshtastic.serial_interface.SerialInterface()
@@ -4987,6 +7750,55 @@ threading.excepthook = thread_excepthook
 @app.route("/connection_status", methods=["GET"])
 def connection_status_route():
     return jsonify({"status": connection_status, "error": last_error_message})
+
+# -----------------------------
+# Quiet-Link Keepalive
+# -----------------------------
+KEEPALIVE_ENABLED = bool(config.get("keepalive_enabled", True))
+try:
+    KEEPALIVE_CHECK_PERIOD = int(config.get("keepalive_check_period", 10))
+except (TypeError, ValueError):
+    KEEPALIVE_CHECK_PERIOD = 10
+try:
+    KEEPALIVE_IDLE_THRESHOLD = int(config.get("keepalive_idle_threshold", 30))
+except (TypeError, ValueError):
+    KEEPALIVE_IDLE_THRESHOLD = 30
+try:
+    KEEPALIVE_MIN_INTERVAL = int(config.get("keepalive_min_interval", 15))
+except (TypeError, ValueError):
+    KEEPALIVE_MIN_INTERVAL = 15
+
+last_keepalive_time = 0.0
+
+def keepalive_worker():
+    global last_keepalive_time
+    while True:
+        try:
+            time.sleep(max(5, KEEPALIVE_CHECK_PERIOD))
+            if not KEEPALIVE_ENABLED:
+                continue
+            if CONNECTING_NOW or connection_status != "Connected":
+                continue
+            now = _now()
+            rx_age = (now - last_rx_time) if last_rx_time else None
+            tx_age = (now - last_tx_time) if last_tx_time else None
+            if rx_age is None or tx_age is None:
+                continue
+            if rx_age < KEEPALIVE_IDLE_THRESHOLD and tx_age < KEEPALIVE_IDLE_THRESHOLD:
+                continue
+            if now - last_keepalive_time < KEEPALIVE_MIN_INTERVAL:
+                continue
+            # Perform a benign serial-only query that does not generate RF
+            if interface is not None and hasattr(interface, "getMyNodeInfo"):
+                try:
+                    interface.getMyNodeInfo()
+                    last_keepalive_time = now
+                    clean_log("Keepalive tick (serial query only)", "🫶", show_always=False, rate_limit=True)
+                except Exception as e:
+                    add_script_log(f"Keepalive query failed: {e}")
+                    # Do not reset here; let watchdog logic decide
+        except Exception:
+            time.sleep(10)
 
 def main():
     global interface, restart_count, server_start_time, reset_event
@@ -5058,6 +7870,8 @@ def main():
         daemon=True,
     )
     api_thread.start()
+    # Start keepalive worker to prevent USB idle timeout without RF noise
+    threading.Thread(target=keepalive_worker, daemon=True).start()
     # If Discord polling is configured, start that thread.
     if DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID:
         threading.Thread(target=poll_discord_channel, daemon=True).start()
@@ -5081,7 +7895,15 @@ def main():
                     interface.close()
             except Exception:
                 pass
+            try:
+                globals()['CONNECTING_NOW'] = True
+            except Exception:
+                pass
             interface = connect_interface()
+            try:
+                globals()['CONNECTING_NOW'] = False
+            except Exception:
+                pass
             print("Subscribing to on_receive callback...")
             # Only subscribe to the main topic to avoid duplicate callbacks
             pub.subscribe(on_receive, "meshtastic.receive")
@@ -5101,6 +7923,10 @@ def main():
             add_script_log("Server shutdown via KeyboardInterrupt.")
             break
         except OSError as e:
+            try:
+                globals()['CONNECTING_NOW'] = False
+            except Exception:
+                pass
             error_code = getattr(e, 'errno', None) or getattr(e, 'winerror', None)
             if error_code in (10053, 10054, 10060):
                 clean_log("Connection lost! Attempting to reconnect...", "🔄", show_always=True)
@@ -5115,6 +7941,10 @@ def main():
                 reset_event.clear()
                 continue
         except Exception as e:
+            try:
+                globals()['CONNECTING_NOW'] = False
+            except Exception:
+                pass
             logging.error(f"⚠️ Connection/runtime error: {e}")
             add_script_log(f"Error: {e}")
             print("Will attempt reconnect in 30 seconds...")
@@ -5127,13 +7957,30 @@ def main():
             continue
 
 def connection_monitor(initial_delay=30):
+    """Monitors connection status and requests reconnects when truly idle.
+
+    Avoids fighting with the active connector by respecting CONNECTING_NOW and
+    throttles requests to prevent serial port lock thrash.
+    """
     global connection_status
     time.sleep(initial_delay)
+    last_request = 0.0
     while True:
-        if connection_status == "Disconnected":
-            print("⚠️ Connection lost! Triggering reconnect...")
-            reset_event.set()
-        time.sleep(5)
+        try:
+            # Skip if we are actively connecting or a reconnect is already pending
+            if CONNECTING_NOW or reset_event.is_set():
+                time.sleep(1)
+                continue
+            if connection_status == "Disconnected":
+                now = time.time()
+                # Throttle to at most once per 10 seconds
+                if now - last_request >= 10:
+                    print("⚠️ Connection lost! Triggering reconnect...")
+                    reset_event.set()
+                    last_request = now
+            time.sleep(2)
+        except Exception:
+            time.sleep(5)
 
 def scheduled_refresh_monitor():
   """Background monitor that triggers a periodic safe refresh of the radio connection.
@@ -5183,19 +8030,12 @@ def heartbeat_worker(period_sec=30):
         'ai_age_s': None if ai_age is None else int(ai_age),
         'msgs': len(messages),
       }
-      if connection_status == "Connected":
+      if connection_status == "Connected" and not CONNECTING_NOW:
         if RADIO_STALE_RX_THRESHOLD and rx_age is not None and rx_age > RADIO_STALE_RX_THRESHOLD:
           trigger_radio_reset(
             f"Radio watchdog: no packets received for {int(rx_age)}s",
             "🛠️",
             debounce_key="stale_rx",
-            power_cycle=True,
-          )
-        if RADIO_STALE_TX_THRESHOLD and tx_age is not None and tx_age > RADIO_STALE_TX_THRESHOLD:
-          trigger_radio_reset(
-            f"Radio watchdog: no transmissions recorded for {int(tx_age)}s",
-            "🛠️",
-            debounce_key="stale_tx",
             power_cycle=True,
           )
       # Short, periodic heartbeat log; always show to keep logs alive
@@ -5315,10 +8155,30 @@ if __name__ == "__main__":
             stop_smooth_logging()   # Clean shutdown of smooth logging
             add_script_log("Server exited via KeyboardInterrupt.")
             break
+        except ExclusiveLockError as e:
+            # Fatal: serial port is stuck in exclusive-lock; exit so systemd restarts cleanly
+            try:
+                import traceback as _tb
+                _tb.print_exc()
+            except Exception:
+                pass
+            print(f"❌ Fatal exclusive-lock on serial: {e}")
+            add_script_log(f"Fatal exclusive-lock on serial: {e}")
+            stop_response_worker()
+            stop_smooth_logging()
+            # Immediate exit to drop any leaked FDs
+            sys.exit(2)
         except Exception as e:
-            logging.error(f"Unhandled error in main: {e}")
+            # Print a clear, unfiltered error with traceback and retry
+            try:
+                import traceback as _tb
+                _tb.print_exc()
+            except Exception:
+                pass
+            print(f"❌ Unhandled error in main: {e}")
+            add_script_log(f"Unhandled error in main: {e}")
             stop_response_worker()  # Clean shutdown on error
-            break
-            add_script_log(f"Unhandled error: {e}")
-            print("Encountered an error. Restarting in 30 seconds...")
-            time.sleep(30)
+            # Small delay before retry to avoid hot loop
+            time.sleep(5)
+            continue
+ 

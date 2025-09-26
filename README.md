@@ -110,7 +110,7 @@ This fork includes significant performance, reliability, and user experience imp
 ### ⚡ **Performance Optimizations**
 - **Faster AI responses**: Reduced Ollama timeout (200s→120s) and context size (6000→4000 chars)
 - **Optimized AI parameters**: Better `temperature`, `num_predict`, and threading settings
-- **Improved chunk delivery**: Reduced delay between message chunks (10s→3s)
+- **Improved chunk delivery**: Configurable chunk buffer between message segments (defaults to 4 s)
 - **Queue fallback processing**: Prevents message drops when system is busy
 
 ### 🔒 **Single-Instance Enforcement**
@@ -266,7 +266,7 @@ RAK's [RAK4631 quick start](https://docs.rakwireless.com/Product-Categories/WisB
   - **Channel Message Organization** with support for custom channels in `config.json`.  
   - **Revamped DM threaded messaging** system.
   - **Multi-language Menu Support** - Internationalized interface with dynamic language switching.
-  - **Location Links** for nodes with available location data via Google Maps.
+22222222222222222222222222222222222222222222222222222222222222222222222  - **Location Links** for nodes with available location data via Google Maps.
   - **Timezone Selection** for accurate incoming message timestamps.
   - **Custom Local Sounds** for message notifications (no longer relying on hosted files).
   - **Logs Page Auto-Refresh** for live updates.
@@ -341,7 +341,7 @@ RAK's [RAK4631 quick start](https://docs.rakwireless.com/Product-Categories/WisB
      - Introduced **Home Assistant** integration toggles (`home_assistant_enabled`, `home_assistant_channel_index`, secure pin, etc.).  
      - Implemented **Twilio** and **SMTP** settings for emergency alerts (including phone number, email, and credentials).  
      - Added **Discord** webhook configuration toggles (e.g., `enable_discord`, `discord_send_emergency`, etc.).  
-     - Several new user-configurable parameters to control message chunking (`chunk_size`, `max_ai_chunks`, and `chunk_delay`) to reduce radio congestion.  
+     - Several new user-configurable parameters to control message chunking (`chunk_size`, `max_ai_chunks`, and `chunk_buffer_seconds`) to reduce radio congestion.  
 - **Support for Multiple AI Providers**  
    - **Local Language Models** (LM Studio, Ollama) and **OpenAI** (GPT-3.5, etc.) can be selected via `ai_provider`.  
    - Behavior is routed depending on which provider you specify in `config.json`.
@@ -357,7 +357,7 @@ RAK's [RAK4631 quick start](https://docs.rakwireless.com/Product-Categories/WisB
    - Retrieves node GPS coordinates (if available) to include location in alerts.  
 - **Improved Message Chunking & Throttling**  
    - Long AI responses are split into multiple smaller segments (configurable via `chunk_size` & `max_ai_chunks`).  
-   - Delays (`chunk_delay`) between chunks to avoid flooding the mesh network.  
+   - Delays (`chunk_buffer_seconds`) between chunks to avoid flooding the mesh network.  
 - **REST API Endpoints** (via built-in Flask server)  
    - `GET /messages`: Returns the last 100 messages in JSON.  
    - `GET /dashboard`: Displays a simple HTML dashboard showing the recently received messages.  
@@ -706,7 +706,7 @@ Your `config.json` file controls almost every aspect of MESH-AI. Below is an exa
   
   "chunk_size": 200,  // Maximum size for message chunks
   "max_ai_chunks": 5,  // Maximum number of chunks to split AI responses into
-  "chunk_delay": 10,  // Delay between message chunks to reduce congestion
+  "chunk_buffer_seconds": 4,  // Delay between message chunks to reduce congestion (set higher for quieter meshes)
   
   "local_location_string": "@ YOUR LOCATION HERE",  // Local string for your node's location (e.g., "@ Home", "@ Roof Node")
   "ai_node_name": "Mesh-AI-Alpha",  // Name for your AI node

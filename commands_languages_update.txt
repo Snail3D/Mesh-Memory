@@ -1,0 +1,56 @@
+Commands & Language Update Notes
+================================
+
+Overview
+--------
+- Introduced a structured `/menu` flow with bilingual (English/Spanish) sections and submenu prompts.
+- Added dedicated `/survival` submenu and per-scenario commands delivering concise field guides with faith reflections.
+- Created `/mud`, a persistent choose-your-own-adventure cavalry campaign set around 1850s El Paso, available in English and Spanish.
+- Expanded command aliases so English and Spanish shortcuts (e.g., `/bromas`, `/aventura`, `/desierto`) route to the new menus.
+- Added a `language_selection` option in `config.json` to switch default menus and helper text between English and Spanish.
+- Normalised translation helpers so unspecified locales now respect the configured default language.
+
+Menu & Command Changes
+----------------------
+- `/menu` now renders a curated main menu that highlights `/mud`, `/jokes`, `/survival`, `/bible`, `/elpaso`, `/weather`, `/motd`, and `/meshinfo` with language-aware descriptions.
+- `/jokes` and `/survival` display structured submenus listing their child commands and brief explanations in the chosen language.
+- Added scenario commands `/survival_desert`, `/survival_urban`, `/survival_jungle`, `/survival_woodland`, `/survival_winter`, and `/survival_medical`, each returning bilingual bullet points and a short faith-focused reflection.
+- `/mud` command launches or advances the El Paso cavalry adventure; `/mud start`, `/mud <number>`, `/mud status`, and `/mud restart` manage the narrative flow.
+- Extended alias coverage so `/joke`, `/funnies`, `/mudgame`, `/cavalry`, `/adventure`, and their Spanish counterparts (`/bromas`, `/chistes`, `/aventura`, `/caballeria`, `/juego`, etc.) properly resolve.
+- Introduced trivia commands `/bibletrivia`, `/disastertrivia`, and `/trivia` with English/Spanish aliases plus a persistent scoreboard for each category.
+- Added skill-trainer commands (`/morsecodetrainer`, `/hurricanetrainer`, `/tornadotrainer`, `/radioprocedurestrainer`, `/navigationtrainer`, `/boatingtrainer`, `/wellnesstrainer`) and localized their menu blurbs.
+
+Cavalry Adventure Details
+-------------------------
+- Storyline includes multiple entry points (Fort Bliss muster, Rio Grande patrol, Franklin Mountain recon) for replay value.
+- Choices influence gold and integrity meters; endings summarise moral outcomes to reinforce the redemption arc.
+- Game state (scene, history, stats) now persists per user and channel in `cavalry_game_states.json`, allowing long-running sessions.
+- Messages, prompts, and outcome summaries adapt to the configured default language, with Spanish translations for all narrative text.
+
+Internationalisation Updates
+----------------------------
+- New helper `_normalize_language_code` centralises mapping of "english"/"spanish" selections to `en`/`es` codes.
+- `language_selection` in `config.json` defaults to `english`; set to `spanish` to switch menu defaults. (Example: "language_selection": "spanish")
+- Translation utilities (`translate`, `get_language_strings`, `_preferred_menu_language`) now defer to the configured fallback when no language hint is present.
+- Trivia banks, explanations, and trainer modules now provide bilingual content and reuse shared localization helpers so prompts, choices, and reflections render consistently in English or Spanish.
+
+Files Touched
+-------------
+- `mesh-ai.py`
+  * Added menu definitions, survival content, and bilingual formatting helpers.
+  * Implemented the cavalry adventure state machine, persistence, and command wiring.
+  * Normalised language handling with config-driven defaults.
+  * Registered `/mud` and survival commands within the handler flow and alias tables.
+- `config.json`
+  * Added `language_selection` setting (default `english`).
+- `commands_languages_update.txt`
+  * This summary file for repository documentation.
+
+Operational Notes
+-----------------
+- After changing `language_selection`, restart the application to reload the new default language.
+- `cavalry_game_states.json` can be removed to clear all saved adventure progress.
+- Survival and adventure content remain ASCII-only to match mesh constraints; translations rely on short, field-ready phrasing.
+- Global chunk pacing now defaults to a 4-second buffer between outgoing message chunks; adjust `chunk_buffer_seconds` in `config.json` if you need a different rate.
+- Chuck Norris, blond, and yo momma joke pools have been scrubbed for PG-13 friendliness (no explicit language or suggestive content remains).
+- Ack retry tracking has been rolled back so messages send without enforced acknowledgements, preventing radio timeouts seen during stress tests.
