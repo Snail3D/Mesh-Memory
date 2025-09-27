@@ -4,5 +4,5 @@ meshtastic==2.6.4
 pubsub==0.1.2
 requests==2.32.4
 Flask==3.1.0
-twilio==9.6.4
 unidecode==1.4.0
+reportlab==4.4.4

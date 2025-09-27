@@ -1,0 +1,303 @@
+Commands
+├─ /911
+│   └─ (no aliases)
+├─ /about
+│   └─ (no aliases)
+├─ /adventure
+│   └─ /aventura [langs: es]
+├─ /ai
+│   └─ (no aliases)
+├─ /aipersonality
+│   └─ (no aliases)
+├─ /aisettings
+│   └─ (no aliases)
+├─ /aivibe
+│   └─ (no aliases)
+├─ /bible
+│   ├─ /bibel [langs: de]
+│   ├─ /bibelvers [langs: de]
+│   ├─ /biblia [langs: es, pl, sw]
+│   ├─ /biblija [langs: hr]
+│   ├─ /bibliya [langs: uk]
+│   ├─ /mstari [langs: sw]
+│   ├─ /shengjing [langs: zh]
+│   ├─ /stih [langs: hr]
+│   ├─ /verset [langs: fr]
+│   ├─ /versiculo [langs: es]
+│   ├─ /versiculobiblico [langs: es]
+│   ├─ /virsh [langs: uk]
+│   └─ /werset [langs: pl]
+├─ /biblehelp
+│   ├─ /ayudabiblia [langs: es]
+│   ├─ /bibliaayuda [langs: es]
+│   └─ /bibliahelp [langs: es]
+├─ /bibletrivia
+│   ├─ /biblequiz [langs: en]
+│   ├─ /scripturetrivia [langs: en]
+│   └─ /triviabiblica [langs: es]
+├─ /bingo
+│   └─ (no aliases)
+├─ /blond
+│   └─ (no aliases)
+├─ /boatingtrainer
+│   ├─ /barco [langs: es]
+│   ├─ /boatprep [langs: en]
+│   ├─ /boattrainer [langs: en]
+│   └─ /seguridadbarco [langs: es]
+├─ /bot
+│   └─ (no aliases)
+├─ /c
+│   └─ (no aliases)
+├─ /changemotd
+│   ├─ /badilisha_ujumbe [langs: sw]
+│   ├─ /cambiarmensaje [langs: es]
+│   ├─ /modifiermotd [langs: fr]
+│   ├─ /motdaendern [langs: de]
+│   ├─ /motdset [langs: en]
+│   ├─ /promijeniporuku [langs: hr]
+│   ├─ /setmotd [langs: en]
+│   ├─ /xiugaixiaoxi [langs: zh]
+│   ├─ /zmienwiadomosc [langs: pl]
+│   └─ /zminypovidomlennia [langs: uk]
+├─ /changeprompt
+│   ├─ /badilisha_prompt [langs: sw]
+│   ├─ /cambiaprompt [langs: es]
+│   ├─ /changetone [langs: en]
+│   ├─ /fixprompt [langs: en]
+│   ├─ /modifierprompt [langs: fr]
+│   ├─ /naprawprompt [langs: pl]
+│   ├─ /popraviprompt [langs: hr]
+│   ├─ /promijeniprompt [langs: hr]
+│   ├─ /promptaendern [langs: de]
+│   ├─ /rekebisha_prompt [langs: sw]
+│   ├─ /setprompt [langs: en]
+│   ├─ /vyprompt [langs: uk]
+│   ├─ /xiugaiprompt [langs: zh]
+│   ├─ /zmienprompt [langs: pl]
+│   └─ /zminyprompt [langs: uk]
+├─ /choose
+│   └─ (no aliases)
+├─ /choosevibe
+│   └─ (no aliases)
+├─ /chucknorris
+│   ├─ /blaguechuck [langs: fr]
+│   └─ /chuckwitz [langs: de]
+├─ /cipher
+│   └─ (no aliases)
+├─ /coinflip
+│   └─ (no aliases)
+├─ /data
+│   └─ (no aliases)
+├─ /disastertrivia
+│   ├─ /disasterquiz [langs: en]
+│   ├─ /prepquiz [langs: en]
+│   └─ /triviadesastres [langs: es]
+├─ /elpaso
+│   ├─ /cinjenicaelpaso [langs: hr]
+│   ├─ /datoelpaso [langs: es]
+│   ├─ /elp [langs: en]
+│   ├─ /elpasofact [langs: en]
+│   ├─ /elpasofacts [langs: en]
+│   ├─ /elpasofakt [langs: de]
+│   ├─ /elpasoshishi [langs: zh]
+│   ├─ /faitelpaso [langs: fr]
+│   ├─ /fakielpaso [langs: sw]
+│   ├─ /faktelpaso [langs: pl, uk]
+│   └─ /hechoelpaso [langs: es]
+├─ /emailhelp
+│   └─ (no aliases)
+├─ /emergency
+│   ├─ /dharaura [langs: sw]
+│   ├─ /emergencia [langs: es]
+│   ├─ /hitno [langs: hr]
+│   ├─ /jinji [langs: zh]
+│   ├─ /nadzvychayno [langs: uk]
+│   ├─ /naglyprzypadek [langs: pl]
+│   ├─ /notfall [langs: de]
+│   └─ /urgence [langs: fr]
+├─ /games
+│   └─ (no aliases)
+├─ /hangman
+│   └─ (no aliases)
+├─ /help
+│   ├─ /aide [langs: fr]
+│   ├─ /ayuda [langs: es]
+│   ├─ /ayudame [langs: es]
+│   ├─ /bangzhu [langs: zh]
+│   ├─ /dopomoga [langs: uk]
+│   ├─ /hilfe [langs: de]
+│   ├─ /msaada [langs: sw]
+│   ├─ /pomoc [langs: pl]
+│   └─ /pomoć [langs: hr]
+├─ /hurricanetrainer
+│   ├─ /entrenadorhuracan [langs: es]
+│   ├─ /huracan [langs: es]
+│   ├─ /huracanes [langs: es]
+│   └─ /hurricaneprep [langs: en]
+├─ /jokes
+│   ├─ /bromas [langs: es]
+│   ├─ /chistes [langs: es]
+│   ├─ /funnies [langs: en]
+│   └─ /joke [langs: en]
+├─ /m
+│   └─ (no aliases)
+├─ /menu
+│   └─ (no aliases)
+├─ /meshinfo
+│   ├─ /estadomalla [langs: es]
+│   ├─ /estadomesh [langs: es]
+│   ├─ /informemalla [langs: es]
+│   ├─ /meshstatus [langs: en]
+│   └─ /networkinfo [langs: en]
+├─ /meshtastic
+│   └─ (no aliases)
+├─ /morse
+│   └─ (no aliases)
+├─ /morsecodetrainer
+│   ├─ /codigomorse [langs: es]
+│   ├─ /entrenadormorse [langs: es]
+│   ├─ /morsecourse [langs: en]
+│   └─ /morsetrainer [langs: en]
+├─ /motd
+│   ├─ /bulletin [langs: en]
+│   ├─ /dailymessage [langs: en]
+│   ├─ /mensaje [langs: es]
+│   ├─ /mensajedia [langs: es]
+│   ├─ /message [langs: en]
+│   ├─ /messagedujour [langs: fr]
+│   ├─ /messageoftheday [langs: en]
+│   ├─ /notes [langs: en]
+│   ├─ /poruka [langs: hr]
+│   ├─ /porukadana [langs: hr]
+│   ├─ /povidomlennia [langs: uk]
+│   ├─ /povidomlennia_dnya [langs: uk]
+│   ├─ /showmotd [langs: en]
+│   ├─ /tagesnachricht [langs: de]
+│   ├─ /ujumbe [langs: sw]
+│   ├─ /ujumbe_wa_siku [langs: sw]
+│   ├─ /wiadomosc [langs: pl]
+│   └─ /wiadomoscdnia [langs: pl]
+├─ /navigationtrainer
+│   ├─ /navegacion [langs: es]
+│   ├─ /navtrainer [langs: en]
+│   └─ /sinbrujula [langs: es]
+├─ /printprompt
+│   └─ (no aliases)
+├─ /query
+│   └─ (no aliases)
+├─ /quizbattle
+│   └─ (no aliases)
+├─ /radioprocedurestrainer
+│   ├─ /procedimientosradio [langs: es]
+│   ├─ /radiocomunicacion [langs: es]
+│   └─ /radiotrainer [langs: en]
+├─ /reset
+│   ├─ /chongzhi [langs: zh]
+│   ├─ /reiniciar [langs: es]
+│   ├─ /reinitialiser [langs: fr]
+│   ├─ /resetchat [langs: en]
+│   ├─ /resetiraj [langs: hr]
+│   ├─ /resetuj [langs: pl]
+│   ├─ /skynuty [langs: uk]
+│   ├─ /wekaupya [langs: sw]
+│   └─ /zuruecksetzen [langs: de]
+├─ /rps
+│   └─ (no aliases)
+├─ /showprompt
+│   ├─ /afficherprompt [langs: fr]
+│   ├─ /chakantishi [langs: zh]
+│   ├─ /onyesha_prompt [langs: sw]
+│   ├─ /pokazhyprompt [langs: uk]
+│   ├─ /pokazprompt [langs: pl]
+│   ├─ /prikaziprompt [langs: hr]
+│   ├─ /promptanzeigen [langs: de]
+│   ├─ /promptshow [langs: en]
+│   ├─ /seeprompt [langs: en]
+│   ├─ /verprompt [langs: es]
+│   └─ /viewprompt [langs: en]
+├─ /sms
+│   ├─ /enviarsms [langs: es]
+│   ├─ /envoyersms [langs: fr]
+│   ├─ /fasongduanxin [langs: zh]
+│   ├─ /poslijsms [langs: hr]
+│   ├─ /smssenden [langs: de]
+│   ├─ /tumasms [langs: sw]
+│   ├─ /vidpravysms [langs: uk]
+│   └─ /wyslijsms [langs: pl]
+├─ /survival
+│   ├─ /sobrevivir [langs: es]
+│   ├─ /supervivencia [langs: es]
+│   └─ /survivaltips [langs: en]
+├─ /survival_desert
+│   ├─ /desert [langs: en]
+│   └─ /desierto [langs: es]
+├─ /survival_jungle
+│   ├─ /jungla [langs: es]
+│   ├─ /jungle [langs: en]
+│   └─ /selva [langs: es]
+├─ /survival_medical
+│   ├─ /firstaid [langs: en]
+│   ├─ /medical [langs: en]
+│   ├─ /medico [langs: es]
+│   └─ /primerosauxilios [langs: es]
+├─ /survival_urban
+│   ├─ /city [langs: en]
+│   ├─ /ciudad [langs: es]
+│   ├─ /urban [langs: en]
+│   └─ /urbano [langs: es]
+├─ /survival_winter
+│   ├─ /cold [langs: en]
+│   ├─ /frio [langs: es]
+│   ├─ /invierno [langs: es]
+│   └─ /winter [langs: en]
+├─ /survival_woodland
+│   ├─ /bosque [langs: es]
+│   ├─ /forest [langs: en]
+│   └─ /woodland [langs: en]
+├─ /test
+│   └─ (no aliases)
+├─ /tornadotrainer
+│   ├─ /entrenadortornado [langs: es]
+│   ├─ /tornado [langs: es]
+│   └─ /tornadoprep [langs: en]
+├─ /trivia
+│   ├─ /acertijos [langs: es]
+│   ├─ /generaltrivia [langs: en]
+│   ├─ /quiz [langs: en]
+│   ├─ /triviagame [langs: en]
+│   └─ /triviageneral [langs: es]
+├─ /weather
+│   ├─ /clima [langs: es]
+│   ├─ /elpweather [langs: en]
+│   ├─ /forecast [langs: en]
+│   ├─ /haliyahewa [langs: sw]
+│   ├─ /meteo [langs: fr]
+│   ├─ /pogoda [langs: pl, uk]
+│   ├─ /prognoz [langs: uk]
+│   ├─ /prognoza [langs: hr, pl]
+│   ├─ /pronostico [langs: es]
+│   ├─ /temps [langs: fr]
+│   ├─ /tianqi [langs: zh]
+│   ├─ /tiempo [langs: es]
+│   ├─ /utabiri [langs: sw]
+│   ├─ /vrijeme [langs: hr]
+│   ├─ /wetter [langs: de]
+│   ├─ /wetterbericht [langs: de]
+│   └─ /wx [langs: en]
+├─ /wellnesstrainer
+│   ├─ /bienestar [langs: es]
+│   ├─ /bienestaremergencia [langs: es]
+│   ├─ /emergencywellness [langs: en]
+│   └─ /mascotas [langs: es]
+├─ /whereami
+│   └─ (no aliases)
+├─ /wipe
+│   └─ (no aliases)
+├─ /wordladder
+│   └─ (no aliases)
+├─ /wordle
+│   └─ (no aliases)
+└─ /yomomma
+    ├─ /momma [langs: en]
+    ├─ /mommajoke [langs: en]
+    └─ /yomommajoke [langs: en]

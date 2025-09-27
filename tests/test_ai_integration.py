@@ -58,12 +58,6 @@ def _exec_module_source(cfg=None):
     pub_obj = types.SimpleNamespace(subscribe=lambda *a, **k: None, unsubscribe=lambda *a, **k: None)
     pubsub_mod.pub = pub_obj
 
-    twilio_rest_mod = types.ModuleType('twilio.rest')
-    class _FakeTwilioClient:
-        def __init__(self, *a, **k):
-            pass
-    twilio_rest_mod.Client = _FakeTwilioClient
-
     # simple unidecode passthrough
     unidecode_mod = types.ModuleType('unidecode')
     unidecode_mod.unidecode = lambda s: s
@@ -82,8 +76,8 @@ def _exec_module_source(cfg=None):
     sys.modules.setdefault('meshtastic.tcp_interface', tcp_interface_mod)
     sys.modules.setdefault('pubsub', pubsub_mod)
     sys.modules.setdefault('pubsub.pub', pub_obj)
-    sys.modules.setdefault('twilio.rest', twilio_rest_mod)
     sys.modules.setdefault('unidecode', unidecode_mod)
+    sys.modules.setdefault('google.protobuf', google_protobuf)
     sys.modules.setdefault('google.protobuf.message', google_message)
 
     # Provide a mocked requests.post that returns a predictable response

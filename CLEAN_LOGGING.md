@@ -1,4 +1,4 @@
-# Clean Logging Enhancement for MESH-AI
+# Clean Logging Enhancement for Mesh Master
 
 ## Overview
 The logging system has been enhanced with emoji-based, human-friendly output that hides technical details when not needed.
@@ -28,7 +28,7 @@ In `config.json`, you now have two logging-related options:
 - Perfect for daily use and monitoring
 - Example output:
   ```
-  🚀 Starting MESH-AI server...
+  🚀 Starting Mesh Master server...
   🌐 Launching Flask web interface on port 5000...
   🔗 Connecting to Meshtastic device...
   🟢 Connection successful! Running until error or Ctrl+C.
@@ -44,7 +44,7 @@ In `config.json`, you now have two logging-related options:
 - Good for environments where emojis aren't supported
 - Example output:
   ```
-  [Info] Starting MESH-AI server...
+  [Info] Starting Mesh Master server...
   [Info] Launching Flask web interface on port 5000...
   [OLLAMA] Processing message...
   [OLLAMA] Response: Hi there! How can I help you today?
@@ -67,8 +67,6 @@ In `config.json`, you now have two logging-related options:
 | 🎯 | Response delivered |
 | 💭 | AI prompt |
 | 🦙 | Ollama AI |
-| 🤖 | OpenAI |
-| 💻 | LM Studio |
 | 🏠 | Home Assistant |
 
 ## Benefits

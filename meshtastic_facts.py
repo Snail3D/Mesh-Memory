@@ -98,7 +98,6 @@ _BASE_FACTS = [
     "Slash command `/motd` shows the message-of-the-day stored on the node.",
     "The CLI `/nodes` command prints SNR, RSSI, and last-heard stats right in your terminal.",
     "Emergency integrations can forward high priority alerts via MQTT, webhooks, or SMS when scripts hook them up.",
-    "Discord webhooks can mirror mesh conversations to a channel for remote monitoring.",
     "Nodes share their hardware capabilities through `supported_device.py`, so apps know which sensors are present.",
     "Channel admin packets distribute new channel keys to keep secondary channels in sync.",
     "AES-CTR encryption keeps mesh traffic confidential even when packets travel through third-party relays.",

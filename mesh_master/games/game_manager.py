@@ -59,7 +59,7 @@ CIPHER_PHRASES = [
 ]
 
 BINGO_TASKS = [
-    "Share SOS in Morse", "Relay a weather update", "Scan channel 1",
+    "Share SOS in Morse", "Relay a mesh status", "Scan channel 1",
     "Test your antenna", "Send GPS coordinates", "Log a received packet",
     "Thank a relay node", "Report battery level", "Ping the group",
     "Share a survival tip", "Record wind speed", "Call for radio check",

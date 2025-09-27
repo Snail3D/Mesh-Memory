@@ -13,8 +13,6 @@ import time
 from datetime import datetime, timedelta, timezone  # Added timezone import
 import threading
 import os
-import smtplib
-from email.mime.text import MIMEText
 import logging
 from collections import deque, Counter
 from pathlib import Path
@@ -29,7 +27,6 @@ import math
 from typing import Optional, Set, Dict, Any, List, Tuple
 from dataclasses import dataclass, field
 from meshtastic_facts import MESHTASTIC_ALERT_FACTS
-from twilio.rest import Client  # for Twilio SMS support
 from unidecode import unidecode   # Added unidecode import for Ollama text normalization
 from google.protobuf.message import DecodeError
 import queue  # For async message processing
@@ -160,8 +157,59 @@ _last_message_time = defaultdict(float)
 _message_counts = defaultdict(int)
 _rate_limit_seconds = 2.0  # Don't show same message more than once every 2 seconds
 
+_NODE_ID_PATTERN = re.compile(r"!(?:[0-9a-f]{8})", re.IGNORECASE)
+_CHANNEL_ID_PATTERN = re.compile(r"ch=(\d+)", re.IGNORECASE)
+
+
+def _truncate_for_log(text: Optional[str], limit: int = 160) -> str:
+    if text is None:
+        return ""
+    stripped = str(text).strip().replace('\n', ' ')
+    if len(stripped) <= limit:
+        return stripped
+    return stripped[: limit - 1].rstrip() + "…"
+
+
+def _beautify_log_text(message: str) -> str:
+    if not message:
+        return message
+
+    def repl(match: re.Match[str]) -> str:
+        node_id = match.group(0)
+        short = get_node_shortname(node_id)
+        return short if short else node_id
+
+    cleaned = _NODE_ID_PATTERN.sub(repl, message)
+    cleaned = cleaned.replace('\x07', '')
+    lowered = cleaned.lower()
+    if 'alert bell character' in lowered or '🔔' in cleaned:
+        original = str(message)
+        candidate = None
+        if 'Message from ' in original:
+            part = original.split('Message from ', 1)[1]
+            candidate = part.split(' ', 1)[0]
+        if not candidate and '→' in original:
+            candidate = original.split('→', 1)[0].strip()
+        if not candidate and ':' in original:
+            candidate = original.split(':', 1)[0].strip()
+        short = get_node_shortname(candidate) if candidate else None
+        name = (short or (candidate or 'NODE')).strip()
+        name = re.sub(r'[^A-Za-z0-9_-]+', ' ', name).strip()
+        if not name:
+            name = ''
+        cleaned = f"[{name.upper()}] ALERTS!"
+    def repl_channel(match: re.Match[str]) -> str:
+        try:
+            idx = int(match.group(1))
+        except (TypeError, ValueError):
+            return match.group(0)
+        return f"ch={_channel_display_name(idx)}"
+    cleaned = _CHANNEL_ID_PATTERN.sub(repl_channel, cleaned)
+    return cleaned
+
 def clean_log(message, emoji="📝", show_always=False, rate_limit=True):
     """Clean, emoji-enhanced logging for better human readability with rate limiting"""
+    message = _beautify_log_text(str(message))
     # Rate limiting to reduce jitter
     if rate_limit and not DEBUG_ENABLED:
         message_key = f"{emoji}_{message[:50]}"  # Use first 50 chars as key
@@ -291,17 +339,20 @@ def _viewer_should_show(line: str) -> bool:
     "SerialInterface",
     "Baudrate switched",
     "Home Assistant multi-mode is ENABLED",
-    "Discord configuration",
-    "Twilio is ",
-    "SMTP is ",
     "Launching Flask web interface",
     "Server restarted.",
     "Enabled clean logging mode",
     "System running normally",
     "DISCLAIMER: This is beta software",
     "Messaging Dashboard Access: http://",
+    "📨 Message from ",
+    "[AsyncAI]",
   )
   if any(s in line for s in spam):
+    return False
+
+  stripped = line.strip()
+  if stripped.startswith('!') and '→' in stripped:
     return False
 
   if '[RX]' in line and '📨' in line:
@@ -321,14 +372,9 @@ def _viewer_should_show(line: str) -> bool:
     "No response generated",
     "Error processing response",
     "EMERGENCY",
-    "Routed Discord message",
-    "Polled and routed Discord",
     "[UI] ",
     # AI provider clean_log prefixes with emojis
     "🦙 OLLAMA:",
-    "🤖 OPENAI:",
-    "💻 LMSTUDIO:",
-    "🏠 HOME_ASSISTANT:",
   )
   if any(s in line for s in whitelist_markers):
     return True
@@ -352,31 +398,18 @@ def _normalize_log_timestamp(line: str) -> str:
   match = LOG_TIMESTAMP_PATTERN.match(line)
   if not match:
     return line
-  try:
-    year = int(match.group('year'))
-    month = int(match.group('month'))
-    day = int(match.group('day'))
-    hour = int(match.group('hour'))
-    minute = int(match.group('minute'))
-    second = int(match.group('second'))
-    tz = match.group('tz')
-    rest = match.group('rest')
-    dt = datetime(year, month, day, hour, minute, second)
-    if second >= 30:
-      dt += timedelta(minutes=1)
-    dt = dt.replace(second=0, microsecond=0)
-    formatted = f"{calendar.month_abbr[dt.month]} {dt.day:02d} {dt.hour:02d}:{dt.minute:02d} {tz} - {rest}"
-    return formatted
-  except Exception:
-    return match.group('rest') if match else line
+  rest = match.group('rest')
+  return rest.strip() if rest else line
 
 
 def _classify_log_line(line: str) -> str:
+  lowered = line.lower()
+  if 'error' in lowered or '❌' in line or '🚨' in line or 'failed' in lowered or 'alerts!' in lowered:
+    return 'error'
   if '📨' in line:
     return 'incoming'
   if '📤' in line or '📡' in line:
     return 'outgoing'
-  lowered = line.lower()
   if 'local time' in lowered or 'uptime' in lowered:
     return 'clock'
   return ''
@@ -812,10 +845,10 @@ if isinstance(_initial_admins, list):
             continue
         AUTHORIZED_ADMINS.add(str(entry))
 PENDING_ADMIN_REQUESTS: Dict[str, Dict[str, Any]] = {}
-PENDING_WEATHER_REQUESTS: Dict[str, Dict[str, Any]] = {}
 PENDING_WIPE_REQUESTS: Dict[str, Dict[str, Any]] = {}
 PENDING_BIBLE_NAV: Dict[str, Dict[str, Any]] = {}
 PENDING_POSITION_CONFIRM: Dict[str, Dict[str, Any]] = {}
+BIBLE_NAV_LOCK = threading.Lock()
 
 ANTISPAM_LOCK = threading.Lock()
 ANTISPAM_STATE: Dict[str, Dict[str, Any]] = {}
@@ -831,15 +864,121 @@ BIBLE_AUTOSCROLL_LOCK = threading.Lock()
 BIBLE_AUTOSCROLL_MAX_CHUNKS = 30
 BIBLE_AUTOSCROLL_INTERVAL = 12
 
+_raw_channel_names = {}
+if isinstance(config, dict):
+    maybe_names = config.get("channel_names", {})
+    if isinstance(maybe_names, dict):
+        _raw_channel_names = maybe_names
+
+CHANNEL_NAME_MAP: Dict[int, str] = {}
+for key, value in _raw_channel_names.items():
+    try:
+        idx = int(key)
+    except (TypeError, ValueError):
+        continue
+    CHANNEL_NAME_MAP[idx] = str(value)
+
+
+def _channel_display_name(ch_idx: Optional[int]) -> str:
+    if ch_idx is None:
+        return "Broadcast"
+    try:
+        idx = int(ch_idx)
+    except (TypeError, ValueError):
+        return str(ch_idx)
+    name = CHANNEL_NAME_MAP.get(idx)
+    if name:
+        return name
+    try:
+        if interface and hasattr(interface, "channels") and interface.channels:
+            channels = interface.channels
+            candidate = None
+            if isinstance(channels, dict):
+                candidate = channels.get(idx) or channels.get(str(idx))
+            elif isinstance(channels, (list, tuple)) and 0 <= idx < len(channels):
+                candidate = channels[idx]
+            if candidate:
+                if isinstance(candidate, dict):
+                    name = candidate.get('settings', {}).get('name') or candidate.get('name')
+                else:
+                    name = getattr(candidate, 'name', None)
+                if name:
+                    CHANNEL_NAME_MAP[idx] = str(name)
+                    return str(name)
+    except Exception:
+        pass
+    return f"Ch{idx}"
+
+
+def _set_bible_nav(sender_key: Optional[str], info: Dict[str, Any], *, is_direct: bool, channel_idx: Optional[int]) -> None:
+    if not sender_key or not info:
+        return
+    nav_info = dict(info)
+    nav_info['is_direct'] = bool(is_direct)
+    nav_info['channel_idx'] = channel_idx
+    with BIBLE_NAV_LOCK:
+        PENDING_BIBLE_NAV[sender_key] = nav_info
+
+
+def _clear_bible_nav(sender_key: Optional[str]) -> None:
+    if not sender_key:
+        return
+    with BIBLE_NAV_LOCK:
+        PENDING_BIBLE_NAV.pop(sender_key, None)
+    with BIBLE_AUTOSCROLL_LOCK:
+        BIBLE_AUTOSCROLL_PENDING.pop(sender_key, None)
+        BIBLE_AUTOSCROLL_STATE.pop(sender_key, None)
+
+
+def _prepare_bible_autoscroll(sender_key: Optional[str], is_direct: bool, channel_idx: Optional[int]):
+    if not sender_key:
+        return PendingReply("📖 Auto-scroll isn't available right now.", "/bible autoscroll")
+    lang = (PENDING_BIBLE_NAV.get(sender_key, {}).get('language') or LANGUAGE_FALLBACK)
+    if not is_direct:
+        return PendingReply(
+            translate(lang, 'bible_autoscroll_dm_only', "📖 Auto-scroll works only in direct messages."),
+            "/bible autoscroll",
+        )
+    if sender_key not in PENDING_BIBLE_NAV:
+        return PendingReply(
+            translate(lang, 'bible_autoscroll_need_nav', "📖 Use /bible first, then reply 22 to auto-scroll."),
+            "/bible autoscroll",
+        )
+    with BIBLE_AUTOSCROLL_LOCK:
+        BIBLE_AUTOSCROLL_PENDING[sender_key] = {
+            'channel_idx': channel_idx,
+            'requested_at': time.time(),
+        }
+    return PendingReply(
+        translate(lang, 'bible_autoscroll_stop', "⏹️ Auto-scroll paused. Reply 22 later to resume."),
+        "/bible autoscroll",
+    )
+
+
+def _process_bible_autoscroll_request(sender_key: Optional[str], sender_node: Optional[str], interface_ref) -> None:
+    if not sender_key:
+        return
+    with BIBLE_AUTOSCROLL_LOCK:
+        BIBLE_AUTOSCROLL_PENDING.pop(sender_key, None)
+        BIBLE_AUTOSCROLL_STATE.pop(sender_key, None)
+
 MESHTASTIC_KB_FILE = config.get("meshtastic_knowledge_file", "data/meshtastic_knowledge.txt")
 try:
-    MESHTASTIC_KB_MAX_CONTEXT = int(config.get("meshtastic_kb_max_context_chars", 4500))
+    MESHTASTIC_KB_MAX_CONTEXT = int(config.get("meshtastic_kb_max_context_chars", 3200))
 except (ValueError, TypeError):
     MESHTASTIC_KB_MAX_CONTEXT = 4500
 MESHTASTIC_KB_MAX_CONTEXT = max(2000, min(MESHTASTIC_KB_MAX_CONTEXT, 12000))
+MESHTASTIC_KB_CACHE_TTL = max(0, int(config.get("meshtastic_kb_cache_ttl", 600)))
 MESHTASTIC_KB_LOCK = threading.Lock()
+MESHTASTIC_KB_CACHE_LOCK = threading.Lock()
 MESHTASTIC_KB_CHUNKS: List[Dict[str, Any]] = []
 MESHTASTIC_KB_MTIME: Optional[float] = None
+MESHTASTIC_KB_WARM_CACHE: Dict[str, Any] = {
+    "expires": 0.0,
+    "tokens": set(),
+    "context": "",
+    "matches": [],
+}
 MESHTASTIC_KB_SYSTEM_PROMPT = (
     "You are Mesh-Master, a safety-critical assistant for the Meshtastic project. "
     "Answer ONLY when the supplied MeshTastic reference passages clearly support the conclusion. "
@@ -850,6 +989,54 @@ MESHTASTIC_KB_SYSTEM_PROMPT = (
 LOCATION_HISTORY: Dict[str, Dict[str, Any]] = {}
 LOCATION_HISTORY_LOCK = threading.Lock()
 LOCATION_HISTORY_RETENTION = 24 * 3600
+
+
+WEATHER_REPORT_FILE = config.get("weather_report_file", "data/weather_reports.json")
+WEATHER_REPORT_LOCK = threading.Lock()
+WEATHER_REPORTS: List[Dict[str, Any]] = []
+WEATHER_REPORT_MAX_ENTRIES = int(config.get("weather_report_max_entries", 100))
+WEATHER_REPORT_RETENTION = int(config.get("weather_report_retention_seconds", 24 * 3600))
+WEATHER_REPORT_RECENT_WINDOW = int(config.get("weather_report_recent_window", 2 * 3600))
+PENDING_WEATHER_REPORTS: Dict[str, Dict[str, Any]] = {}
+
+
+
+# Ensure sane defaults for retention settings
+if WEATHER_REPORT_MAX_ENTRIES < 10:
+    WEATHER_REPORT_MAX_ENTRIES = 10
+if WEATHER_REPORT_RETENTION < 3600:
+    WEATHER_REPORT_RETENTION = 3600
+if WEATHER_REPORT_RECENT_WINDOW < 900:
+    WEATHER_REPORT_RECENT_WINDOW = 900
+
+
+def _normalize_weather_reports(raw) -> List[Dict[str, Any]]:
+    reports: List[Dict[str, Any]] = []
+    if isinstance(raw, dict) and 'reports' in raw:
+        raw = raw.get('reports')
+    if not isinstance(raw, list):
+        return reports
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        entry = {
+            'timestamp': float(item.get('timestamp', 0.0) or 0.0),
+            'shortname': str(item.get('shortname') or item.get('node') or ''),
+            'text': str(item.get('text') or ''),
+            'map_url': item.get('map_url') or None,
+            'lat': item.get('lat'),
+            'lon': item.get('lon'),
+            'node_key': item.get('node_key') or None,
+        }
+        reports.append(entry)
+    return reports
+
+
+try:
+    WEATHER_REPORTS = _normalize_weather_reports(safe_load_json(WEATHER_REPORT_FILE, []))
+except Exception as exc:
+    print(f"⚠️ Could not load weather reports: {exc}")
+    WEATHER_REPORTS = []
 
 
 def _public_base_url() -> str:
@@ -865,12 +1052,10 @@ def _public_base_url() -> str:
     return f"http://{host_part}:{SERVER_PORT}"
 
 
-US_ZIP_LOOKUP: Optional[Dict[str, Dict[str, Any]]] = None
-US_CITY_LOOKUP: Optional[Dict[str, Dict[str, Any]]] = None
-WORLD_CITY_LOOKUP: Optional[Dict[str, List[Dict[str, Any]]]] = None
 
 PROVERB_CACHE: Dict[str, List[str]] = {}
 PROVERB_INDEX_TRACKER: Dict[str, int] = {}
+PROVERB_LOCK = threading.Lock()
 WIPE_CONFIRM_YES = {"y", "yes", "yeah", "yep"}
 WIPE_CONFIRM_NO = {"n", "no", "nope", "cancel"}
 
@@ -892,6 +1077,86 @@ def _coerce_positive_int(value, default):
         return ivalue if ivalue > 0 else None
     except (TypeError, ValueError):
         return default
+
+
+def _proverb_language_key(language: Optional[str]) -> str:
+    """Reduce language hints to the keys we keep proverbs under."""
+    if language:
+        normalized = str(language).strip().lower()
+        if normalized.startswith("es"):
+            return "es"
+    return "en"
+
+
+def _build_proverb_list(path: str, book_label: str) -> List[str]:
+    """Extract the book of Proverbs from the given Bible JSON file."""
+    try:
+        data = safe_load_json(path, {})
+    except Exception:
+        return []
+
+    if not isinstance(data, dict):
+        return []
+
+    books = data.get("books")
+    if not isinstance(books, dict):
+        return []
+
+    chapters = books.get("Proverbs")
+    if not isinstance(chapters, list):
+        return []
+
+    verses: List[str] = []
+    for chapter_index, chapter in enumerate(chapters, start=1):
+        if not isinstance(chapter, list):
+            continue
+        for verse_index, verse_text in enumerate(chapter, start=1):
+            if not isinstance(verse_text, str):
+                continue
+            text = verse_text.strip()
+            if not text:
+                continue
+            verses.append(f"{book_label} {chapter_index}:{verse_index} {text}")
+    return verses
+
+
+def _load_proverbs(language: Optional[str]) -> List[str]:
+    """Return cached Proverbs verses for the requested language."""
+    lang_key = _proverb_language_key(language)
+    with PROVERB_LOCK:
+        cached = PROVERB_CACHE.get(lang_key)
+    if cached is not None:
+        return cached
+
+    if lang_key == "es":
+        verses = _build_proverb_list("data/bible_rvr.json", "Proverbios")
+        if not verses:
+            verses = _build_proverb_list("data/bible_web.json", "Proverbs")
+    else:
+        verses = _build_proverb_list("data/bible_web.json", "Proverbs")
+
+    if verses is None:
+        verses = []
+
+    with PROVERB_LOCK:
+        PROVERB_CACHE[lang_key] = verses
+        PROVERB_INDEX_TRACKER.setdefault(lang_key, 0)
+
+    return verses
+
+
+def _next_proverb(language: Optional[str]) -> str:
+    """Return the next proverb for the marquee, advancing the pointer."""
+    lang_key = _proverb_language_key(language)
+    verses = _load_proverbs(lang_key)
+    if not verses:
+        return "Proverbs unavailable."
+
+    with PROVERB_LOCK:
+        index = PROVERB_INDEX_TRACKER.get(lang_key, 0)
+        verse = verses[index % len(verses)]
+        PROVERB_INDEX_TRACKER[lang_key] = (index + 1) % len(verses)
+    return verse
 
 RADIO_STALE_RX_THRESHOLD = _coerce_positive_int(
     config.get("radio_stale_rx_seconds", RADIO_STALE_RX_THRESHOLD_DEFAULT),
@@ -916,24 +1181,11 @@ def _sender_key(sender_id: Any) -> str:
 # -----------------------------
 DEBUG_ENABLED = bool(config.get("debug", False))
 CLEAN_LOGS = bool(config.get("clean_logs", True))  # Enable emoji-enhanced clean logging by default
-AI_PROVIDER = config.get("ai_provider", "lmstudio").lower()
+AI_PROVIDER = config.get("ai_provider", "ollama").lower()
 SYSTEM_PROMPT = config.get("system_prompt", "You are a helpful assistant responding to mesh network chats.")
-LMSTUDIO_URL = config.get("lmstudio_url", "http://localhost:1234/v1/chat/completions")
-LMSTUDIO_TIMEOUT = config.get("lmstudio_timeout", 60)
-LMSTUDIO_CHAT_MODEL = config.get(
-    "lmstudio_chat_model",
-    "llama-3.2-1b-instruct-uncensored",
-)
-LMSTUDIO_EMBEDDING_MODEL = config.get(
-    "lmstudio_embedding_model",
-    "text-embedding-nomic-embed-text-v1.5",	
-)	
-OPENAI_API_KEY = config.get("openai_api_key", "")
-OPENAI_MODEL = config.get("openai_model", "gpt-3.5-turbo")
-OPENAI_TIMEOUT = config.get("openai_timeout", 30)
 OLLAMA_URL = config.get("ollama_url", "http://localhost:11434/api/generate")
-OLLAMA_MODEL = config.get("ollama_model", "llama2")
-OLLAMA_TIMEOUT = config.get("ollama_timeout", 60)
+OLLAMA_MODEL = config.get("ollama_model", "llama3.2:1b")
+OLLAMA_TIMEOUT = config.get("ollama_timeout", 120)
 # Max characters of conversation history to include in prompts for Ollama
 try:
     OLLAMA_CONTEXT_CHARS = int(config.get("ollama_context_chars", 4000))
@@ -964,6 +1216,35 @@ try:
 except (ValueError, TypeError):
     MAIL_SEARCH_NUM_CTX = min(4096, OLLAMA_NUM_CTX)
 MAIL_SEARCH_NUM_CTX = max(1024, min(MAIL_SEARCH_NUM_CTX, OLLAMA_NUM_CTX))
+
+try:
+    SEND_RATE_WINDOW_SECONDS = max(1, int(config.get("send_rate_window_seconds", 5)))
+except (TypeError, ValueError):
+    SEND_RATE_WINDOW_SECONDS = 5
+
+try:
+    SEND_RATE_MAX_MESSAGES = int(config.get("send_rate_max_messages", 20))
+except (TypeError, ValueError):
+    SEND_RATE_MAX_MESSAGES = 20
+if SEND_RATE_MAX_MESSAGES < 1:
+    SEND_RATE_MAX_MESSAGES = 0
+
+_SEND_RATE_LOCK = threading.Lock()
+_SEND_RATE_EVENTS: deque[float] = deque()
+
+
+def check_send_rate_limit() -> bool:
+    """Simple sliding-window rate limiter for outbound mesh messages."""
+    if SEND_RATE_MAX_MESSAGES == 0:
+        return True
+    now = time.time()
+    with _SEND_RATE_LOCK:
+        while _SEND_RATE_EVENTS and now - _SEND_RATE_EVENTS[0] > SEND_RATE_WINDOW_SECONDS:
+            _SEND_RATE_EVENTS.popleft()
+        if len(_SEND_RATE_EVENTS) >= SEND_RATE_MAX_MESSAGES:
+            return False
+        _SEND_RATE_EVENTS.append(now)
+    return True
 
 MAIL_MANAGER = MailManager(
     store_path="mesh_mailboxes.json",
@@ -1329,11 +1610,6 @@ try:
 except (ValueError, TypeError):
     MAX_MESSAGE_LOG = 100
 
-ENABLE_DISCORD = config.get("enable_discord", False)
-DISCORD_WEBHOOK_URL = config.get("discord_webhook_url", None)
-DISCORD_SEND_EMERGENCY = config.get("discord_send_emergency", False)
-DISCORD_SEND_AI = config.get("discord_send_ai", False)
-DISCORD_SEND_ALL = config.get("discord_send_all", False)
 
 ALERT_BELL_KEYWORDS = {
     "🔔 alert bell character!",
@@ -1377,19 +1653,24 @@ except Exception:
     BIBLE_PROGRESS = {}
 BIBLE_PROGRESS_LOCK = threading.Lock()
 
+SERIAL_PORT = config.get("serial_port", "")
 try:
-    WEATHER_WORLD_CITIES = safe_load_json("data/world_cities.json", [])
-    if not isinstance(WEATHER_WORLD_CITIES, list):
-        WEATHER_WORLD_CITIES = []
-except Exception:
-    WEATHER_WORLD_CITIES = []
+    SERIAL_BAUD = int(config.get("serial_baud", 115200))
+except (ValueError, TypeError):
+    SERIAL_BAUD = 115200
+USE_WIFI = bool(config.get("use_wifi", False))
+WIFI_HOST = config.get("wifi_host") or None
+try:
+    WIFI_PORT = int(config.get("wifi_port", 4403))
+except (ValueError, TypeError):
+    WIFI_PORT = 4403
+USE_MESH_INTERFACE = bool(config.get("use_mesh_interface", False))
 
+AUTO_REFRESH_ENABLED = bool(config.get("auto_refresh_enabled", False))
 try:
-    WEATHER_US_ZIPCODES = safe_load_json("data/USCities.json", [])
-    if not isinstance(WEATHER_US_ZIPCODES, list):
-        WEATHER_US_ZIPCODES = []
-except Exception:
-    WEATHER_US_ZIPCODES = []
+    AUTO_REFRESH_MINUTES = max(1, int(config.get("auto_refresh_minutes", 60)))
+except (ValueError, TypeError):
+    AUTO_REFRESH_MINUTES = 60
 
 BIBLE_SPANISH_DISPLAY_OVERRIDES = {
     "Genesis": "Génesis",
@@ -1880,7 +2161,6 @@ COMMAND_DELAY_OVERRIDES = {
     "/c search": 1.0,
     "/wipe command": 1.0,
     "/wipe confirm": 1.0,
-    "/weather command": 2.0,
 }
 
 
@@ -1898,105 +2178,279 @@ def _command_delay(reason: str, delay: Optional[float] = None) -> None:
 
 TRAILING_COMMAND_PUNCT = ",.;:!?)]}"
 
-EL_PASO_LAT = 31.761877
-EL_PASO_LON = -106.485022
-EL_PASO_WEATHER_TTL = 600  # seconds
-EL_PASO_WEATHER_API = "https://api.open-meteo.com/v1/forecast"
-EL_PASO_WEATHER_CACHE: Dict[str, Any] = {"timestamp": 0.0, "text": None}
-OFFLINE_WEATHER_FILE = os.path.join("data", "offline_weather.json")
-OFFLINE_FORECAST_REFRESH_TTL = 6 * 3600
-OFFLINE_FORECAST_LAST_REFRESH = 0.0
-WEATHER_SERVICE_AVAILABLE = True
-WEATHER_DYNAMIC_CACHE: Dict[str, Dict[str, Any]] = {}
-WEATHER_CITY_SYNONYMS = {
-    "cdmx": "Ciudad de México",
-    "ciudad de mexico": "Ciudad de México",
-    "mexico df": "Ciudad de México",
-    "df": "Ciudad de México",
-    "cd juarez": "Ciudad Juárez",
-    "cdjuarez": "Ciudad Juárez",
-    "juarez": "Ciudad Juárez",
-    "gdl": "Guadalajara",
-    "guadalajara": "Guadalajara",
-    "mty": "Monterrey",
-    "monterrey": "Monterrey",
-    "tijuana": "Tijuana",
-    "tij": "Tijuana",
-    "bogota": "Bogotá",
-    "bogotá": "Bogotá",
-    "santiago": "Santiago",
-    "nyc": "New York",
-    "new york city": "New York",
-    "la": "Los Angeles",
-    "los angeles": "Los Angeles",
-    "chis": "Chihuahua",
-    "chihuahua": "Chihuahua",
-}
 
-COMMAND_ALIASES = {
-    # English shortcuts / typos
-    "/menu": {"canonical": "/menu", "languages": ["en", "es"]},
-    "/m": {"canonical": "/m", "languages": ["en"]},
-    "/mail": {"canonical": "/m", "languages": ["en"]},
-    "/email": {"canonical": "/m", "languages": ["en"]},
-    "/c": {"canonical": "/c", "languages": ["en"]},
-    "/checkmail": {"canonical": "/c", "languages": ["en"]},
-    "/check": {"canonical": "/c", "languages": ["en"]},
-    "/meshtastic": {"canonical": "/meshtastic", "languages": ["en"]},
-    "/meshkb": {"canonical": "/meshtastic", "languages": ["en"]},
-    "/meshdoc": {"canonical": "/meshtastic", "languages": ["en"]},
-    "/aisettings": {"canonical": "/aipersonality", "languages": ["en"]},
-    "/aivibe": {"canonical": "/aivibe", "languages": ["en"]},
-    "/choosevibe": {"canonical": "/choosevibe", "languages": ["en"]},
-    "/changevibe": {"canonical": "/choosevibe", "languages": ["en"]},
-    "/adventure": {"canonical": "/adventure", "languages": ["en"]},
-    "/choose": {"canonical": "/adventure", "languages": ["en", "es"]},
-    "/emailhelp": {"canonical": "/emailhelp", "languages": ["en"]},
-    "/aipersonality": {"canonical": "/aipersonality", "languages": ["en"]},
-    "/aiperson": {"canonical": "/aipersonality", "languages": ["en"]},
-    "/aistyle": {"canonical": "/aipersonality", "languages": ["en"]},
-    "/aiemoji": {"canonical": "/aipersonality", "languages": ["en"]},
-    "/wipe": {"canonical": "/wipe", "languages": ["en"]},
-    "/clearbox": {"canonical": "/wipe", "languages": ["en"]},
-    "/clearmail": {"canonical": "/wipe", "languages": ["en"]},
-    "/wipebox": {"canonical": "/wipe", "languages": ["en"]},
-    "/games": {"canonical": "/games", "languages": ["en"]},
-    "/game": {"canonical": "/games", "languages": ["en"]},
-    "/hangman": {"canonical": "/hangman", "languages": ["en"]},
-    "/wordle": {"canonical": "/wordle", "languages": ["en"]},
-    "/wordladder": {"canonical": "/wordladder", "languages": ["en"]},
-    "/ladder": {"canonical": "/wordladder", "languages": ["en"]},
-    "/rps": {"canonical": "/rps", "languages": ["en"]},
-    "/rpc": {"canonical": "/rps", "languages": ["en"]},
-    "/rockpaperscissors": {"canonical": "/rps", "languages": ["en"]},
-    "/coinflip": {"canonical": "/coinflip", "languages": ["en"]},
-    "/coin": {"canonical": "/coinflip", "languages": ["en"]},
-    "/flip": {"canonical": "/coinflip", "languages": ["en"]},
-    "/cipher": {"canonical": "/cipher", "languages": ["en"]},
-    "/code": {"canonical": "/cipher", "languages": ["en"]},
-    "/bingo": {"canonical": "/bingo", "languages": ["en"]},
-    "/quizbattle": {"canonical": "/quizbattle", "languages": ["en"]},
-    "/quizb": {"canonical": "/quizbattle", "languages": ["en"]},
-    "/morse": {"canonical": "/morse", "languages": ["en"]},
-    "/commands": {"canonical": "/help", "languages": ["en"]},
-    "/command": {"canonical": "/help", "languages": ["en"]},
-    "/h": {"canonical": "/help", "languages": ["en"]},
-    "/bibleverse": {"canonical": "/bible", "languages": ["en"]},
-    "/scripture": {"canonical": "/bible", "languages": ["en"]},
-    "/verses": {"canonical": "/bible", "languages": ["en"]},
-    "/biblefact": {"canonical": "/bible", "languages": ["en"]},
-    "/biblefacts": {"canonical": "/bible", "languages": ["en"]},
-    "/biblehelp": {"canonical": "/biblehelp", "languages": ["en"]},
-    "/chuck": {"canonical": "/chucknorris", "languages": ["en"]},
-    "/norris": {"canonical": "/chucknorris", "languages": ["en"]},
-    "/chuckfacts": {"canonical": "/chucknorris", "languages": ["en"]},
-    "/chuckfact": {"canonical": "/chucknorris", "languages": ["en"]},
-    "/facts": {"canonical": "/chucknorris", "languages": ["en"]},
-    "/blondjoke": {"canonical": "/blond", "languages": ["en"]},
-    "/blonde": {"canonical": "/blond", "languages": ["en"]},
-    "/blondejoke": {"canonical": "/blond", "languages": ["en"]},
-    "/yomama": {"canonical": "/yomomma", "languages": ["en"]},
-    "/yomamma": {"canonical": "/yomomma", "languages": ["en"]},
+# -----------------------------
+# Anti-spam helpers
+# -----------------------------
+
+def _antispam_get_state(sender_key: str) -> Dict[str, Any]:
+    state = ANTISPAM_STATE.get(sender_key)
+    if state is None:
+        state = {
+            'history': deque(),
+            'timeout_until': None,
+            'timeout_level': 0,
+            'notified': False,
+            'last_short_timeout_end': None,
+        }
+        ANTISPAM_STATE[sender_key] = state
+    return state
+
+
+def _antispam_refresh_state(state: Dict[str, Any], now: float) -> None:
+    timeout_until = state.get('timeout_until')
+    if timeout_until and now >= timeout_until:
+        level = state.get('timeout_level', 0)
+        if level == 1:
+            state['last_short_timeout_end'] = timeout_until
+        elif level == 2:
+            state['last_short_timeout_end'] = None
+        state['timeout_until'] = None
+        state['timeout_level'] = 0
+        state['notified'] = False
+        state['history'].clear()
+
+
+def _antispam_is_blocked(sender_key: Optional[str], *, now: Optional[float] = None) -> Optional[float]:
+    if not sender_key:
+        return None
+    current = now or time.time()
+    with ANTISPAM_LOCK:
+        state = ANTISPAM_STATE.get(sender_key)
+        if not state:
+            return None
+        _antispam_refresh_state(state, current)
+        timeout_until = state.get('timeout_until')
+        if timeout_until and current < timeout_until:
+            return timeout_until
+    return None
+
+
+def _antispam_register_trigger(sender_key: Optional[str], *, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    if not sender_key:
+        return None
+    current = now or time.time()
+    with ANTISPAM_LOCK:
+        state = _antispam_get_state(sender_key)
+        _antispam_refresh_state(state, current)
+        timeout_until = state.get('timeout_until')
+        if timeout_until and current < timeout_until:
+            return None  # Already timed out
+
+        history: deque = state['history']
+        window_start = current - ANTISPAM_WINDOW_SECONDS
+        while history and history[0] < window_start:
+            history.popleft()
+        history.append(current)
+
+        if len(history) > ANTISPAM_THRESHOLD:
+            last_short_end = state.get('last_short_timeout_end')
+            if last_short_end and (current - last_short_end) <= ANTISPAM_ESCALATION_WINDOW:
+                duration = ANTISPAM_LONG_TIMEOUT
+                level = 2
+                state['last_short_timeout_end'] = None
+            else:
+                duration = ANTISPAM_SHORT_TIMEOUT
+                level = 1
+
+            until = current + duration
+            state['timeout_until'] = until
+            state['timeout_level'] = level
+            state['notified'] = False
+            history.clear()
+            return {
+                'level': level,
+                'until': until,
+                'duration': duration,
+            }
+    return None
+
+
+def _antispam_mark_notified(sender_key: Optional[str]) -> None:
+    if not sender_key:
+        return
+    with ANTISPAM_LOCK:
+        state = ANTISPAM_STATE.get(sender_key)
+        if state:
+            state['notified'] = True
+
+
+def _antispam_notification_needed(sender_key: Optional[str]) -> bool:
+    if not sender_key:
+        return False
+    with ANTISPAM_LOCK:
+        state = ANTISPAM_STATE.get(sender_key)
+        if not state:
+            return False
+        return bool(state.get('timeout_until')) and not state.get('notified', False)
+
+
+def _antispam_format_time(until_ts: float, *, include_date: bool = False) -> str:
+    dt = datetime.fromtimestamp(until_ts)
+    if include_date:
+        return dt.strftime("%b %d %H:%M")
+    return dt.strftime("%H:%M")
+
+
+def _kb_tokenize(text: str) -> List[str]:
+    stripped = unidecode(text.lower())
+    return re.findall(r"[a-z0-9]+", stripped)
+
+
+def _load_meshtastic_kb_locked() -> bool:
+    global MESHTASTIC_KB_CHUNKS, MESHTASTIC_KB_MTIME
+    if not MESHTASTIC_KB_FILE:
+        MESHTASTIC_KB_CHUNKS = []
+        MESHTASTIC_KB_MTIME = None
+        return False
+    try:
+        mtime = os.path.getmtime(MESHTASTIC_KB_FILE)
+    except OSError:
+        MESHTASTIC_KB_CHUNKS = []
+        MESHTASTIC_KB_MTIME = None
+        return False
+    if MESHTASTIC_KB_MTIME and MESHTASTIC_KB_MTIME == mtime and MESHTASTIC_KB_CHUNKS:
+        return True
+    try:
+        raw = Path(MESHTASTIC_KB_FILE).read_text(encoding='utf-8')
+    except Exception as exc:
+        clean_log(f"Unable to read MeshTastic knowledge file: {exc}", "⚠️")
+        MESHTASTIC_KB_CHUNKS = []
+        MESHTASTIC_KB_MTIME = None
+        return False
+
+    sections: List[Tuple[str, str]] = []
+    current_title = "Overview"
+    current_lines: List[str] = []
+    for line in raw.splitlines():
+        if line.startswith('## '):
+            if current_lines:
+                sections.append((current_title, '\n'.join(current_lines).strip()))
+            current_title = line[3:].strip() or current_title
+            current_lines = []
+            continue
+        if line.startswith('# ') and not sections and not current_lines:
+            # Skip document-level title
+            continue
+        current_lines.append(line)
+    if current_lines:
+        sections.append((current_title, '\n'.join(current_lines).strip()))
+
+    chunks: List[Dict[str, Any]] = []
+    for title, body in sections:
+        paragraphs = [p.strip() for p in body.split('\n\n') if p.strip()]
+        buffer = ''
+        for paragraph in paragraphs:
+            candidate = paragraph if not buffer else f"{buffer}\n\n{paragraph}"
+            if len(candidate) <= 900:
+                buffer = candidate
+                continue
+            if buffer:
+                chunks.append({'title': title, 'text': buffer})
+            if len(paragraph) <= 900:
+                buffer = paragraph
+            else:
+                start = 0
+                while start < len(paragraph):
+                    slice_text = paragraph[start:start + 900].strip()
+                    if slice_text:
+                        chunks.append({'title': title, 'text': slice_text})
+                    start += 900
+                buffer = ''
+        if buffer:
+            chunks.append({'title': title, 'text': buffer})
+
+    prepared: List[Dict[str, Any]] = []
+    for chunk in chunks:
+        tokens = _kb_tokenize(chunk['text'])
+        if not tokens:
+            continue
+        prepared.append({
+            'title': chunk['title'],
+            'text': chunk['text'],
+            'text_lower': chunk['text'].lower(),
+            'term_counts': Counter(tokens),
+            'title_tokens': set(_kb_tokenize(chunk['title'])),
+            'length': len(chunk['text']),
+        })
+
+    MESHTASTIC_KB_CHUNKS = prepared
+    MESHTASTIC_KB_MTIME = mtime
+    clean_log(f"Loaded MeshTastic knowledge base ({len(prepared)} chunks)", "📚")
+    return bool(prepared)
+
+
+def _ensure_meshtastic_kb_loaded() -> bool:
+    with MESHTASTIC_KB_LOCK:
+        return _load_meshtastic_kb_locked()
+
+
+def _search_meshtastic_kb(query: str, max_chunks: int = 5) -> List[Dict[str, Any]]:
+    if not query:
+        return []
+    if not _ensure_meshtastic_kb_loaded():
+        return []
+    query_tokens = _kb_tokenize(query)
+    if not query_tokens:
+        return []
+    query_lower = unidecode(query.lower())
+    with MESHTASTIC_KB_LOCK:
+        chunks = list(MESHTASTIC_KB_CHUNKS)
+    if not chunks:
+        return []
+
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+    for chunk in chunks:
+        term_counts = chunk['term_counts']
+        score = 0.0
+        unique_hits = 0
+        for token in query_tokens:
+            freq = term_counts.get(token, 0)
+            if freq:
+                score += freq * 2.0
+                unique_hits += 1
+                if token in chunk['title_tokens']:
+                    score += 1.5
+        if unique_hits:
+            score += unique_hits * 0.75
+        if query_lower in chunk['text_lower']:
+            score += 3.0
+        if score <= 0:
+            continue
+        score = score / (1.0 + math.log1p(chunk['length']))
+        scored.append((score, chunk))
+
+    if not scored:
+        return []
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    selected: List[Dict[str, Any]] = []
+    total_chars = 0
+    for score, chunk in scored:
+        if len(selected) >= max_chunks:
+            break
+        chunk_len = chunk['length']
+        if selected and total_chars + chunk_len > MESHTASTIC_KB_MAX_CONTEXT:
+            continue
+        selected.append({**chunk, 'score': score})
+        total_chars += chunk_len
+
+    if not selected:
+        score, chunk = scored[0]
+        selected.append({**chunk, 'score': score})
+
+    return selected
+
+
+def _format_meshtastic_context(chunks: List[Dict[str, Any]]) -> str:
+    if not chunks:
+        return ""
+    lines: List[str] = []
+    for idx, chunk in enumerate(chunks, 1):
+        lines.append(f"[{idx}] {chunk['title']}\n{chunk['text'].strip()}")
+    return "\n\n".join(lines)
+
+COMMAND_ALIASES: Dict[str, Dict[str, Any]] = {
     "/momma": {"canonical": "/yomomma", "languages": ["en"]},
     "/mommajoke": {"canonical": "/yomomma", "languages": ["en"]},
     "/yomommajoke": {"canonical": "/yomomma", "languages": ["en"]},
@@ -4198,1579 +4652,6 @@ def _parse_bible_reference(text: str) -> Optional[Tuple[str, int, Optional[int],
             verse_start = int(range_parts[0])
         except (TypeError, ValueError):
             return None
-        if len(range_parts) > 1 and range_parts[1].strip():
-            try:
-                verse_end = int(range_parts[1])
-            except (TypeError, ValueError):
-                return None
-        else:
-            verse_end = verse_start
-    return book_raw, chapter, verse_start, verse_end
-
-
-def _collect_bible_verses(
-    book: str,
-    chapter: int,
-    verse_start: int,
-    verse_end: int,
-    preferred_language: str = 'en',
-) -> Optional[Dict[str, Any]]:
-    if verse_start > verse_end:
-        verse_start, verse_end = verse_end, verse_start
-    books_source, lang_used = _get_books_and_language(book, preferred_language)
-    if not books_source or not lang_used:
-        return None
-    chapters = books_source.get(book, [])
-    if chapter < 1 or chapter > len(chapters):
-        return None
-    verses = chapters[chapter - 1]
-    if not verses:
-        return None
-    verse_start = max(1, verse_start)
-    verse_end = min(len(verses), verse_end)
-    if verse_start > verse_end:
-        return None
-    collected: List[Tuple[int, str]] = []
-    for verse_num in range(verse_start, verse_end + 1):
-        text = verses[verse_num - 1]
-        if text:
-            collected.append((verse_num, text))
-    if not collected:
-        return None
-    translation_tag = 'RVR1909' if lang_used == 'es' else 'WEB'
-    return {
-        'verses': collected,
-        'language': lang_used,
-        'translation': translation_tag,
-        'chapter': chapter,
-        'first_verse': collected[0][0],
-        'last_verse': collected[-1][0],
-    }
-
-
-def _render_bible_passage(
-    book: str,
-    chapter: int,
-    verse_start: int,
-    verse_end: int,
-    preferred_language: str = 'en',
-    include_header: bool = False,
-) -> Optional[Tuple[str, Dict[str, Any]]]:
-    data = _collect_bible_verses(book, chapter, verse_start, verse_end, preferred_language)
-    if not data:
-        return None
-    actual_language = data['language']
-    display_book = _display_book_name(book, actual_language)
-    lines: List[str] = []
-    if include_header or data['first_verse'] == 1:
-        lines.append(f"📖 {display_book} {data['chapter']}")
-    verses = data['verses']
-    if len(verses) == 1:
-        lines.append(verses[0][1])
-    else:
-        for verse_num, verse_text in verses:
-            lines.append(f"{verse_num}. {verse_text}")
-    text = "\n".join(lines)
-    info = {
-        'book': book,
-        'chapter': data['chapter'],
-        'verse_start': data['first_verse'],
-        'verse_end': data['last_verse'],
-        'language': actual_language,
-        'translation': data['translation'],
-        'span': data['last_verse'] - data['first_verse'],
-    }
-    return text, info
-
-
-def _random_bible_verse(language: str = 'en') -> Optional[Dict[str, Any]]:
-    dataset = BIBLE_WEB_VERSES if language != 'es' else BIBLE_RVR_VERSES or BIBLE_WEB_VERSES
-    preferred_language = 'es' if language == 'es' and BIBLE_RVR_VERSES else 'en'
-    if not dataset:
-        dataset = BIBLE_RVR_VERSES if BIBLE_RVR_VERSES else BIBLE_WEB_VERSES
-        preferred_language = 'es' if dataset is BIBLE_RVR_VERSES else 'en'
-    if not dataset:
-        return None
-    verse = random.choice(dataset)
-    book = verse.get('book')
-    chapter = verse.get('chapter')
-    verse_num = verse.get('verse')
-    if not (book and chapter and verse_num):
-        return None
-    rendered = _render_bible_passage(book, chapter, verse_num, verse_num, preferred_language, include_header=True)
-    if not rendered:
-        return None
-    text, info = rendered
-    display_book = _display_book_name(book, info['language'])
-    header = f"📖 {display_book} {info['chapter']}:{info['verse_start']} ({info['translation']})"
-    body = text.split("\n", 1)[-1] if "\n" in text else text
-    combined = f"{header} — {body}"
-    info.update({
-        'text': combined,
-        'book': book,
-        'chapter': info['chapter'],
-    })
-    return info
-
-
-def _load_proverbs(language: str) -> List[str]:
-    lang_key = 'es' if language == 'es' else 'en'
-    if lang_key in PROVERB_CACHE and PROVERB_CACHE[lang_key]:
-        return PROVERB_CACHE[lang_key]
-    book_name = 'Proverbs'
-    books, lang_used = _get_books_and_language(book_name, lang_key)
-    if not books:
-        PROVERB_CACHE[lang_key] = []
-        return PROVERB_CACHE[lang_key]
-    chapters = books.get(book_name, []) or []
-    display_book = _display_book_name(book_name, lang_used or lang_key)
-    verses: List[str] = []
-    for chap_idx, verses_list in enumerate(chapters, start=1):
-        for verse_idx, verse_text in enumerate(verses_list or [], start=1):
-            cleaned = str(verse_text or '').strip()
-            if cleaned:
-                verses.append(f"{display_book} {chap_idx}:{verse_idx} — {cleaned}")
-    PROVERB_CACHE[lang_key] = verses
-    PROVERB_INDEX_TRACKER.setdefault(lang_key, 0)
-    return verses
-
-
-def _next_proverb(language: str) -> str:
-    lang_key = 'es' if language == 'es' else 'en'
-    verses = _load_proverbs(lang_key)
-    if not verses:
-        return "Proverbs unavailable."
-    idx = PROVERB_INDEX_TRACKER.get(lang_key, 0)
-    verse = verses[idx % len(verses)]
-    PROVERB_INDEX_TRACKER[lang_key] = (idx + 1) % len(verses)
-    return verse
-
-
-def _set_bible_nav(sender_key: Optional[str], info: Dict[str, Any], *, is_direct: bool, channel_idx: Optional[int]) -> None:
-    if not sender_key or not info:
-        return
-    PENDING_BIBLE_NAV[sender_key] = {
-        'book': info.get('book'),
-        'chapter': info.get('chapter'),
-        'verse_start': info.get('verse_start'),
-        'verse_end': info.get('verse_end'),
-        'span': info.get('span', info.get('verse_end', 0) - info.get('verse_start', 0)),
-        'language': info.get('language', 'en'),
-        'is_direct': is_direct,
-        'channel_idx': channel_idx,
-    }
-
-
-def _clear_bible_nav(sender_key: Optional[str]) -> None:
-    if sender_key and sender_key in PENDING_BIBLE_NAV:
-        PENDING_BIBLE_NAV.pop(sender_key, None)
-
-
-def _shift_bible_position(
-    state: Dict[str, Any],
-    forward: bool,
-) -> Optional[Tuple[str, int, int, int, str, bool]]:
-    book = state.get('book')
-    chapter = state.get('chapter')
-    verse_start = state.get('verse_start')
-    verse_end = state.get('verse_end')
-    span = state.get('span', (verse_end or 0) - (verse_start or 0))
-    preferred_language = state.get('language', 'en')
-    if not (book and chapter and verse_start is not None and verse_end is not None):
-        return None
-    span = max(0, span)
-    if forward:
-        new_start = verse_end + 1
-        new_end = new_start + span
-        cur_book = book
-        cur_chapter = chapter
-        language = preferred_language
-        while True:
-            chapter_len, lang_used = _get_chapter_length(cur_book, cur_chapter, language)
-            if chapter_len == 0:
-                alt = 'es' if language != 'es' else 'en'
-                chapter_len, lang_used = _get_chapter_length(cur_book, cur_chapter, alt)
-                if chapter_len == 0:
-                    return None
-            language = lang_used
-            if new_start <= chapter_len:
-                new_end = min(new_end, chapter_len)
-                return cur_book, cur_chapter, new_start, new_end, language, (cur_book != book or cur_chapter != chapter)
-            new_start -= chapter_len
-            new_end = new_start + span
-            next_book = _next_book(cur_book)
-            if not next_book:
-                return None
-            cur_book = next_book
-            cur_chapter = 1
-    else:
-        new_end = verse_start - 1
-        cur_book = book
-        cur_chapter = chapter
-        language = preferred_language
-        while True:
-            if new_end >= 1:
-                chapter_len, lang_used = _get_chapter_length(cur_book, cur_chapter, language)
-                if chapter_len == 0:
-                    alt = 'es' if language != 'es' else 'en'
-                    chapter_len, lang_used = _get_chapter_length(cur_book, cur_chapter, alt)
-                    if chapter_len == 0:
-                        return None
-                language = lang_used
-                new_start = max(new_end - span, 1)
-                return cur_book, cur_chapter, new_start, new_end, language, (cur_book != book or cur_chapter != chapter or new_start == 1)
-            prev_book = _prev_book(cur_book)
-            if not prev_book:
-                return None
-            cur_book = prev_book
-            chapter_count, _ = _get_chapter_count(cur_book, language)
-            if chapter_count == 0:
-                chapter_count, _ = _get_chapter_count(cur_book, 'es' if language != 'es' else 'en')
-                if chapter_count == 0:
-                    return None
-            cur_chapter = chapter_count
-            chapter_len, lang_used = _get_chapter_length(cur_book, cur_chapter, language)
-            if chapter_len == 0:
-                chapter_len, lang_used = _get_chapter_length(cur_book, cur_chapter, 'es' if language != 'es' else 'en')
-                if chapter_len == 0:
-                    return None
-            language = lang_used
-            new_end = chapter_len
-
-
-def _handle_bible_navigation(
-    sender_key: str,
-    forward: bool,
-    *,
-    is_direct: bool,
-    channel_idx: Optional[int],
-) -> Optional[PendingReply]:
-    state = PENDING_BIBLE_NAV.get(sender_key)
-    if not state:
-        return None
-    if state.get('is_direct') != is_direct or state.get('channel_idx') != channel_idx:
-        return None
-    shift = _shift_bible_position(state, forward)
-    if not shift:
-        language = state.get('language', 'en')
-        message = "📖 Already at the beginning." if not forward else "📖 Already at the end."
-        if language == 'es':
-            message = "📖 Ya estás al comienzo." if not forward else "📖 Ya estás al final."
-        return PendingReply(message, "/bible nav")
-
-    book, chapter, verse_start, verse_end, language, header_needed = shift
-    rendered = _render_bible_passage(book, chapter, verse_start, verse_end, language, include_header=header_needed)
-    if not rendered:
-        return PendingReply("⚠️ Verse unavailable.", "/bible nav")
-    text, info = rendered
-    info['book'] = book
-    nav_prompt = "\n<1,2>"
-    response = text + nav_prompt
-    _set_bible_nav(sender_key, info, is_direct=is_direct, channel_idx=channel_idx)
-    span = info.get('span', state.get('span', 0))
-    if sender_key:
-        if forward:
-            state_for_next = {
-                'book': book,
-                'chapter': info['chapter'],
-                'verse_start': info['verse_start'],
-                'verse_end': info['verse_end'],
-                'span': span,
-                'language': info.get('language', state.get('language', 'en')),
-            }
-            next_state = _shift_bible_position(state_for_next, True)
-            if next_state:
-                nb, nch, ns, ne, nlang, _ = next_state
-                _update_bible_progress(sender_key, nb, nch, ns, nlang, span)
-            else:
-                _update_bible_progress(sender_key, book, info['chapter'], info['verse_end'], info.get('language', 'en'), span)
-        else:
-            _update_bible_progress(sender_key, book, info['chapter'], info['verse_start'], info.get('language', 'en'), span)
-    return PendingReply(response, "/bible nav")
-
-
-def _prepare_bible_autoscroll(sender_key: str, is_direct: bool, channel_idx: Optional[int]) -> PendingReply:
-    lang = LANGUAGE_FALLBACK
-    if not is_direct:
-        text = translate(lang, 'bible_autoscroll_dm_only', "📖 Auto-scroll only works in direct messages.")
-        return PendingReply(text, "/bible nav")
-
-    state = PENDING_BIBLE_NAV.get(sender_key)
-    if not state:
-        text = translate(lang, 'bible_autoscroll_need_nav', "📖 Open a passage with /bible first, then reply 22 to auto-scroll.")
-        return PendingReply(text, "/bible nav")
-
-    nav_direct = state.get('is_direct', True)
-    nav_channel = state.get('channel_idx')
-    if not nav_direct:
-        text = translate(lang, 'bible_autoscroll_dm_only', "📖 Auto-scroll only works in direct messages.")
-        return PendingReply(text, "/bible nav")
-
-    with BIBLE_AUTOSCROLL_LOCK:
-        current = BIBLE_AUTOSCROLL_STATE.get(sender_key)
-        pending = BIBLE_AUTOSCROLL_PENDING.get(sender_key)
-
-        if current and current.get('active'):
-            current['stop_event'].set()
-            BIBLE_AUTOSCROLL_PENDING[sender_key] = {'action': 'stop'}
-            text = translate(lang, 'bible_autoscroll_stop', "⏹️ Auto-scroll paused. Reply 22 to resume.")
-            return PendingReply(text, "/bible nav")
-
-        if pending and pending.get('action') == 'start':
-            BIBLE_AUTOSCROLL_PENDING.pop(sender_key, None)
-            text = translate(lang, 'bible_autoscroll_stop', "⏹️ Auto-scroll paused. Reply 22 to resume.")
-            return PendingReply(text, "/bible nav")
-
-        BIBLE_AUTOSCROLL_PENDING[sender_key] = {
-            'action': 'start',
-            'is_direct': nav_direct,
-            'channel_idx': nav_channel,
-        }
-
-    text = translate(lang, 'bible_autoscroll_start', "📖 Auto-scroll engaged. Next verses every 12 seconds (30 total).")
-    return PendingReply(text, "/bible nav")
-
-
-def _process_bible_autoscroll_request(sender_key: Optional[str], sender_node: Any, interface_ref) -> None:
-    if not sender_key:
-        return
-
-    with BIBLE_AUTOSCROLL_LOCK:
-        request = BIBLE_AUTOSCROLL_PENDING.pop(sender_key, None)
-
-    if not request:
-        return
-
-    action = request.get('action')
-    if action == 'stop':
-        clean_log(f"Bible auto-scroll paused for {sender_key}", "📖")
-        return
-
-    if action != 'start':
-        return
-
-    if not interface_ref:
-        clean_log(f"Cannot start Bible auto-scroll for {sender_key}: interface unavailable", "⚠️")
-        return
-
-    is_direct = request.get('is_direct', True)
-    channel_idx = request.get('channel_idx')
-
-    if not is_direct:
-        clean_log(f"Auto-scroll ignored for {sender_key}: not a direct context", "⚠️")
-        return
-
-    stop_event = threading.Event()
-    state_record = {
-        'stop_event': stop_event,
-        'active': True,
-        'channel_idx': channel_idx,
-        'is_direct': is_direct,
-    }
-
-    with BIBLE_AUTOSCROLL_LOCK:
-        BIBLE_AUTOSCROLL_STATE[sender_key] = state_record
-
-    thread = threading.Thread(
-        target=_bible_autoscroll_worker,
-        args=(sender_key, sender_node, interface_ref, stop_event, channel_idx, is_direct),
-        daemon=True,
-    )
-    state_record['thread'] = thread
-    thread.start()
-    clean_log(f"Bible auto-scroll started for {sender_key}", "📖")
-
-
-def _bible_autoscroll_worker(
-    sender_key: str,
-    sender_node: Any,
-    interface_ref,
-    stop_event: threading.Event,
-    channel_idx: Optional[int],
-    is_direct: bool,
-) -> None:
-    chunks_sent = 0
-
-    try:
-        while chunks_sent < BIBLE_AUTOSCROLL_MAX_CHUNKS:
-            if stop_event.wait(BIBLE_AUTOSCROLL_INTERVAL):
-                break
-
-            if not interface_ref:
-                break
-
-            reply = _handle_bible_navigation(sender_key, True, is_direct=is_direct, channel_idx=channel_idx)
-            if not reply or not isinstance(reply, PendingReply):
-                break
-
-            text = reply.text
-            if not text:
-                break
-
-            send_direct_chunks(interface_ref, text, sender_node)
-            _antispam_after_response(sender_key, sender_node, interface_ref, count_response=False)
-            chunks_sent += 1
-
-            lowered = text.lower()
-            if "already at the end" in lowered or "ya estás al final" in lowered:
-                break
-
-        if not stop_event.is_set() and chunks_sent >= BIBLE_AUTOSCROLL_MAX_CHUNKS and interface_ref:
-            finish_text = translate(
-                LANGUAGE_FALLBACK,
-                'bible_autoscroll_finished',
-                "📖 Auto-scroll paused after 30 verses. Reply 22 to continue.",
-            )
-            send_direct_chunks(interface_ref, finish_text, sender_node)
-            _antispam_after_response(sender_key, sender_node, interface_ref, count_response=False)
-
-    except Exception as exc:
-        clean_log(f"Bible auto-scroll error for {sender_key}: {exc}", "⚠️")
-
-    finally:
-        with BIBLE_AUTOSCROLL_LOCK:
-            state = BIBLE_AUTOSCROLL_STATE.get(sender_key)
-            if state and state.get('stop_event') is stop_event:
-                BIBLE_AUTOSCROLL_STATE.pop(sender_key, None)
-        clean_log(f"Bible auto-scroll finished for {sender_key} (sent {chunks_sent})", "📖")
-
-
-def _random_chuck_fact(language: str = 'en') -> Optional[str]:
-    dataset = CHUCK_NORRIS_FACTS
-    if language == 'es' and CHUCK_NORRIS_FACTS_ES:
-        dataset = CHUCK_NORRIS_FACTS_ES
-    if not dataset:
-        return None
-    return random.choice(dataset)
-
-
-def _random_blond_joke(language: str = 'en') -> Optional[str]:
-    if not BLOND_JOKES:
-        return None
-    return random.choice(BLOND_JOKES)
-
-
-def _random_yo_momma_joke(language: str = 'en') -> Optional[str]:
-    if not YO_MOMMA_JOKES:
-        return None
-    return random.choice(YO_MOMMA_JOKES)
-
-
-WEATHER_INTENT_PATTERNS = [
-    re.compile(r"\bweather\b", re.IGNORECASE),
-    re.compile(r"\bforecast\b", re.IGNORECASE),
-    re.compile(r"\btemp(erature)?\b", re.IGNORECASE),
-    re.compile(r"\brain\b", re.IGNORECASE),
-    re.compile(r"\bsnow\b", re.IGNORECASE),
-    re.compile(r"\bclima\b", re.IGNORECASE),
-    re.compile(r"\btiempo\b", re.IGNORECASE),
-]
-
-WEATHER_LOCATION_STOPWORDS = {
-    'weather', 'forecast', 'temp', 'temperature', 'rain', 'snow', 'wind',
-    'what', 'whats', "what's", 'is', 'the', 'like', 'outside', 'today',
-    'tonight', 'tomorrow', 'this', 'week', 'right', 'now', 'please', 'por',
-    'favor', 'dime', 'que', 'cómo', 'como', 'esta', 'hace', 'hay', 'de',
-    'el', 'la', 'en', 'un', 'una', 'me', 'tell', 'about', 'give', 'me', 'and',
-    'can', 'you', 'for', 'at', 'near', 'around', 'in', 'del', 'lo', 'hoy',
-    'manana', 'mañana', 'ayer', 'ayer?', 'porfavor', 'favor?', 'please?',
-    'pronostico', 'pronóstico',
-}
-
-
-def _looks_like_weather_intent(text: str) -> bool:
-    if not text:
-        return False
-    normalized = unidecode(text or "").lower()
-    for pattern in WEATHER_INTENT_PATTERNS:
-        if pattern.search(normalized):
-            return True
-    return False
-
-
-def _extract_weather_location(text: str) -> str:
-    if not text:
-        return ""
-    match = re.search(r"\b(?:in|for|at|near|around)\s+([A-Za-z0-9\s,.-]{2,})", text, flags=re.IGNORECASE)
-    if match:
-        candidate = match.group(1)
-        candidate = re.sub(r"[?!\.]+$", "", candidate).strip()
-        words = [w.strip(".,") for w in candidate.split() if w]
-        filtered = [w for w in words if w.lower() not in WEATHER_LOCATION_STOPWORDS]
-        candidate_clean = " ".join(filtered).strip()
-        if candidate_clean:
-            return candidate_clean
-    sanitized = re.sub(r"[^A-Za-z0-9\s,.-]", " ", text)
-    tokens = [tok.strip(".,") for tok in sanitized.split() if tok]
-    filtered_tokens: List[str] = []
-    for tok in tokens:
-        lowered = unidecode(tok).lower()
-        if lowered in WEATHER_LOCATION_STOPWORDS:
-            continue
-        filtered_tokens.append(tok)
-    for tok in filtered_tokens:
-        digits = tok.replace('-', '').strip()
-        if digits.isdigit() and 3 <= len(digits) <= 6:
-            return digits
-    if filtered_tokens:
-        tail = filtered_tokens[-3:]
-        candidate = " ".join(tail).strip()
-        return candidate
-    return ""
-
-
-def _weather_code_description(code: Optional[int], language: str = 'en') -> str:
-    mapping_en = {
-        0: "clear sky",
-        1: "mainly clear",
-        2: "partly cloudy",
-        3: "overcast",
-        45: "fog",
-        48: "depositing rime fog",
-        51: "light drizzle",
-        53: "moderate drizzle",
-        55: "dense drizzle",
-        56: "light freezing drizzle",
-        57: "dense freezing drizzle",
-        61: "light rain",
-        63: "moderate rain",
-        65: "heavy rain",
-        66: "light freezing rain",
-        67: "heavy freezing rain",
-        71: "light snow",
-        73: "moderate snow",
-        75: "heavy snow",
-        77: "snow grains",
-        80: "light rain showers",
-        81: "moderate rain showers",
-        82: "violent rain showers",
-        85: "light snow showers",
-        86: "heavy snow showers",
-        95: "thunderstorm",
-        96: "thunderstorm with light hail",
-        99: "thunderstorm with heavy hail",
-    }
-    mapping_es = {
-        0: "cielo despejado",
-        1: "mayormente despejado",
-        2: "parcialmente nublado",
-        3: "cubierto",
-        45: "niebla",
-        48: "niebla helada",
-        51: "llovizna ligera",
-        53: "llovizna moderada",
-        55: "llovizna densa",
-        56: "llovizna helada ligera",
-        57: "llovizna helada intensa",
-        61: "lluvia ligera",
-        63: "lluvia moderada",
-        65: "lluvia intensa",
-        66: "lluvia helada ligera",
-        67: "lluvia helada intensa",
-        71: "nieve ligera",
-        73: "nieve moderada",
-        75: "nieve intensa",
-        77: "granitos de nieve",
-        80: "chubascos ligeros",
-        81: "chubascos moderados",
-        82: "chubascos violentos",
-        85: "chubascos de nieve ligeros",
-        86: "chubascos de nieve intensos",
-        95: "tormenta",
-        96: "tormenta con granizo ligero",
-        99: "tormenta con granizo fuerte",
-    }
-    try:
-        key = int(code) if code is not None else None
-    except (TypeError, ValueError):
-        key = None
-    if language == 'es':
-        return mapping_es.get(key, "condiciones locales")
-    return mapping_en.get(key, "local conditions")
-
-
-def _wind_direction_cardinal(degrees: Optional[float]) -> Optional[str]:
-    if degrees is None:
-        return None
-    try:
-        deg = float(degrees) % 360.0
-    except (TypeError, ValueError):
-        return None
-    directions = [
-        "N",
-        "NNE",
-        "NE",
-        "ENE",
-        "E",
-        "ESE",
-        "SE",
-        "SSE",
-        "S",
-        "SSW",
-        "SW",
-        "WSW",
-        "W",
-        "WNW",
-        "NW",
-        "NNW",
-    ]
-    idx = int((deg / 22.5) + 0.5) % len(directions)
-    return directions[idx]
-
-
-def _format_el_paso_weather() -> Optional[str]:
-    clean_log("Fetching El Paso weather snapshot", "🌤️", show_always=True, rate_limit=False)
-    summary = _format_weather_report("El Paso, TX", EL_PASO_LAT, EL_PASO_LON, language='en', timezone="America/Denver", cache_token="el_paso_en")
-    if summary:
-        EL_PASO_WEATHER_CACHE["timestamp"] = time.time()
-        EL_PASO_WEATHER_CACHE["text"] = summary
-    return summary
-
-
-def _load_offline_weather_cache() -> Optional[Dict[str, Any]]:
-    try:
-        with open(OFFLINE_WEATHER_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
-def _save_offline_weather_cache(payload: Dict[str, Any]) -> None:
-    try:
-        os.makedirs(os.path.dirname(OFFLINE_WEATHER_FILE), exist_ok=True)
-        write_atomic(OFFLINE_WEATHER_FILE, json.dumps(payload, indent=2, sort_keys=True))
-    except Exception as exc:
-        clean_log(f"Failed to persist offline forecast: {exc}", "⚠️")
-
-
-def _mark_weather_service_status(is_available: bool) -> None:
-    global WEATHER_SERVICE_AVAILABLE
-    WEATHER_SERVICE_AVAILABLE = is_available
-
-
-def _update_offline_forecast() -> None:
-    global OFFLINE_FORECAST_LAST_REFRESH
-    if _now() - OFFLINE_FORECAST_LAST_REFRESH < OFFLINE_FORECAST_REFRESH_TTL:
-        return
-    params = {
-        "latitude": EL_PASO_LAT,
-        "longitude": EL_PASO_LON,
-        "daily": "weathercode,temperature_2m_max,temperature_2m_min",
-        "forecast_days": 7,
-        "timezone": "America/Denver",
-    }
-    try:
-        resp = requests.get(EL_PASO_WEATHER_API, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:
-        return
-    daily = data.get("daily") or {}
-    times = daily.get("time") or []
-    codes = daily.get("weathercode") or []
-    tmax = daily.get("temperature_2m_max") or []
-    tmin = daily.get("temperature_2m_min") or []
-    days: List[Dict[str, Any]] = []
-    for idx, date_str in enumerate(times):
-        entry = {
-            "date": date_str,
-            "weathercode": codes[idx] if idx < len(codes) else None,
-            "tmax_c": tmax[idx] if idx < len(tmax) else None,
-            "tmin_c": tmin[idx] if idx < len(tmin) else None,
-        }
-        days.append(entry)
-    if not days:
-        return
-    payload = {
-        "generated": datetime.utcnow().isoformat() + "Z",
-        "days": days,
-    }
-    _save_offline_weather_cache(payload)
-    OFFLINE_FORECAST_LAST_REFRESH = _now()
-
-
-def _render_offline_el_paso(language: str) -> Optional[str]:
-    cache = _load_offline_weather_cache()
-    if not cache:
-        return None
-    days = cache.get("days") or []
-    if not days:
-        return None
-    today = datetime.now(timezone.utc).date()
-    chosen = None
-    for day in days:
-        try:
-            day_date = datetime.fromisoformat(day.get("date", "")).date()
-        except Exception:
-            continue
-        if day_date == today:
-            chosen = day
-            break
-    if not chosen:
-        return None
-    generated_iso = cache.get("generated")
-    try:
-        generated_dt = datetime.fromisoformat(generated_iso.replace("Z", "+00:00")) if generated_iso else None
-        generated_str = generated_dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z") if generated_dt else generated_iso
-    except Exception:
-        generated_str = generated_iso or "unknown"
-    code = chosen.get("weathercode")
-    desc = _weather_code_description(code, language or 'en')
-    tmax_c = chosen.get("tmax_c")
-    tmin_c = chosen.get("tmin_c")
-    if isinstance(tmax_c, (int, float)):
-        tmax_f = tmax_c * 9 / 5 + 32
-        tmax_text = f"high {round(tmax_f)}°F / {tmax_c:.1f}°C"
-    else:
-        tmax_text = ""
-    if isinstance(tmin_c, (int, float)):
-        tmin_f = tmin_c * 9 / 5 + 32
-        tmin_text = f"low {round(tmin_f)}°F / {tmin_c:.1f}°C"
-    else:
-        tmin_text = ""
-    parts = [p for p in [tmax_text, tmin_text] if p]
-    detail = f"{desc}"
-    if parts:
-        detail += " • " + "; ".join(parts)
-    intro = translate(language, 'weather_cached_intro', "⚠️ Live weather unavailable. Cached El Paso forecast (generated {generated}).", generated=generated_str)
-    outro = translate(language, 'weather_cached_outro', "Data may be outdated.")
-    return f"{intro}\nEl Paso {chosen.get('date')}: {detail}\n{outro}"
-
-
-def _random_el_paso_fact() -> Optional[str]:
-    if not EL_PASO_FACTS:
-        return None
-    return random.choice(EL_PASO_FACTS)
-
-
-def _normalize_weather_query(query: str) -> str:
-    cleaned = query.strip().lower()
-    return WEATHER_CITY_SYNONYMS.get(cleaned, query.strip())
-
-
-def _ensure_us_lookups() -> None:
-    global US_ZIP_LOOKUP, US_CITY_LOOKUP
-    if US_ZIP_LOOKUP is not None and US_CITY_LOOKUP is not None:
-        return
-    zip_lookup: Dict[str, Dict[str, Any]] = {}
-    city_lookup: Dict[str, Dict[str, Any]] = {}
-    try:
-        with open(os.path.join("data", "USCities.json"), "r", encoding="utf-8") as f:
-            rows = json.load(f)
-        for row in rows:
-            zip_code = str(row.get("zip_code") or "").zfill(5)
-            if zip_code:
-                zip_lookup[zip_code] = row
-            city = str(row.get("city") or "").strip().lower()
-            state = str(row.get("state") or "").strip().lower()
-            if city and state:
-                key = f"{city}|{state}"
-                if key not in city_lookup:
-                    city_lookup[key] = row
-    except Exception as exc:
-        clean_log(f"Unable to load US location data: {exc}", "⚠️")
-        zip_lookup = {}
-        city_lookup = {}
-    US_ZIP_LOOKUP = zip_lookup
-    US_CITY_LOOKUP = city_lookup
-
-
-def _ensure_world_lookup() -> None:
-    global WORLD_CITY_LOOKUP
-    if WORLD_CITY_LOOKUP is not None:
-        return
-    lookup: Dict[str, List[Dict[str, Any]]] = {}
-    try:
-        with open(os.path.join("data", "world_cities.json"), "r", encoding="utf-8") as f:
-            rows = json.load(f)
-        for row in rows:
-            name = str(row.get("name") or "").strip().lower()
-            if not name:
-                continue
-            lookup.setdefault(name, []).append(row)
-    except Exception as exc:
-        clean_log(f"Unable to load world city data: {exc}", "⚠️")
-        lookup = {}
-    WORLD_CITY_LOOKUP = lookup
-
-
-def _local_geocode(query: str, language: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    if not query:
-        return None
-    q_clean = query.strip()
-    if not q_clean:
-        return None
-    digits_only = re.sub(r"[^0-9]", "", q_clean)
-    if digits_only:
-        _ensure_us_lookups()
-        if US_ZIP_LOOKUP:
-            candidate = US_ZIP_LOOKUP.get(digits_only.zfill(5))
-            if candidate:
-                name = f"{candidate.get('city')}, {candidate.get('state')}"
-                return {
-                    "name": name,
-                    "latitude": float(candidate.get("latitude")),
-                    "longitude": float(candidate.get("longitude")),
-                    "timezone": "auto",
-                }
-    tokens = [part.strip() for part in re.split(r",", q_clean) if part.strip()]
-    city_part = tokens[0] if tokens else q_clean
-    state_part = tokens[1] if len(tokens) > 1 else None
-    if state_part is None:
-        pieces = city_part.split()
-        if len(pieces) > 1 and len(pieces[-1]) == 2:
-            state_part = pieces[-1]
-            city_part = " ".join(pieces[:-1])
-    if state_part:
-        _ensure_us_lookups()
-        key = f"{city_part.strip().lower()}|{state_part.strip().lower()}"
-        if US_CITY_LOOKUP and key in US_CITY_LOOKUP:
-            entry = US_CITY_LOOKUP[key]
-            name = f"{entry.get('city')}, {entry.get('state')}"
-            return {
-                "name": name,
-                "latitude": float(entry.get("latitude")),
-                "longitude": float(entry.get("longitude")),
-                "timezone": "auto",
-            }
-    _ensure_world_lookup()
-    if WORLD_CITY_LOOKUP:
-        world_key = city_part.strip().lower()
-        candidates = WORLD_CITY_LOOKUP.get(world_key)
-        if candidates:
-            best = candidates[0]
-            display_parts = [best.get("name")]
-            if best.get("admin1"):
-                display_parts.append(best.get("admin1"))
-            if best.get("country"):
-                display_parts.append(best.get("country"))
-            return {
-                "name": ", ".join([p for p in display_parts if p]),
-                "latitude": float(best.get("lat")),
-                "longitude": float(best.get("lng")),
-                "timezone": "auto",
-            }
-    return None
-
-
-def _geocode_location(query: str, language: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    normalized = _normalize_weather_query(query)
-    params = {
-        "count": 1,
-    }
-    local = _local_geocode(normalized, language)
-    if local:
-        return local
-    lang_param = None
-    if language == 'es':
-        lang_param = 'es'
-    if lang_param:
-        params["language"] = lang_param
-    lat = lon = None
-    base_url = "https://geocoding-api.open-meteo.com/v1/search"
-    query_str = normalized.strip()
-    is_postal = bool(re.fullmatch(r"[0-9A-Za-z\- ]{3,12}", query_str)) and any(char.isdigit() for char in query_str)
-    try:
-        if is_postal:
-            params_postal = dict(params)
-            params_postal["postal_code"] = query_str
-            resp = requests.get(base_url, params=params_postal, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            results = data.get("results") or []
-            if results:
-                best = results[0]
-                lat = best.get("latitude")
-                lon = best.get("longitude")
-                if lat is not None and lon is not None:
-                    name = best.get("name") or query_str
-                    country = best.get("country")
-                    display = f"{name}, {country}" if country else name
-                    _mark_weather_service_status(True)
-                    return {
-                        "name": display,
-                        "latitude": float(lat),
-                        "longitude": float(lon),
-                        "timezone": best.get("timezone") or "auto",
-                    }
-        params_name = dict(params)
-        params_name["name"] = query_str
-        resp = requests.get(base_url, params=params_name, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        results = data.get("results") or []
-        if not results:
-            return None
-        best = results[0]
-        lat = best.get("latitude")
-        lon = best.get("longitude")
-        if lat is None or lon is None:
-            return None
-        name = best.get("name") or query_str
-        admin1 = best.get("admin1")
-        country = best.get("country")
-        parts = [name]
-        if admin1 and admin1.lower() != name.lower():
-            parts.append(admin1)
-        if country and country.lower() not in [p.lower() for p in parts]:
-            parts.append(country)
-        display = ", ".join(parts)
-        _mark_weather_service_status(True)
-        return {
-            "name": display,
-            "latitude": float(lat),
-            "longitude": float(lon),
-            "timezone": best.get("timezone") or "auto",
-        }
-    except Exception:
-        _mark_weather_service_status(False)
-        return None
-
-
-def _format_weather_report(location_name: str, latitude: float, longitude: float, language: str = 'en', timezone: Optional[str] = None, cache_token: Optional[str] = None) -> Optional[str]:
-    key = cache_token or f"{round(latitude, 3)},{round(longitude, 3)}:{language}"
-    entry = WEATHER_DYNAMIC_CACHE.get(key)
-    now = time.time()
-    if entry and now - entry.get("timestamp", 0.0) < EL_PASO_WEATHER_TTL:
-        return entry.get("text")
-
-    params = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "current_weather": "true",
-        "hourly": "relativehumidity_2m,apparent_temperature",
-        "timezone": timezone or "auto",
-    }
-    if language == 'es':
-        params["language"] = "es"
-    try:
-        response = requests.get(EL_PASO_WEATHER_API, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-    except Exception:
-        _mark_weather_service_status(False)
-        return None
-
-    current = data.get("current_weather") or {}
-    if not current:
-        _mark_weather_service_status(False)
-        return None
-
-    temp_c = current.get("temperature")
-    temp_f = (temp_c * 9 / 5 + 32) if isinstance(temp_c, (int, float)) else None
-    wind_speed = current.get("windspeed")
-    wind_mph = wind_speed * 0.621371 if isinstance(wind_speed, (int, float)) else None
-    wind_dir_text = _wind_direction_cardinal(current.get("winddirection"))
-    weather_desc = _weather_code_description(current.get("weathercode"), language)
-    observed_time = str(current.get("time") or "").replace("T", " ").strip()
-
-    humidity = None
-    feels_like_c = None
-    hourly = data.get("hourly") or {}
-    hourly_times = hourly.get("time") or []
-    try:
-        idx = hourly_times.index(current.get("time"))
-    except ValueError:
-        idx = None
-    if idx is not None:
-        rel_humidity = hourly.get("relativehumidity_2m") or []
-        if idx < len(rel_humidity):
-            humidity = rel_humidity[idx]
-        apparent = hourly.get("apparent_temperature") or []
-        if idx < len(apparent):
-            feels_like_c = apparent[idx]
-
-    feels_like_f = (feels_like_c * 9 / 5 + 32) if isinstance(feels_like_c, (int, float)) else None
-
-    if language == 'es':
-        temp_bits = []
-        if isinstance(temp_c, (int, float)):
-            temp_bits.append(f"{temp_c:.1f}°C")
-        if isinstance(temp_f, (int, float)):
-            temp_bits.append(f"{temp_f:.0f}°F")
-        parts = []
-        if temp_bits:
-            parts.append(" / ".join(temp_bits))
-        if isinstance(feels_like_c, (int, float)):
-            parts.append(f"sensación {feels_like_c:.1f}°C")
-        elif isinstance(feels_like_f, (int, float)):
-            parts.append(f"sensación {feels_like_f:.0f}°F")
-        if isinstance(humidity, (int, float)):
-            parts.append(f"humedad {humidity:.0f}%")
-        if isinstance(wind_mph, (int, float)):
-            if wind_dir_text:
-                parts.append(f"viento {wind_mph:.0f} mph {wind_dir_text}")
-            else:
-                parts.append(f"viento {wind_mph:.0f} mph")
-        summary = f"Clima en {location_name}: {weather_desc}"
-        if parts:
-            summary += " • " + "; ".join(parts)
-        if observed_time:
-            summary += f" • actualizado {observed_time}"
-    else:
-        temp_bits = []
-        if isinstance(temp_f, (int, float)):
-            temp_bits.append(f"{temp_f:.0f}°F")
-        if isinstance(temp_c, (int, float)):
-            temp_bits.append(f"{temp_c:.1f}°C")
-        parts = []
-        if temp_bits:
-            parts.append(" / ".join(temp_bits))
-        if isinstance(feels_like_f, (int, float)):
-            parts.append(f"feels like {feels_like_f:.0f}°F")
-        elif isinstance(feels_like_c, (int, float)):
-            parts.append(f"feels like {feels_like_c:.1f}°C")
-        if isinstance(humidity, (int, float)):
-            parts.append(f"humidity {humidity:.0f}%")
-        if isinstance(wind_mph, (int, float)):
-            if wind_dir_text:
-                parts.append(f"wind {wind_mph:.0f} mph {wind_dir_text}")
-            else:
-                parts.append(f"wind {wind_mph:.0f} mph")
-        summary = f"Weather for {location_name}: {weather_desc}"
-        if parts:
-            summary += " • " + "; ".join(parts)
-        if observed_time:
-            summary += f" • updated {observed_time}"
-
-    WEATHER_DYNAMIC_CACHE[key] = {"timestamp": now, "text": summary}
-    _mark_weather_service_status(True)
-    if cache_token and cache_token.startswith("el_paso_"):
-        _update_offline_forecast()
-    return summary
-
-
-def _handle_weather_lookup(sender_key: Optional[str], query: str, language: Optional[str]) -> PendingReply:
-    lang = language or 'en'
-    location = _geocode_location(query, lang)
-    if location:
-        report = _format_weather_report(location["name"], location["latitude"], location["longitude"], language=lang, timezone=location.get("timezone"))
-        if report:
-            if sender_key:
-                PENDING_WEATHER_REQUESTS.pop(sender_key, None)
-            return PendingReply(report, "/weather command")
-        if sender_key:
-            PENDING_WEATHER_REQUESTS.pop(sender_key, None)
-        if "el paso" in location.get("name", "").lower():
-            offline = _render_offline_el_paso(lang)
-            if offline:
-                return PendingReply(offline, "/weather command")
-        failure = translate(lang, 'weather_service_fail', "🌤️ Weather service unavailable right now.")
-        return PendingReply(failure, "/weather command")
-    if sender_key:
-        info = PENDING_WEATHER_REQUESTS.setdefault(sender_key, {"language": lang, "attempts": 0})
-        info["language"] = lang
-        info["attempts"] = info.get("attempts", 0) + 1
-        if info["attempts"] >= 2:
-            PENDING_WEATHER_REQUESTS.pop(sender_key, None)
-            if not WEATHER_SERVICE_AVAILABLE:
-                offline = _render_offline_el_paso(lang)
-                if offline:
-                    return PendingReply(offline, "/weather command")
-                final_msg = translate(lang, 'weather_offline', "Weather data is offline.")
-            else:
-                final_msg = translate(lang, 'weather_final_fail', "I still can't find that location. Try another city or ZIP.")
-            return PendingReply(final_msg, "weather prompt")
-    if not WEATHER_SERVICE_AVAILABLE:
-        offline = _render_offline_el_paso(lang)
-        if offline:
-            return PendingReply(offline, "/weather command")
-        retry_msg = translate(lang, 'weather_offline', "Weather data is offline.")
-        return PendingReply(retry_msg, "/weather command")
-    retry_msg = translate(lang, 'weather_need_city', "I couldn't find that location. Tell me the nearest major city and I'll try again.")
-    return PendingReply(retry_msg, "weather prompt")
-
-
-def _parse_timestamp(ts: Optional[str]) -> Optional[datetime]:
-    if not ts:
-        return None
-    try:
-        return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S %Z").replace(tzinfo=timezone.utc)
-    except ValueError:
-        try:
-            return datetime.fromisoformat(ts)
-        except Exception:
-            return None
-
-
-def _format_node_label(node_key: Any) -> str:
-    if node_key is None:
-        return "Unknown"
-    try:
-        if isinstance(node_key, int):
-            return get_node_shortname(node_key)
-        if isinstance(node_key, str):
-            cleaned = node_key
-            if '(' in cleaned:
-                cleaned = cleaned.split('(')[0].strip()
-            try:
-                return get_node_shortname(node_key)
-            except Exception:
-                return cleaned or str(node_key)
-    except Exception:
-        pass
-    return str(node_key)
-
-
-def _compute_average_battery_voltage() -> Tuple[Optional[float], int]:
-    if interface is None or not hasattr(interface, "nodes"):
-        return None, 0
-    nodes = getattr(interface, "nodes", {}) or {}
-    total = 0.0
-    count = 0
-    for info in nodes.values():
-        telemetry = info.get("telemetry") or {}
-        voltage = None
-        if isinstance(telemetry, dict):
-            for key in ("batteryVoltage", "voltage", "Voltage"):
-                if key in telemetry:
-                    voltage = telemetry.get(key)
-                    break
-            if voltage is None:
-                battery_block = telemetry.get("battery")
-                if isinstance(battery_block, dict):
-                    for key in ("voltage", "voltageMv", "voltage_mv"):
-                        if key in battery_block:
-                            voltage = battery_block.get(key)
-                            if key.endswith("Mv") or key.endswith("mv"):
-                                try:
-                                    voltage = float(voltage) / 1000.0
-                                except Exception:
-                                    pass
-                            break
-        if voltage is None:
-            continue
-        try:
-            voltage_val = float(voltage)
-        except (TypeError, ValueError):
-            continue
-        if voltage_val >= BATTERY_PLUGGED_THRESHOLD:
-            continue
-        total += voltage_val
-        count += 1
-    if count == 0:
-        return None, 0
-    return total / count, count
-
-
-def _format_meshinfo_report(language: str) -> str:
-    lang = language or 'en'
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=1)
-    prev_cutoff = cutoff - timedelta(hours=1)
-
-    with messages_lock:
-        snapshot = list(messages)
-
-    node_first: Dict[Any, datetime] = {}
-    node_last: Dict[Any, datetime] = {}
-    node_counts: Counter = Counter()
-    recent_messages = 0
-
-    for entry in snapshot:
-        ts = _parse_timestamp(entry.get("timestamp"))
-        if ts is None:
-            continue
-        node_key = entry.get("node_id")
-        if node_key is None:
-            node_key = entry.get("node")
-        if node_key is None:
-            continue
-        is_ai = bool(entry.get("is_ai"))
-        if not is_ai:
-            first = node_first.get(node_key)
-            if first is None or ts < first:
-                node_first[node_key] = ts
-            last = node_last.get(node_key)
-            if last is None or ts > last:
-                node_last[node_key] = ts
-            if ts >= cutoff:
-                node_counts[node_key] += 1
-        if ts >= cutoff:
-            recent_messages += 1
-
-    new_nodes = [node for node, first in node_first.items() if first >= cutoff]
-    left_nodes = [node for node, last in node_last.items() if prev_cutoff <= last < cutoff]
-
-    avg_voltage, battery_count = _compute_average_battery_voltage()
-    capacity = MAX_SENDS_PER_MINUTE * 60 if MAX_SENDS_PER_MINUTE else 1200
-    usage_percent = min(100.0, (recent_messages / capacity) * 100 if capacity else 0.0)
-    usage_percent = round(usage_percent, 1)
-    top_nodes = node_counts.most_common(3)
-
-    lines = [translate(lang, 'meshinfo_header', "Mesh network summary (last hour)")]
-
-    if new_nodes:
-        names = ", ".join(_format_node_label(node) for node in new_nodes)
-        lines.append(translate(lang, 'meshinfo_new_nodes_some', "New nodes: {count} ({list})", count=len(new_nodes), list=names))
-    else:
-        lines.append(translate(lang, 'meshinfo_new_nodes_none', "New nodes: none"))
-
-    if left_nodes:
-        names = ", ".join(_format_node_label(node) for node in left_nodes)
-        lines.append(translate(lang, 'meshinfo_left_nodes_some', "Nodes left: {count} ({list})", count=len(left_nodes), list=names))
-    else:
-        lines.append(translate(lang, 'meshinfo_left_nodes_none', "No nodes departed in the last hour."))
-
-    if avg_voltage is not None and battery_count:
-        lines.append(translate(lang, 'meshinfo_avg_batt', "Average battery voltage (off-grid): {voltage:.2f} V ({count} nodes)", voltage=avg_voltage, count=battery_count))
-    else:
-        lines.append(translate(lang, 'meshinfo_avg_batt_unknown', "No battery data available."))
-
-    lines.append(translate(lang, 'meshinfo_network_usage', "Approximate network usage: {percent}% (last hour)", percent=f"{usage_percent:.1f}"))
-
-    if top_nodes:
-        formatted = ", ".join(f"{_format_node_label(node)} ({count})" for node, count in top_nodes)
-        lines.append(translate(lang, 'meshinfo_top_nodes', "Top nodes by traffic: {list}", list=formatted))
-    else:
-        lines.append(translate(lang, 'meshinfo_top_nodes_none', "No traffic recorded in the last hour."))
-
-    return "\n".join(lines)
-
-def _cmd_reply(cmd_name: str, message: str) -> PendingReply:
-    label = f"{cmd_name} command" if cmd_name else "command"
-    return PendingReply(message, label)
-
-DISCORD_RESPONSE_CHANNEL_INDEX = config.get("discord_response_channel_index", None)
-DISCORD_RECEIVE_ENABLED = config.get("discord_receive_enabled", True)
-# New variable for inbound routing
-DISCORD_INBOUND_CHANNEL_INDEX = config.get("discord_inbound_channel_index", None)
-if DISCORD_INBOUND_CHANNEL_INDEX is not None:
-    try:
-        DISCORD_INBOUND_CHANNEL_INDEX = int(DISCORD_INBOUND_CHANNEL_INDEX)
-    except (ValueError, TypeError):
-        DISCORD_INBOUND_CHANNEL_INDEX = None
-# For polling Discord messages (optional)
-DISCORD_BOT_TOKEN = config.get("discord_bot_token", None)
-DISCORD_CHANNEL_ID = config.get("discord_channel_id", None)
-
-ENABLE_TWILIO = config.get("enable_twilio", False)
-ENABLE_SMTP = config.get("enable_smtp", False)
-ALERT_PHONE_NUMBER = config.get("alert_phone_number", None)
-TWILIO_SID = config.get("twilio_sid", None)
-TWILIO_AUTH_TOKEN = config.get("twilio_auth_token", None)
-TWILIO_FROM_NUMBER = config.get("twilio_from_number", None)
-SMTP_HOST = config.get("smtp_host", None)
-SMTP_PORT = config.get("smtp_port", 587)
-SMTP_USER = config.get("smtp_user", None)
-SMTP_PASS = config.get("smtp_pass", None)
-ALERT_EMAIL_TO = config.get("alert_email_to", None)
-
-SERIAL_PORT = config.get("serial_port", "")
-try:
-    # SERIAL_BAUD = int(config.get("serial_baud", 921600))  # ← COMMENTED OUT - fast baud causing issues
-    SERIAL_BAUD = int(config.get("serial_baud", 115200))  # ← NEW ● default 115200 (slower for stability)
-except (ValueError, TypeError):
-    # SERIAL_BAUD = 921600  # ← COMMENTED OUT - fast baud causing issues  
-    SERIAL_BAUD = 115200  # ← NEW ● default 115200 (slower for stability)
-USE_WIFI = bool(config.get("use_wifi", False))
-WIFI_HOST = config.get("wifi_host", None)
-try:
-    WIFI_PORT = int(config.get("wifi_port", 4403))
-except (ValueError, TypeError):
-    WIFI_PORT = 4403
-USE_MESH_INTERFACE = bool(config.get("use_mesh_interface", False))
-
-# Auto-refresh to improve long-term stability
-AUTO_REFRESH_ENABLED = bool(config.get("auto_refresh_enabled", True))
-try:
-  AUTO_REFRESH_MINUTES = int(config.get("auto_refresh_minutes", 60))
-  if AUTO_REFRESH_MINUTES < 5:
-    AUTO_REFRESH_MINUTES = 60  # guard: don't thrash
-except (ValueError, TypeError):
-  AUTO_REFRESH_MINUTES = 60
-
-# Sending rate limiting to prevent mesh network overload
-from collections import deque
-send_timestamps = deque()
-send_rate_lock = threading.Lock()
-MAX_SENDS_PER_MINUTE = 20  # Configurable limit to prevent spam overload
-
-def check_send_rate_limit():
-    """Check if we're under the sending rate limit. Returns True if OK to send."""
-    with send_rate_lock:
-        now = time.time()
-        # Remove timestamps older than 1 minute
-        while send_timestamps and send_timestamps[0] < now - 60:
-            send_timestamps.popleft()
-        
-        if len(send_timestamps) >= MAX_SENDS_PER_MINUTE:
-            return False
-        
-        send_timestamps.append(now)
-        return True
-
-# -----------------------------
-# Anti-spam helpers
-# -----------------------------
-
-def _antispam_get_state(sender_key: str) -> Dict[str, Any]:
-    state = ANTISPAM_STATE.get(sender_key)
-    if state is None:
-        state = {
-            'history': deque(),
-            'timeout_until': None,
-            'timeout_level': 0,
-            'notified': False,
-            'last_short_timeout_end': None,
-        }
-        ANTISPAM_STATE[sender_key] = state
-    return state
-
-
-def _antispam_refresh_state(state: Dict[str, Any], now: float) -> None:
-    timeout_until = state.get('timeout_until')
-    if timeout_until and now >= timeout_until:
-        level = state.get('timeout_level', 0)
-        if level == 1:
-            state['last_short_timeout_end'] = timeout_until
-        elif level == 2:
-            state['last_short_timeout_end'] = None
-        state['timeout_until'] = None
-        state['timeout_level'] = 0
-        state['notified'] = False
-        state['history'].clear()
-
-
-def _antispam_is_blocked(sender_key: Optional[str], *, now: Optional[float] = None) -> Optional[float]:
-    if not sender_key:
-        return None
-    current = now or time.time()
-    with ANTISPAM_LOCK:
-        state = ANTISPAM_STATE.get(sender_key)
-        if not state:
-            return None
-        _antispam_refresh_state(state, current)
-        timeout_until = state.get('timeout_until')
-        if timeout_until and current < timeout_until:
-            return timeout_until
-    return None
-
-
-def _antispam_register_trigger(sender_key: Optional[str], *, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
-    if not sender_key:
-        return None
-    current = now or time.time()
-    with ANTISPAM_LOCK:
-        state = _antispam_get_state(sender_key)
-        _antispam_refresh_state(state, current)
-        timeout_until = state.get('timeout_until')
-        if timeout_until and current < timeout_until:
-            return None  # Already timed out
-
-        history: deque = state['history']
-        window_start = current - ANTISPAM_WINDOW_SECONDS
-        while history and history[0] < window_start:
-            history.popleft()
-        history.append(current)
-
-        if len(history) > ANTISPAM_THRESHOLD:
-            last_short_end = state.get('last_short_timeout_end')
-            if last_short_end and (current - last_short_end) <= ANTISPAM_ESCALATION_WINDOW:
-                duration = ANTISPAM_LONG_TIMEOUT
-                level = 2
-                state['last_short_timeout_end'] = None
-            else:
-                duration = ANTISPAM_SHORT_TIMEOUT
-                level = 1
-
-            until = current + duration
-            state['timeout_until'] = until
-            state['timeout_level'] = level
-            state['notified'] = False
-            history.clear()
-            return {
-                'level': level,
-                'until': until,
-                'duration': duration,
-            }
-    return None
-
-
-def _antispam_mark_notified(sender_key: Optional[str]) -> None:
-    if not sender_key:
-        return
-    with ANTISPAM_LOCK:
-        state = ANTISPAM_STATE.get(sender_key)
-        if state:
-            state['notified'] = True
-
-
-def _antispam_notification_needed(sender_key: Optional[str]) -> bool:
-    if not sender_key:
-        return False
-    with ANTISPAM_LOCK:
-        state = ANTISPAM_STATE.get(sender_key)
-        if not state:
-            return False
-        return bool(state.get('timeout_until')) and not state.get('notified', False)
-
-
-def _antispam_format_time(until_ts: float, *, include_date: bool = False) -> str:
-    dt = datetime.fromtimestamp(until_ts)
-    if include_date:
-        return dt.strftime("%b %d %H:%M")
-    return dt.strftime("%H:%M")
-
-
-def _kb_tokenize(text: str) -> List[str]:
-    stripped = unidecode(text.lower())
-    return re.findall(r"[a-z0-9]+", stripped)
-
-
-def _load_meshtastic_kb_locked() -> bool:
-    global MESHTASTIC_KB_CHUNKS, MESHTASTIC_KB_MTIME
-    if not MESHTASTIC_KB_FILE:
-        MESHTASTIC_KB_CHUNKS = []
-        MESHTASTIC_KB_MTIME = None
-        return False
-    try:
-        mtime = os.path.getmtime(MESHTASTIC_KB_FILE)
-    except OSError:
-        MESHTASTIC_KB_CHUNKS = []
-        MESHTASTIC_KB_MTIME = None
-        return False
-    if MESHTASTIC_KB_MTIME and MESHTASTIC_KB_MTIME == mtime and MESHTASTIC_KB_CHUNKS:
-        return True
-    try:
-        raw = Path(MESHTASTIC_KB_FILE).read_text(encoding='utf-8')
-    except Exception as exc:
-        clean_log(f"Unable to read MeshTastic knowledge file: {exc}", "⚠️")
-        MESHTASTIC_KB_CHUNKS = []
-        MESHTASTIC_KB_MTIME = None
-        return False
-
-    sections: List[Tuple[str, str]] = []
-    current_title = "Overview"
-    current_lines: List[str] = []
-    for line in raw.splitlines():
-        if line.startswith('## '):
-            if current_lines:
-                sections.append((current_title, '\n'.join(current_lines).strip()))
-            current_title = line[3:].strip() or current_title
-            current_lines = []
-            continue
-        if line.startswith('# ') and not sections and not current_lines:
-            # Skip document-level title
-            continue
-        current_lines.append(line)
-    if current_lines:
-        sections.append((current_title, '\n'.join(current_lines).strip()))
-
-    chunks: List[Dict[str, Any]] = []
-    for title, body in sections:
-        paragraphs = [p.strip() for p in body.split('\n\n') if p.strip()]
-        buffer = ''
-        for paragraph in paragraphs:
-            candidate = paragraph if not buffer else f"{buffer}\n\n{paragraph}"
-            if len(candidate) <= 900:
-                buffer = candidate
-                continue
-            if buffer:
-                chunks.append({'title': title, 'text': buffer})
-            if len(paragraph) <= 900:
-                buffer = paragraph
-            else:
-                start = 0
-                while start < len(paragraph):
-                    slice_text = paragraph[start:start + 900].strip()
-                    if slice_text:
-                        chunks.append({'title': title, 'text': slice_text})
-                    start += 900
-                buffer = ''
-        if buffer:
-            chunks.append({'title': title, 'text': buffer})
-
-    prepared: List[Dict[str, Any]] = []
-    for chunk in chunks:
-        tokens = _kb_tokenize(chunk['text'])
-        if not tokens:
-            continue
-        prepared.append({
-            'title': chunk['title'],
-            'text': chunk['text'],
-            'text_lower': chunk['text'].lower(),
-            'term_counts': Counter(tokens),
-            'title_tokens': set(_kb_tokenize(chunk['title'])),
-            'length': len(chunk['text']),
-        })
-
-    MESHTASTIC_KB_CHUNKS = prepared
-    MESHTASTIC_KB_MTIME = mtime
-    clean_log(f"Loaded MeshTastic knowledge base ({len(prepared)} chunks)", "📚")
-    return bool(prepared)
-
-
-def _ensure_meshtastic_kb_loaded() -> bool:
-    with MESHTASTIC_KB_LOCK:
-        return _load_meshtastic_kb_locked()
-
-
-def _search_meshtastic_kb(query: str, max_chunks: int = 5) -> List[Dict[str, Any]]:
-    if not query:
-        return []
-    if not _ensure_meshtastic_kb_loaded():
-        return []
-    query_tokens = _kb_tokenize(query)
-    if not query_tokens:
-        return []
-    query_lower = unidecode(query.lower())
-    with MESHTASTIC_KB_LOCK:
-        chunks = list(MESHTASTIC_KB_CHUNKS)
-    if not chunks:
-        return []
-
-    scored: List[Tuple[float, Dict[str, Any]]] = []
-    for chunk in chunks:
-        term_counts = chunk['term_counts']
-        score = 0.0
-        unique_hits = 0
-        for token in query_tokens:
-            freq = term_counts.get(token, 0)
-            if freq:
-                score += freq * 2.0
-                unique_hits += 1
-                if token in chunk['title_tokens']:
-                    score += 1.5
-        if unique_hits:
-            score += unique_hits * 0.75
-        if query_lower in chunk['text_lower']:
-            score += 3.0
-        if score <= 0:
-            continue
-        score = score / (1.0 + math.log1p(chunk['length']))
-        scored.append((score, chunk))
-
-    if not scored:
-        return []
-
-    scored.sort(key=lambda item: item[0], reverse=True)
-    selected: List[Dict[str, Any]] = []
-    total_chars = 0
-    for score, chunk in scored:
-        if len(selected) >= max_chunks:
-            break
-        chunk_len = chunk['length']
-        if selected and total_chars + chunk_len > MESHTASTIC_KB_MAX_CONTEXT:
-            continue
-        selected.append({**chunk, 'score': score})
-        total_chars += chunk_len
-
-    if not selected:
-        score, chunk = scored[0]
-        selected.append({**chunk, 'score': score})
-
-    return selected
-
-
-def _format_meshtastic_context(chunks: List[Dict[str, Any]]) -> str:
-    if not chunks:
-        return ""
-    lines: List[str] = []
-    for idx, chunk in enumerate(chunks, 1):
-        lines.append(f"[{idx}] {chunk['title']}\n{chunk['text'].strip()}")
-    return "\n\n".join(lines)
-
 
 def _antispam_handle_penalty(sender_key: str, sender_node: Any, interface_ref, info: Dict[str, Any]) -> None:
     level = info.get('level', 1)
@@ -5893,7 +4774,10 @@ def process_responses_worker():
             if resp:
                 pending = resp if isinstance(resp, PendingReply) else None
                 response_text = pending.text if pending else resp
-                clean_log(f"✅ [AsyncAI] Generated response in {processing_time:.1f}s, preparing to send...", "🤖")
+
+                target_name = get_node_shortname(sender_node) or str(sender_node)
+                summary = _truncate_for_log(response_text)
+                clean_log(f"Ollama → {target_name} ({processing_time:.1f}s): {summary}", "🦙", show_always=True, rate_limit=False)
 
                 # Reduced collision delay for async processing
                 if pending:
@@ -5913,15 +4797,6 @@ def process_responses_worker():
                     is_ai=(pending is None),
                 )
 
-                # If message originated on Discord inbound channel, send back to Discord
-                if ENABLE_DISCORD and DISCORD_SEND_AI and DISCORD_INBOUND_CHANNEL_INDEX is not None and ch_idx == DISCORD_INBOUND_CHANNEL_INDEX:
-                    disc_msg = f"🤖 **{AI_NODE_NAME}**: {response_text}"
-                    send_discord_message(disc_msg)
-                    try:
-                        log_message("Discord", disc_msg, direct=False, channel_idx=DISCORD_INBOUND_CHANNEL_INDEX, is_ai=(pending is None))
-                    except Exception:
-                        pass
-
                 # Send the response via mesh
                 chunk_delay = pending.chunk_delay if pending else None
                 if interface_ref and response_text:
@@ -5939,9 +4814,8 @@ def process_responses_worker():
                 except Exception:
                     pass
                 total_time = time.time() - start_time
-                clean_log(f"🎯 [AsyncAI] Completed response for {sender_node} (total: {total_time:.1f}s)", "✅")
             else:
-                clean_log(f"❌ [AsyncAI] No response generated for {sender_node} ({processing_time:.1f}s)", "🤖")
+                clean_log(f"Ollama → {get_node_shortname(sender_node) or sender_node} ({processing_time:.1f}s): [no response]", "🦙", show_always=True, rate_limit=False)
                 
             response_queue.task_done()
             
@@ -5958,7 +4832,7 @@ def start_response_worker():
     """Start the background response worker thread."""
     worker_thread = threading.Thread(target=process_responses_worker, daemon=True)
     worker_thread.start()
-    clean_log(f"🚀 [AsyncAI] Response worker thread started (queue max {RESPONSE_QUEUE_MAXSIZE})", "⚡")
+    clean_log("firin' up!", "🚀")
 
 def stop_response_worker():
     """Stop the background response worker thread."""
@@ -6105,7 +4979,128 @@ def _collect_recent_locations(exclude_key: Optional[str] = None, limit: Optional
             "precision": entry.get("precision"),
             "dilution": entry.get("dilution"),
         })
+
     return results
+
+
+def _save_weather_reports_locked() -> None:
+    data = WEATHER_REPORTS[-WEATHER_REPORT_MAX_ENTRIES:]
+    payload = json.dumps({'reports': data}, ensure_ascii=False, indent=2)
+    write_atomic(WEATHER_REPORT_FILE, payload)
+
+
+def _prune_weather_reports_locked() -> None:
+    cutoff = _now() - WEATHER_REPORT_RETENTION
+    WEATHER_REPORTS[:] = [r for r in WEATHER_REPORTS if r.get('timestamp', 0.0) >= cutoff]
+    if len(WEATHER_REPORTS) > WEATHER_REPORT_MAX_ENTRIES:
+        del WEATHER_REPORTS[:-WEATHER_REPORT_MAX_ENTRIES]
+
+
+def _record_weather_report(sender_key: str, shortname: str, report_text: str, lat: float, lon: float) -> Dict[str, Any]:
+    timestamp = _now()
+    map_url = _generate_map_link(lat, lon, shortname) if lat is not None and lon is not None else None
+    entry = {
+        'timestamp': timestamp,
+        'shortname': shortname,
+        'text': report_text.strip(),
+        'map_url': map_url,
+        'lat': lat,
+        'lon': lon,
+        'node_key': sender_key,
+    }
+    with WEATHER_REPORT_LOCK:
+        WEATHER_REPORTS.append(entry)
+        _prune_weather_reports_locked()
+        _save_weather_reports_locked()
+    return entry
+
+
+
+def _get_recent_weather_report(max_age: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    if max_age is None:
+        max_age = WEATHER_REPORT_RECENT_WINDOW
+    cutoff = _now() - max_age
+    with WEATHER_REPORT_LOCK:
+        fresh = [r for r in WEATHER_REPORTS if r.get('timestamp', 0.0) >= cutoff]
+        fresh.sort(key=lambda r: r.get('timestamp', 0.0), reverse=True)
+        return fresh[0] if fresh else None
+
+
+def _collect_recent_weather_reports(max_age: Optional[int] = None) -> List[Dict[str, Any]]:
+    if max_age is None:
+        max_age = WEATHER_REPORT_RETENTION
+    cutoff = _now() - max_age
+    with WEATHER_REPORT_LOCK:
+        items = [r for r in WEATHER_REPORTS if r.get('timestamp', 0.0) >= cutoff]
+    items.sort(key=lambda r: r.get('timestamp', 0.0), reverse=True)
+    return items
+
+
+def _format_weather_timestamp(ts: float) -> str:
+    try:
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone()
+        return dt.strftime('%b %d %H:%M')
+    except Exception:
+        return str(ts)
+
+
+def _format_relative_age(seconds: float) -> str:
+    seconds = abs(int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h"
+    days = hours // 24
+    if days < 7:
+        return f"{days}d"
+    weeks = days // 7
+    return f"{weeks}w"
+
+
+def _format_weather_reply_lines(entry: Dict[str, Any], lang: str, include_header: bool = True) -> List[str]:
+    if not entry:
+        return []
+    lines: List[str] = []
+    if include_header:
+        lines.append(translate(lang, 'weather_latest', "🌦️ Latest mesh weather:"))
+    report_text = entry.get('text', '')
+    if report_text:
+        lines.append(report_text)
+    time_label = _format_weather_timestamp(entry.get('timestamp', _now()))
+    shortname = entry.get('shortname') or 'node'
+    byline = translate(lang, 'weather_byline', "{time} • {shortname}", time=time_label, shortname=shortname)
+    lines.append(byline)
+    map_url = entry.get('map_url')
+    if map_url:
+        lines.append(f"🔗 {map_url}")
+    return lines
+
+
+def _resolve_sender_position(sender_id: Any, sender_key: Optional[str]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    lat, lon, tstamp, precision, dilution = get_node_location(sender_id)
+    if lat is not None and lon is not None:
+        try:
+            return float(lat), float(lon), float(tstamp) if isinstance(tstamp, (int, float)) else _now()
+        except Exception:
+            pass
+    if sender_key:
+        with LOCATION_HISTORY_LOCK:
+            entry = LOCATION_HISTORY.get(sender_key)
+        if entry:
+            lat_val = entry.get('lat')
+            lon_val = entry.get('lon')
+            ts_val = entry.get('timestamp', _now())
+            try:
+                lat_val = float(lat_val)
+                lon_val = float(lon_val)
+            except Exception:
+                return None, None, None
+            return lat_val, lon_val, float(ts_val) if isinstance(ts_val, (int, float)) else _now()
+    return None, None, None
 
 
 def _snapshot_all_node_positions() -> None:
@@ -6132,9 +5127,13 @@ def _snapshot_all_node_positions() -> None:
         _update_location_history(sender_key, shortname, lat, lon, timestamp_val, precision, dilution)
 
 
+
+
+
 def _build_locations_kml() -> str:
     _snapshot_all_node_positions()
     points = _collect_recent_locations(exclude_key=None, limit=None)
+    weather_points = _collect_recent_weather_reports()
     lines = [
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
         "<kml xmlns=\"http://www.opengis.net/kml/2.2\">",
@@ -6148,8 +5147,6 @@ def _build_locations_kml() -> str:
         "          <href>http://maps.google.com/mapfiles/kml/paddle/red-circle.png</href>",
         "        </Icon>",
         "      </IconStyle>",
-    ]
-    lines += [
         "    </Style>",
         "    <Style id=\"dilute\">",
         "      <IconStyle>",
@@ -6157,6 +5154,15 @@ def _build_locations_kml() -> str:
         "        <scale>1.1</scale>",
         "        <Icon>",
         "          <href>http://maps.google.com/mapfiles/kml/paddle/ylw-circle.png</href>",
+        "        </Icon>",
+        "      </IconStyle>",
+        "    </Style>",
+        "    <Style id=\"weather\">",
+        "      <IconStyle>",
+        "        <color>ffffa200</color>",
+        "        <scale>1.2</scale>",
+        "        <Icon>",
+        "          <href>http://maps.google.com/mapfiles/kml/paddle/blu-stars.png</href>",
         "        </Icon>",
         "      </IconStyle>",
         "    </Style>",
@@ -6180,13 +5186,37 @@ def _build_locations_kml() -> str:
             "      </Point>",
             "    </Placemark>",
         ]
+    for entry in weather_points:
+        lat_val = entry.get('lat')
+        lon_val = entry.get('lon')
+        if lat_val is None or lon_val is None:
+            continue
+        try:
+            lat_float = float(lat_val)
+            lon_float = float(lon_val)
+        except Exception:
+            continue
+        name = entry.get('shortname') or 'Weather report'
+        report_text = entry.get('text', '')
+        time_str = _format_weather_timestamp(entry.get('timestamp', _now()))
+        summary = f"{time_str} • {report_text}" if report_text else time_str
+        lines += [
+            "    <Placemark>",
+            f"      <name>{html.escape('Weather: ' + name)}</name>",
+            "      <styleUrl>#weather</styleUrl>",
+            "      <ExtendedData>",
+            f"        <Data name=\"summary\"><value>{html.escape(summary)}</value></Data>",
+            "      </ExtendedData>",
+            "      <Point>",
+            f"        <coordinates>{lon_float},{lat_float},0</coordinates>",
+            "      </Point>",
+            "    </Placemark>",
+        ]
     lines += [
         "  </Document>",
         "</kml>",
     ]
     return "\n".join(lines)
-    return "https://maps.google.com/maps?" + urllib.parse.urlencode(query_params, doseq=True)
-
 
 def _format_location_reply(sender_id: Any) -> Optional[str]:
     lat, lon, tstamp, precision, dilution = get_node_location(sender_id)
@@ -6445,7 +5475,6 @@ def split_message(text):
 
 def send_broadcast_chunks(interface, text, channelIndex, chunk_delay: Optional[float] = None):
     dprint(f"send_broadcast_chunks: text='{text}', channelIndex={channelIndex}")
-    clean_log(f"Broadcasting on Ch{channelIndex}: {_redact_sensitive(text)}", "📡")
     if interface is None:
         print("❌ Cannot send broadcast: interface is None.")
         return
@@ -6461,6 +5490,7 @@ def send_broadcast_chunks(interface, text, channelIndex, chunk_delay: Optional[f
             return
     delay = CHUNK_DELAY if chunk_delay is None else max(chunk_delay, 0)
     chunks = split_message(text)
+    sent_any = False
     for i, chunk in enumerate(chunks):
         # Retry logic for timeout resilience
         max_retries = 3
@@ -6476,7 +5506,7 @@ def send_broadcast_chunks(interface, text, channelIndex, chunk_delay: Optional[f
                     globals()['last_tx_time'] = _now()
                 except Exception:
                     pass
-                clean_log(f"Sent chunk {i+1}/{len(chunks)} on Ch{channelIndex}", "📡")
+                sent_any = True
                 break
             except Exception as e:
                 error_msg = str(e).lower()
@@ -6503,6 +5533,8 @@ def send_broadcast_chunks(interface, text, channelIndex, chunk_delay: Optional[f
         # Adaptive delay based on success
         if success and i < len(chunks) - 1:  # Don't delay after last chunk
             time.sleep(delay)
+    if sent_any:
+        clean_log(f"Broadcast to {_channel_display_name(channelIndex)}", "📡")
 
 
 def send_direct_chunks(interface, text, destinationId, chunk_delay: Optional[float] = None):
@@ -6510,7 +5542,6 @@ def send_direct_chunks(interface, text, destinationId, chunk_delay: Optional[flo
     dest_display = get_node_shortname(destinationId)
     if not dest_display:
         dest_display = str(destinationId)
-    clean_log(f"Sending direct to {dest_display}: {_redact_sensitive(text)}", "📤")
     if interface is None:
         print("❌ Cannot send direct message: interface is None.")
         return
@@ -6532,6 +5563,7 @@ def send_direct_chunks(interface, text, destinationId, chunk_delay: Optional[flo
 
     ephemeral_ok = hasattr(interface, "sendDirectText")
 
+    sent_any = False
     for idx, chunk in enumerate(chunks):
         max_retries = 3
         retry_delay = 2
@@ -6548,7 +5580,7 @@ def send_direct_chunks(interface, text, destinationId, chunk_delay: Optional[flo
                 except Exception:
                     pass
                 success = True
-                clean_log(f"Sent chunk {idx + 1}/{len(chunks)} to {dest_display}", "📤")
+                sent_any = True
                 break
             except Exception as e:
                 error_msg = str(e).lower()
@@ -6576,6 +5608,8 @@ def send_direct_chunks(interface, text, destinationId, chunk_delay: Optional[flo
 
         if success and idx < len(chunks) - 1:
             time.sleep(delay)
+    if sent_any:
+        clean_log(f"Sent to {dest_display}", "📤")
 
 def _format_ai_error(provider: str, detail: str) -> str:
     message = (detail or "unknown issue").strip()
@@ -6676,167 +5710,6 @@ def _process_wipe_confirmation(sender_id: Any, message: str, is_direct: bool, ch
         return PendingReply(aggregated, "/wipe confirm")
 
     return PendingReply("Unknown wipe action. Try /wipe again.", "/wipe confirm")
-
-
-def send_to_lmstudio(user_message: str, system_prompt: str):
-    """Chat/completion request to LM Studio with explicit model name."""
-    dprint(f"send_to_lmstudio: user_message='{user_message}'")
-    ai_log("Processing message...", "lmstudio")
-    payload = {
-        "model": LMSTUDIO_CHAT_MODEL,  # **mandatory when multiple models loaded**
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_message},
-        ],
-        "max_tokens": MAX_RESPONSE_LENGTH,
-    }
-    try:
-        # Track last AI request time
-        try:
-            globals()['last_ai_request_time'] = _now()
-        except Exception:
-            pass
-        # Simple retry loop
-        attempts = 0
-        backoff = 1.5
-        response = None
-        while attempts < 2:
-            attempts += 1
-            try:
-                response = requests.post(LMSTUDIO_URL, json=payload, timeout=LMSTUDIO_TIMEOUT)
-                break
-            except Exception as e:
-                if attempts >= 2:
-                    raise
-                time.sleep(backoff)
-                backoff *= 1.7
-        if response is not None and response.status_code == 200:
-            j = response.json()
-            dprint(f"LMStudio raw ⇒ {j}")
-            ai_resp = (
-                j.get("choices", [{}])[0]
-                 .get("message", {})
-                 .get("content", "🤖 [No response]")
-            )
-            # Clean response logging
-            if ai_resp and ai_resp != "🤖 [No response]":
-                clean_resp = ai_resp[:100] + "..." if len(ai_resp) > 100 else ai_resp
-                ai_log(f"Response: {clean_resp}", "lmstudio")
-            return ai_resp[:MAX_RESPONSE_LENGTH]
-        else:
-            status = getattr(response, 'status_code', 'no response')
-            body_preview = ''
-            if response is not None and hasattr(response, 'text'):
-                body_preview = response.text[:120]
-            err = f"status {status}. {body_preview}".strip()
-            print(f"⚠️ LMStudio error: {err}")
-            try:
-                globals()['ai_last_error'] = f"LMStudio {err}"
-                globals()['ai_last_error_time'] = _now()
-            except Exception:
-                pass
-            return _format_ai_error("LMStudio", err)
-    except Exception as e:
-        msg = f"LMStudio request failed: {e}"
-        print(f"⚠️ {msg}")
-        try:
-            globals()['ai_last_error'] = msg
-            globals()['ai_last_error_time'] = _now()
-        except Exception:
-            pass
-        return _format_ai_error("LMStudio", str(e))
-def lmstudio_embed(text: str):
-    """Return an embedding vector (if you ever need it)."""
-    payload = {
-        "model": LMSTUDIO_EMBEDDING_MODEL,
-        "input": text,
-															   
-    }
-    try:
-        r = requests.post(
-            "http://localhost:1234/v1/embeddings",
-            json=payload,
-            timeout=LMSTUDIO_TIMEOUT,
-        )
-        if r.status_code == 200:
-            vec = r.json().get("data", [{}])[0].get("embedding")
-            return vec
-        else:
-            dprint(f"LMStudio embed error {r.status_code}: {r.text}")
-					   
-    except Exception as exc:
-        dprint(f"LMStudio embed exception: {exc}")
-    return None
-def send_to_openai(user_message: str, system_prompt: str):
-    dprint(f"send_to_openai: user_message='{user_message}'")
-    ai_log("Processing message...", "openai")
-    if not OPENAI_API_KEY:
-        print("⚠️ No OpenAI API key provided.")
-        return _format_ai_error("OpenAI", "API key not configured")
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {OPENAI_API_KEY}"
-    }
-    payload = {
-        "model": OPENAI_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message}
-        ],
-        "max_tokens": MAX_RESPONSE_LENGTH
-    }
-    try:
-        try:
-            globals()['last_ai_request_time'] = _now()
-        except Exception:
-            pass
-        r = None
-        attempts = 0
-        backoff = 1.5
-        while attempts < 2:
-            attempts += 1
-            try:
-                r = requests.post(url, headers=headers, json=payload, timeout=OPENAI_TIMEOUT)
-                break
-            except Exception as e:
-                if attempts >= 2:
-                    raise
-                time.sleep(backoff)
-                backoff *= 1.7
-        if r is not None and r.status_code == 200:
-            jr = r.json()
-            dprint(f"OpenAI raw => {jr}")
-            content = (
-                jr.get("choices", [{}])[0]
-                  .get("message", {})
-                  .get("content", "🤖 [No response]")
-            )
-            # Clean response logging
-            if content and content != "🤖 [No response]":
-                clean_resp = content[:100] + "..." if len(content) > 100 else content
-                ai_log(f"Response: {clean_resp}", "openai")
-            return content[:MAX_RESPONSE_LENGTH]
-        else:
-            status = getattr(r, 'status_code', 'no response')
-            detail = r.text[:120] if r is not None and hasattr(r, 'text') else ''
-            err = f"status {status}. {detail}".strip()
-            print(f"⚠️ OpenAI error: {err}")
-            try:
-                globals()['ai_last_error'] = f"OpenAI {err}"
-                globals()['ai_last_error_time'] = _now()
-            except Exception:
-                pass
-            return _format_ai_error("OpenAI", err)
-    except Exception as e:
-        msg = f"OpenAI request failed: {e}"
-        print(f"⚠️ {msg}")
-        try:
-            globals()['ai_last_error'] = msg
-            globals()['ai_last_error_time'] = _now()
-        except Exception:
-            pass
-        return _format_ai_error("OpenAI", str(e))
 
 def build_ollama_history(sender_id=None, is_direct=False, channel_idx=None, thread_root_ts=None, max_chars=OLLAMA_CONTEXT_CHARS):
   """Build a short conversation history string for Ollama based on recent messages.
@@ -7075,103 +5948,23 @@ def send_to_home_assistant(user_message):
         return _format_ai_error("Home Assistant", str(e))
 
 def get_ai_response(prompt, sender_id=None, is_direct=False, channel_idx=None, thread_root_ts=None):
-  """Get AI response from configured provider. Optional context (sender/is_direct/channel_idx)
-  is forwarded to the provider integration so it can include history/context when available."""
+  """Return an AI response using the configured provider (Ollama by default)."""
   system_prompt = build_system_prompt_for_sender(sender_id)
-  if AI_PROVIDER == "lmstudio":
-    return send_to_lmstudio(prompt, system_prompt)
-  elif AI_PROVIDER == "openai":
-    return send_to_openai(prompt, system_prompt)
-  elif AI_PROVIDER == "ollama":
-    return send_to_ollama(
-        prompt,
-        sender_id=sender_id,
-        is_direct=is_direct,
-        channel_idx=channel_idx,
-        thread_root_ts=thread_root_ts,
-        system_prompt=system_prompt,
-    )
-  elif AI_PROVIDER == "home_assistant":
+  provider = AI_PROVIDER
+  if provider == "home_assistant":
     return send_to_home_assistant(prompt)
-  else:
-    print(f"⚠️ Unknown AI provider: {AI_PROVIDER}")
-    return None
 
-def send_discord_message(content):
-    if not (ENABLE_DISCORD and DISCORD_WEBHOOK_URL):
-        return
-    try:
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=10)
-    except Exception as e:
-        print(f"⚠️ Discord webhook error: {e}")
+  if provider not in {"ollama", "home_assistant"}:
+    print(f"⚠️ Unknown AI provider '{provider}', defaulting to Ollama.")
 
-# -----------------------------
-# Revised Emergency Notification Function
-# -----------------------------
-def send_emergency_notification(node_id, user_msg, lat=None, lon=None, position_time=None):
-    info_print("[Info] Sending emergency notification...")
-
-    sn = get_node_shortname(node_id)
-    fullname = get_node_fullname(node_id)
-    full_msg = f"EMERGENCY from {sn} ({fullname}) [Node {node_id}]:\n"
-    if lat is not None and lon is not None:
-        maps_url = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
-        full_msg += f" - Location: {maps_url}\n"
-    if position_time:
-        full_msg += f" - Last GPS time: {position_time}\n"
-    if user_msg:
-        full_msg += f" - Message: {user_msg}\n"
-    
-    # Attempt to send SMS via Twilio if configured.
-    try:
-        if ENABLE_TWILIO and TWILIO_SID and TWILIO_AUTH_TOKEN and ALERT_PHONE_NUMBER and TWILIO_FROM_NUMBER:
-            client = Client(TWILIO_SID, TWILIO_AUTH_TOKEN)
-            client.messages.create(
-                body=full_msg,
-                from_=TWILIO_FROM_NUMBER,
-                to=ALERT_PHONE_NUMBER
-            )
-            print("✅ Emergency SMS sent via Twilio.")
-        else:
-            print("Twilio not properly configured for SMS.")
-    except Exception as e:
-        print(f"⚠️ Twilio error: {e}")
-
-    # Attempt to send email via SMTP if configured.
-    try:
-        if ENABLE_SMTP and SMTP_HOST and SMTP_USER and SMTP_PASS and ALERT_EMAIL_TO:
-            if isinstance(ALERT_EMAIL_TO, list):
-                email_to = ", ".join(ALERT_EMAIL_TO)
-            else:
-                email_to = ALERT_EMAIL_TO
-            msg = MIMEText(full_msg)
-            msg["Subject"] = f"EMERGENCY ALERT from {sn} ({fullname}) [Node {node_id}]"
-            msg["From"] = SMTP_USER
-            msg["To"] = email_to
-            if SMTP_PORT == 465:
-                s = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT)
-            else:
-                s = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
-                s.starttls()
-            s.login(SMTP_USER, SMTP_PASS)
-            s.sendmail(SMTP_USER, email_to, msg.as_string())
-            s.quit()
-            print("✅ Emergency email sent via SMTP.")
-        else:
-            print("SMTP not properly configured for email alerts.")
-    except Exception as e:
-        print(f"⚠️ SMTP error: {e}")
-
-    # Attempt to post emergency alert to Discord if enabled.
-    try:
-        if DISCORD_SEND_EMERGENCY and ENABLE_DISCORD and DISCORD_WEBHOOK_URL:
-            requests.post(DISCORD_WEBHOOK_URL, json={"content": full_msg}, timeout=10)
-            print("✅ Emergency alert posted to Discord.")
-        else:
-            print("Discord emergency notifications disabled or not configured.")
-    except Exception as e:
-        print(f"⚠️ Discord webhook error: {e}")
-
+  return send_to_ollama(
+      prompt,
+      sender_id=sender_id,
+      is_direct=is_direct,
+      channel_idx=channel_idx,
+      thread_root_ts=thread_root_ts,
+      system_prompt=system_prompt,
+  )
 # -----------------------------
 # Helper: Validate/Strip PIN (for Home Assistant)
 # -----------------------------
@@ -7209,7 +6002,7 @@ def route_message_text(user_message, channel_idx):
 # -----------------------------
 def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None, thread_root_ts=None, language_hint=None):
   # Globals modified by DM-only commands
-  global motd_content, SYSTEM_PROMPT, config
+  global motd_content, SYSTEM_PROMPT, config, MESHTASTIC_KB_WARM_CACHE
   cmd = cmd.lower()
   dprint(f"handle_command => cmd='{cmd}', full_text='{full_text}', sender_id={sender_id}, is_direct={is_direct}, language={language_hint}")
   lang = _normalize_language_code(language_hint) if language_hint else LANGUAGE_FALLBACK
@@ -7229,13 +6022,8 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
       info_print(f"[Info] Converting empty {cmd} command in DM to regular AI query: '{user_prompt}'")
     elif not user_prompt:
       # In channels, if no prompt provided, give helpful message
-      return _cmd_reply(cmd, f"Please provide a question or prompt after {cmd}. Example: `{cmd} What's the weather?`")
+      return _cmd_reply(cmd, f"Please provide a question or prompt after {cmd}. Example: `{cmd} summarize today's mesh activity`")
 
-    if sender_key and _looks_like_weather_intent(user_prompt):
-      location_hint = _extract_weather_location(user_prompt)
-      info_print(f"[Info] Weather intent detected in {cmd}; hint='{location_hint}'")
-      PENDING_WEATHER_REQUESTS.pop(sender_key, None)
-      return _handle_weather_lookup(sender_key, location_hint, lang)
 
     if AI_PROVIDER == "home_assistant" and HOME_ASSISTANT_ENABLE_PIN:
       if not pin_is_valid(user_prompt):
@@ -7263,13 +6051,6 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
         }
       prompt = "⚠️ Are you sure? This will broadcast your position publicly. Send it? Reply Yes or No."
       return PendingReply(prompt, "/whereami confirm")
-
-  elif cmd in ["/emergency", "/911"]:
-    lat, lon, tstamp, _, _ = get_node_location(sender_id)
-    user_msg = full_text[len(cmd):].strip()
-    send_emergency_notification(sender_id, user_msg, lat, lon, tstamp)
-    log_message(sender_id, f"EMERGENCY TRIGGERED: {full_text}", is_emergency=True)
-    return _cmd_reply(cmd, "🚨 Emergency alert sent. Stay safe.")
 
   elif cmd == "/test":
     sn = get_node_shortname(sender_id)
@@ -7414,10 +6195,41 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     query = full_text[len(cmd):].strip()
     if not query:
       return _cmd_reply(cmd, "Use this by typing: /meshtastic <question>")
-    matches = _search_meshtastic_kb(query, max_chunks=5)
-    if not matches:
-      return _cmd_reply(cmd, "No matching MeshTastic references found. Refine your question and try again.")
-    context = _format_meshtastic_context(matches)
+
+    query_tokens = set(_kb_tokenize(query))
+    matches: Optional[List[Dict[str, Any]]] = None
+    context: Optional[str] = None
+    cache_used = False
+    now_ts = time.time()
+    if MESHTASTIC_KB_CACHE_TTL > 0:
+      with MESHTASTIC_KB_CACHE_LOCK:
+        cache = MESHTASTIC_KB_WARM_CACHE
+        if cache.get("context") and cache.get("matches") and cache.get("expires", 0.0) > now_ts:
+          cached_tokens = cache.get("tokens") or set()
+          if not query_tokens or (cached_tokens and query_tokens.issubset(cached_tokens)):
+            matches = cache.get("matches")
+            context = cache.get("context")
+            cache_used = True
+    if matches is None:
+      matches = _search_meshtastic_kb(query, max_chunks=5)
+      if not matches:
+        return _cmd_reply(cmd, "No matching MeshTastic references found. Refine your question and try again.")
+      context = _format_meshtastic_context(matches)
+      union_tokens: Set[str] = set()
+      for chunk in matches:
+        union_tokens.update(chunk.get('term_counts', {}).keys())
+      if not union_tokens:
+        union_tokens = set(_kb_tokenize(context or ""))
+      if MESHTASTIC_KB_CACHE_TTL > 0:
+        with MESHTASTIC_KB_CACHE_LOCK:
+          MESHTASTIC_KB_WARM_CACHE = {
+            "expires": time.time() + MESHTASTIC_KB_CACHE_TTL,
+            "tokens": union_tokens,
+            "context": context,
+            "matches": matches,
+          }
+    elif cache_used:
+      clean_log("MeshTastic KB warm cache reused", "♻️")
     seen_titles: List[str] = []
     for chunk in matches:
       title = chunk['title']
@@ -7451,7 +6263,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     default_help = (
       "📖 Bible quick tips: `/bible` keeps your place. Jump with `/bible John 3:16`. "
       "Add `in Spanish` or `en ingles` to switch languages. Turn pages with `<1,2>`. Reply `22` "
-      "in a DM to auto-scroll 30 verses (18s each)."
+      "in a DM to auto-scroll 30 verses (12s each)."
     )
     help_text = translate(lang, 'bible_help', default_help)
     return _cmd_reply(cmd, help_text)
@@ -7560,8 +6372,8 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
   elif cmd == "/help":
     built_in = [
       "/about", "/menu", "/mail", "/checkmail", "/emailhelp", "/wipe",
-      "/query", "/emergency", "/911", "/test",
-      "/motd", "/weather", "/meshinfo", "/bible", "/biblehelp", "/chucknorris", "/elpaso", "/blond", "/yomomma", "/sms",
+      "/query", "/test",
+      "/motd", "/meshinfo", "/bible", "/biblehelp", "/chucknorris", "/elpaso", "/blond", "/yomomma",
       "/games", "/hangman", "/wordle", "/wordladder", "/adventure", "/rps", "/coinflip", "/cipher", "/bingo", "/quizbattle", "/morse",
       "/aivibe", "/changevibe", "/aipersonality", "/changemotd", "/changeprompt", "/showprompt", "/printprompt", "/reset"
     ]
@@ -7578,22 +6390,6 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
   elif cmd == "/motd":
     motd_msg = translate(lang, 'motd_current', "Current MOTD:\n{motd}", motd=motd_content)
     return _cmd_reply(cmd, motd_msg)
-
-  elif cmd == "/weather":
-    sender_key = _safe_sender_key(sender_id)
-    query = full_text[len(cmd):].strip()
-    if not query:
-      default_report = _format_weather_report("El Paso, TX", EL_PASO_LAT, EL_PASO_LON, language=lang, timezone="America/Denver", cache_token=f"el_paso_{lang}")
-      if default_report:
-        return _cmd_reply(cmd, default_report)
-      offline = _render_offline_el_paso(lang)
-      if offline:
-        return _cmd_reply(cmd, offline)
-      fallback = translate(lang, 'weather_offline', "Weather data is offline.")
-      return _cmd_reply(cmd, fallback)
-    PENDING_WEATHER_REQUESTS.pop(sender_key, None)
-    reply = _handle_weather_lookup(sender_key, query, lang)
-    return reply
 
   elif cmd == "/meshinfo":
     report = _format_meshinfo_report(lang)
@@ -7885,25 +6681,6 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
       else:
         return _cmd_reply(cmd, "🧹 Nothing to reset (unknown target).")
 
-  elif cmd == "/sms":
-    parts = full_text.split(" ", 2)
-    if len(parts) < 3:
-      return _cmd_reply(cmd, "Invalid syntax. Use: /sms <phone_number> <message>")
-    phone_number = parts[1]
-    message_text = parts[2]
-    try:
-      client = Client(TWILIO_SID, TWILIO_AUTH_TOKEN)
-      client.messages.create(
-        body=message_text,
-        from_=TWILIO_FROM_NUMBER,
-        to=phone_number,
-      )
-      print(f"✅ SMS sent to {phone_number}")
-      return _cmd_reply(cmd, "SMS sent successfully.")
-    except Exception as e:
-      print(f"⚠️ Failed to send SMS: {e}")
-      return _cmd_reply(cmd, "Failed to send SMS.")
-
   for c in commands_config.get("commands", []):
     if c.get("command").lower() == cmd:
       if "ai_prompt" in c:
@@ -7929,7 +6706,8 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
   if not check_only:
     channel_type = "DM" if is_direct else f"Ch{channel_idx}"
     logged_text = text if text is not None else ""
-    clean_log(f"Message from {sender_id} ({channel_type}): {_redact_sensitive(logged_text)}", "📨")
+    short = get_node_shortname(sender_id) or str(sender_id)
+    clean_log(f"Message from {short} ({channel_type}): {_redact_sensitive(logged_text)}", "📨")
   text = text.strip()
   if not text:
     return None if not check_only else False
@@ -7950,12 +6728,56 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
     if check_only:
       return False
     return _process_admin_password(sender_id, text)
-  if is_direct and sender_key and sender_key in PENDING_WEATHER_REQUESTS and not text.startswith("/"):
-    info = PENDING_WEATHER_REQUESTS.get(sender_key) or {}
-    lang = info.get("language")
-    if check_only:
-      return False
-    return _handle_weather_lookup(sender_key, text, lang)
+  if sender_key and sender_key in PENDING_WEATHER_REPORTS and not text.startswith("/"):
+    state = PENDING_WEATHER_REPORTS.get(sender_key) or {}
+    if (_now() - state.get('created', 0.0,)) > 600:
+      PENDING_WEATHER_REPORTS.pop(sender_key, None)
+    else:
+      if check_only:
+        return False
+      stage = state.get('stage', 'confirm')
+      lang = state.get('language') or LANGUAGE_FALLBACK
+      text_lower = text.strip().lower()
+      if stage == 'confirm':
+        if text_lower in WIPE_CONFIRM_YES:
+          state['stage'] = 'report'
+          state['created'] = _now()
+          prompt = translate(lang, 'weather_prompt_report', "Great! Reply with a quick weather update (temp, wind, conditions).")
+          return PendingReply(prompt, "/weather wizard")
+        if text_lower in WIPE_CONFIRM_NO:
+          PENDING_WEATHER_REPORTS.pop(sender_key, None)
+          decline = translate(lang, 'weather_decline', "No worries. You can try /weather again later.")
+          return PendingReply(decline, "/weather wizard")
+        reminder = translate(lang, 'weather_confirm_reminder', "Please reply Y to report or N to skip.")
+        return PendingReply(reminder, "/weather wizard")
+      elif stage == 'report':
+        report_text = text.strip()
+        if len(report_text) < 5:
+          short_msg = translate(lang, 'weather_report_too_short', "Please provide a bit more detail about the weather.")
+          return PendingReply(short_msg, "/weather wizard")
+        if len(report_text) > 240:
+          report_text = report_text[:240].strip()
+        lat, lon, pos_ts = _resolve_sender_position(sender_id, sender_key)
+        if lat is None or lon is None:
+          PENDING_WEATHER_REPORTS.pop(sender_key, None)
+          need_fix = translate(lang, 'weather_need_location', "I don't have your latest location yet. Share it with /whereami and try /weather again.")
+          return PendingReply(need_fix, "/weather wizard")
+        try:
+          shortname = get_node_shortname(sender_id)
+        except Exception:
+          shortname = sender_key or 'node'
+        entry = _record_weather_report(sender_key, shortname, report_text, float(lat), float(lon))
+        if pos_ts is None:
+          pos_ts = _now()
+        _update_location_history(sender_key, shortname, lat, lon, pos_ts, None, None)
+        PENDING_WEATHER_REPORTS.pop(sender_key, None)
+        clean_log(f"Weather report from {shortname}: {report_text}", "🌦️", show_always=True, rate_limit=False)
+        thanks = translate(lang, 'weather_saved_header', "🌦️ Weather report saved—thank you!")
+        lines = [thanks]
+        lines.extend(_format_weather_reply_lines(entry, lang, include_header=False))
+        return PendingReply("\n".join(lines), "/weather wizard")
+      else:
+        PENDING_WEATHER_REPORTS.pop(sender_key, None)
   if sender_key and sender_key in PENDING_POSITION_CONFIRM and not text.startswith("/"):
     if check_only:
       return False
@@ -8027,16 +6849,8 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
       PENDING_POSITION_CONFIRM[sender_key] = pending_position_info
     return PendingReply(quick_reply, quick_reason or "quick reply")
 
-  if is_direct and sender_key and not text.startswith("/"):
-    if _looks_like_weather_intent(text):
-      if check_only:
-        return False
-      PENDING_WEATHER_REQUESTS.pop(sender_key, None)
-      normalized_lang_hint = unidecode(text or "").lower()
-      lang_hint = 'es' if any(token in normalized_lang_hint for token in ("clima", "tiempo", "pronostico", "pronóstico")) else 'en'
-      location_hint = _extract_weather_location(text)
-      info_print(f"[Info] Weather intent detected in direct text; hint='{location_hint}'")
-      return _handle_weather_lookup(sender_key, location_hint, lang_hint)
+  if text.startswith("/") and sender_key in PENDING_WEATHER_REPORTS:
+    PENDING_WEATHER_REPORTS.pop(sender_key, None)
 
   # Commands (start with /) should be handled and given context
   if text.startswith("/"):
@@ -8052,7 +6866,7 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
       cmd_lower = canonical_cmd.lower()
       if cmd_lower in {"/adventure", "/wordladder"}:
         return True
-      if cmd_lower in ["/reset", "/sms"]:
+      if cmd_lower in ["/reset"]:
         return False  # Process immediately, not async
       # Built-in AI commands need async processing
       if cmd_lower in ["/ai", "/bot", "/query", "/data"]:
@@ -8167,7 +6981,15 @@ def on_receive(packet=None, interface=None, **kwargs):
     if _rx_seen_before(rx_key):
       info_print(f"[Info] Duplicate RX suppressed for from={sender_node} ch={ch_idx}: {text}")
       return
-    info_print(f"📨 {sender_node or '?'} → {raw_to or '^all'} (ch={ch_idx}): {text}")
+    sender_display = get_node_shortname(sender_node) or str(sender_node or '?')
+    if to_node_int == BROADCAST_ADDR:
+      dest_display = _channel_display_name(ch_idx)
+      channel_label = dest_display
+    else:
+      dest_display = get_node_shortname(raw_to) or get_node_shortname(to_node_int) or str(raw_to or to_node_int)
+      channel_label = "DM"
+    summary = _truncate_for_log(text)
+    info_print(f"📨 {sender_display} → {dest_display} ({channel_label}): {summary}")
 
     sender_key = _safe_sender_key(sender_node)
 
@@ -8183,12 +7005,6 @@ def on_receive(packet=None, interface=None, **kwargs):
         lastDMNode = sender_node
     else:
         lastChannelIndex = ch_idx
-
-    # Only forward messages on the configured Discord inbound channel to Discord.
-    if ENABLE_DISCORD and DISCORD_SEND_ALL and DISCORD_INBOUND_CHANNEL_INDEX is not None and ch_idx == DISCORD_INBOUND_CHANNEL_INDEX:
-        sender_info = f"{get_node_shortname(sender_node)} ({sender_node})"
-        disc_content = f"**{sender_info}**: {text}"
-        send_discord_message(disc_content)
 
     # Determine our node number
     my_node_num = FORCE_NODE_NUM if FORCE_NODE_NUM is not None else None
@@ -8265,6 +7081,9 @@ def on_receive(packet=None, interface=None, **kwargs):
         pending = resp if isinstance(resp, PendingReply) else None
         response_text = pending.text if pending else resp
         if response_text:
+          target_name = get_node_shortname(sender_node) or str(sender_node)
+          summary = _truncate_for_log(response_text)
+          clean_log(f"Ollama → {target_name} (0.0s): {summary}", "🦙", show_always=True, rate_limit=False)
           if pending:
             _command_delay(pending.reason)
           if is_direct:
@@ -8330,9 +7149,9 @@ def logs_stream():
       ]
       # send only the new lines
       if last_index < len(visible):
-        for line in visible[last_index:]:
-          # each SSE “data:” is one log line
-          yield f"data: {line}\n\n"
+        for raw_line in visible[last_index:]:
+          html_line = _render_log_line_html(raw_line)
+          yield f"data: {html_line}\n\n"
         last_index = len(visible)
       time.sleep(0.5)
 
@@ -8354,12 +7173,62 @@ def logs_stream():
 
 _LOG_URL_PATTERN = re.compile(r"(https?://\S+)")
 
+LOG_EMOJI_SVG = {
+    "📨": "1f4e8.svg",
+    "📬": "1f4ec.svg",
+    "📪": "1f4ea.svg",
+    "📤": "1f4e4.svg",
+    "📦": "1f4e6.svg",
+    "📡": "1f4e1.svg",
+    "📚": "1f4da.svg",
+    "📥": "1f4e5.svg",
+    "📤": "1f4e4.svg",
+    "⚡": "26a1.svg",
+    "⚠": "26a0.svg",
+    "⚠️": "26a0.svg",
+    "🛡": "1f6e1.svg",
+    "🛡️": "1f6e1.svg",
+    "🟢": "1f7e2.svg",
+    "🟡": "1f7e1.svg",
+    "🟠": "1f7e0.svg",
+    "💚": "1f49a.svg",
+    "💓": "1f493.svg",
+    "🔗": "1f517.svg",
+    "🔐": "1f510.svg",
+    "🚀": "1f680.svg",
+    "🧠": "1f9e0.svg",
+    "🧭": "1f9ed.svg",
+    "🖥": "1f5a5.svg",
+    "🖥️": "1f5a5.svg",
+    "📝": "1f4dd.svg",
+    "🎉": "1f389.svg",
+    "ℹ": "2139.svg",
+    "ℹ️": "2139.svg",
+}
+
+_LOG_EMOJI_KEYS = sorted(LOG_EMOJI_SVG.keys(), key=len, reverse=True)
+_LOG_EMOJI_PATTERN = re.compile("|".join(re.escape(k) for k in _LOG_EMOJI_KEYS)) if LOG_EMOJI_SVG else None
+
+
+def _twemoji_img(emoji: str) -> str:
+    filename = LOG_EMOJI_SVG.get(emoji)
+    if not filename:
+        return html.escape(emoji)
+    return f'<img class="emoji" src="/static/twemoji/svg/{filename}" alt="{html.escape(emoji)}">'
+
+
+def _inject_emoji_html(escaped_text: str) -> str:
+    if not _LOG_EMOJI_PATTERN:
+        return escaped_text
+    return _LOG_EMOJI_PATTERN.sub(lambda m: _twemoji_img(m.group(0)), escaped_text)
+
 
 def _render_log_line_html(line: str) -> str:
   normalized = _normalize_log_timestamp(line)
   css_class = _classify_log_line(normalized)
   safe = html.escape(normalized, quote=False)
   safe = _LOG_URL_PATTERN.sub(lambda m: f'<a href="{m.group(1)}" target="_blank" rel="noopener">{m.group(1)}</a>', safe)
+  safe = _inject_emoji_html(safe)
   classes = "log-line"
   if css_class:
     classes += f" {css_class}"
@@ -8388,16 +7257,19 @@ def logs():
         line for line in script_logs
         if (_viewer_should_show(line) if _viewer_filter_enabled else True)
     ]
-    log_text = "<br>".join(_render_log_line_html(line) for line in visible)
+    log_text = "".join(_render_log_line_html(line) for line in visible)
 
     lang_for_proverbs = LANGUAGE_FALLBACK
+    proverb_lang_key = _proverb_language_key(lang_for_proverbs)
     initial_proverb = _next_proverb(lang_for_proverbs)
-    proverb_index_js = PROVERB_INDEX_TRACKER.get('es' if lang_for_proverbs == 'es' else 'en', 0)
+    proverb_index_js = PROVERB_INDEX_TRACKER.get(proverb_lang_key, 0)
     proverb_list = _load_proverbs(lang_for_proverbs)
     proverbs_json = json.dumps(proverb_list, ensure_ascii=False)
-    initial_proverb_html = html.escape(initial_proverb)
-    marquee_duration_ms = 28000
-    marquee_duration_sec = marquee_duration_ms / 1000.0
+    initial_proverb_html = _inject_emoji_html(html.escape(initial_proverb, quote=False))
+    proverb_interval_ms = 60000
+    fade_duration_ms = 1200
+    emoji_html_map_json = json.dumps({emoji: _twemoji_img(emoji) for emoji in LOG_EMOJI_SVG}, ensure_ascii=False)
+    emoji_keys_json = json.dumps(_LOG_EMOJI_KEYS, ensure_ascii=False)
 
     html_page = f"""<html>
   <head>
@@ -8406,7 +7278,7 @@ def logs():
       body {{
         background:#000;
         color:#fff;
-        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        font-family: 'Segoe UI', 'Noto Sans', 'Liberation Sans', 'Helvetica Neue', Arial, 'Twemoji Mozilla', 'Noto Color Emoji', 'Segoe UI Emoji', 'Apple Color Emoji', sans-serif;
         padding:20px;
         margin:0;
         overflow-x:hidden;
@@ -8415,12 +7287,12 @@ def logs():
         content:'';
         position:fixed;
         top:0; left:0; right:0; bottom:0;
-        background: radial-gradient(circle at 20% 20%, rgba(255,255,255,0.3) 0%, rgba(255,255,255,0) 60%),
-                    radial-gradient(circle at 80% 30%, rgba(120,200,255,0.25) 0%, rgba(0,0,0,0) 55%),
-                    radial-gradient(circle at 50% 80%, rgba(255,180,255,0.2) 0%, rgba(0,0,0,0) 60%),
+        background: radial-gradient(circle at 20% 20%, rgba(255,255,255,0.15) 0%, rgba(255,255,255,0) 60%),
+                    radial-gradient(circle at 80% 30%, rgba(120,200,255,0.125) 0%, rgba(0,0,0,0) 55%),
+                    radial-gradient(circle at 50% 80%, rgba(255,180,255,0.1) 0%, rgba(0,0,0,0) 60%),
                     #000;
         background-size:400px 400px, 600px 600px, 500px 500px;
-        animation: starfield 120s linear infinite;
+        animation: starfield 240s linear infinite;
         z-index:-2;
       }}
       @keyframes starfield {{
@@ -8439,87 +7311,173 @@ def logs():
         left:0;
         right:0;
         background:rgba(0,0,0,0.75);
-        padding:10px 20px;
+        padding:14px 20px 12px;
         border-bottom:1px solid #333;
         z-index:1000;
+        text-align:center;
       }}
       .content {{
-        margin-top:120px;
+        margin-top:130px;
+        text-align:center;
+      }}
+      .logbox {{
+        height: calc(100vh - 220px);
+        overflow-y: auto;
+        white-space: pre-wrap;
+        word-break: break-word;
+        margin:0;
+        padding-bottom:100px;
+        transform: rotate(180deg);
+      }}
+      .footer-status {{
+        position:fixed;
+        bottom:16px;
+        left:50%;
+        transform:translateX(-50%);
+        display:flex;
+        flex-direction:column;
+        align-items:center;
+        gap:6px;
+        font-size:12px;
+        color:#fff;
       }}
       .scroll-indicator {{
-        position:fixed;
-        bottom:20px;
-        left:20px;
+        display:flex;
+        align-items:center;
+        gap:6px;
         background:#333;
-        color:#fff;
-        padding:5px 10px;
-        border-radius:5px;
-        font-size:12px;
-      }}
-      .marquee {{
-        overflow:hidden;
-        position:relative;
-        height:32px;
-        margin-top:8px;
-        background:rgba(0,0,0,0.45);
+        padding:4px 10px;
         border-radius:6px;
+        min-width:150px;
+        justify-content:center;
+      }}
+      .scroll-indicator .arrow {{
+        font-size:14px;
+        opacity:0;
+      }}
+      .scroll-indicator.on .arrow {{
+        opacity:1;
+        animation:pulse 1.2s infinite;
+      }}
+      .scroll-indicator .label {{
+        text-transform:uppercase;
+        letter-spacing:0.08em;
+      }}
+      .status-meta {{
+        background:rgba(0,0,0,0.55);
+        padding:3px 8px;
+        border-radius:6px;
+        display:flex;
+        gap:10px;
+      }}
+      .status-meta span {{
+        color:#aaa;
+      }}
+      @keyframes slideup {{
+        from {{ transform: translateY(18px); opacity:0; }}
+        to {{ transform: translateY(0); opacity:1; }}
+      }}
+      @keyframes pulse {{
+        0% {{ transform:translateY(0); opacity:0.2; }}
+        50% {{ transform:translateY(3px); opacity:1; }}
+        100% {{ transform:translateY(0); opacity:0.2; }}
+      }}
+      .proverb-box {{
+        display:inline-block;
+        max-width:80%;
+        padding:6px 14px;
+        margin-top:18px;
+        background:rgba(0,0,0,0.55);
+        border-radius:8px;
+        text-align:center;
+        margin-left:auto;
+        margin-right:auto;
       }}
       .headline-text {{
-        display:inline-block;
-        padding-left:100%;
-        white-space:nowrap;
-        animation: marquee {marquee_duration_sec}s linear infinite;
-        font-weight:600;
-        font-size:18px;
+        display:block;
+        font-family: 'Playfair Display', 'Georgia', 'Cambria', 'Times New Roman', serif, 'Twemoji Mozilla', 'Noto Color Emoji', 'Segoe UI Emoji', 'Apple Color Emoji';
+        font-size:0.88rem;
+        line-height:1.3;
+        letter-spacing:0.15px;
+        color:#c0b9ac;
+        opacity:1;
+        transition: opacity 1.2s ease-in-out;
+      }}
+      .headline-text.fade-out {{
+        opacity:0;
       }}
       .headline-text.highlight {{
-        color:#ffeb3b;
-      }}
-      @keyframes marquee {{
-        0% {{ transform: translateX(0%); }}
-        100% {{ transform: translateX(-100%); }}
+        color:#cca961;
       }}
       .log-line {{ display:block; margin:0; }}
-      .log-line.incoming {{ color:#ffeb3b; }}
-      .log-line.outgoing {{ color:#8bc34a; }}
-      .log-line.clock {{ color:#64b5f6; }}
-      .header .clock {{ color:#64b5f6; font-weight:bold; }}
+      .log-line.animate-up {{ animation: slideup 0.45s ease-out; }}
+      .emoji {{
+        width:1em;
+        height:1em;
+        margin:0 0.05em;
+        vertical-align:-0.1em;
+      }}
+      .log-line.incoming {{ color:#D7BA7D; }}
+      .log-line.outgoing {{ color:#6A9955; }}
+      .log-line.clock {{ color:#2472C8; }}
+      .log-line.error {{ color:#F14C4C; font-weight:700; }}
+      .header .clock {{ color:#2472C8; font-weight:bold; }}
       .log-line a {{ color:#90caf9; }}
     </style>
   </head>
   <body>
     <div class="header">
-      <h1>
-        <div class="marquee"><span class="headline-text" id="headlineText">{initial_proverb_html}</span></div>
-      </h1>
-      <div><strong>Local Time:</strong> <span class="clock">{now_local}</span> | <strong>Uptime:</strong> <span class="clock">{uptime_str}</span> | <strong>Restarts:</strong> <span class="clock">{restart_count}</span></div>
+      <div class="proverb-box">
+        <span class="headline-text" id="headlineText">{initial_proverb_html}</span>
+      </div>
     </div>
     <div class="content">
-      <pre id="logbox">{log_text}</pre>
+      <div id="logbox" class="logbox">{log_text}</div>
     </div>
-    <div class="scroll-indicator" id="scrollStatus">🟢 Auto-scroll ON</div>
+    <div class="footer-status">
+      <div class="scroll-indicator on" id="scrollStatus">
+        <span class="arrow">↓</span>
+        <span class="label" id="scrollLabel">Auto-scroll ON</span>
+      </div>
+      <div class="status-meta">
+        <span id="statusTime">{now_local}</span>
+        <span id="statusUptime">{uptime_str}</span>
+        <span id="statusRestarts">Restarts: {restart_count}</span>
+      </div>
+    </div>
     <script>
+      const EMOJI_HTML_MAP = {emoji_html_map_json};
+      const EMOJI_KEYS = Object.keys(EMOJI_HTML_MAP).sort((a, b) => b.length - a.length);
+
       const PROVERBS = {proverbs_json};
       let proverbIndex = {proverb_index_js};
-      const marqueeDuration = {marquee_duration_ms};
+      const PROVERB_INTERVAL = {proverb_interval_ms};
+      const FADE_DURATION = {fade_duration_ms};
       const headlineText = document.getElementById('headlineText');
       let highlightTimer = null;
       let highlightActive = false;
+      let proverbRotationTimer = null;
+      let fadeTimeout = null;
 
-      function escapeHtml(text) {{
-        const map = {{ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }};
-        return text.replace(/[&<>"']/g, m => map[m]);
+      function escapeForHTML(text) {{
+        if (!text) return '';
+        return text
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;');
       }}
 
-      function linkify(text) {{
-        const escaped = escapeHtml(text);
-        return escaped.replace(/(https?:\/\/\S+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
-      }}
-
-      function restartMarqueeAnimation() {{
-        headlineText.style.animation = 'none';
-        void headlineText.offsetHeight;
-        headlineText.style.animation = `marquee ${{marqueeDuration/1000}}s linear infinite`;
+      function renderWithEmoji(text) {{
+        let escaped = escapeForHTML(text || '');
+        if (!EMOJI_KEYS.length) return escaped;
+        for (const emoji of EMOJI_KEYS) {{
+          const html = EMOJI_HTML_MAP[emoji];
+          if (!html) continue;
+          escaped = escaped.split(emoji).join(html);
+        }}
+        return escaped;
       }}
 
       function nextProverb() {{
@@ -8531,79 +7489,122 @@ def logs():
         return text;
       }}
 
+      function swapHeadline(text, {{ highlight = false, immediate = false }} = {{}}) {{
+        if (fadeTimeout) {{
+          clearTimeout(fadeTimeout);
+          fadeTimeout = null;
+        }}
+
+        const html = renderWithEmoji(text || '');
+        if (immediate) {{
+          headlineText.innerHTML = html;
+          headlineText.classList.remove('fade-out', 'highlight');
+          if (highlight) {{
+            headlineText.classList.add('highlight');
+          }}
+          return;
+        }}
+
+        headlineText.classList.remove('fade-out');
+        void headlineText.offsetWidth;
+        headlineText.classList.add('fade-out');
+
+        fadeTimeout = setTimeout(() => {{
+          headlineText.innerHTML = html;
+          headlineText.classList.remove('highlight');
+          if (highlight) {{
+            headlineText.classList.add('highlight');
+          }}
+          headlineText.classList.remove('fade-out');
+          fadeTimeout = null;
+        }}, FADE_DURATION);
+      }}
+
       function setHeadlineToProverb(force=false) {{
         if (highlightActive && !force) return;
         const proverb = nextProverb();
-        headlineText.textContent = proverb;
-        headlineText.className = 'headline-text';
-        restartMarqueeAnimation();
         highlightActive = false;
+        swapHeadline(proverb);
       }}
 
       function showMessageHeadline(text) {{
         highlightActive = true;
-        headlineText.textContent = text;
-        headlineText.className = 'headline-text highlight';
-        restartMarqueeAnimation();
+        swapHeadline(text, {{ highlight: true }});
         if (highlightTimer) {{ clearTimeout(highlightTimer); }}
         highlightTimer = setTimeout(() => {{
           highlightActive = false;
           setHeadlineToProverb(true);
           highlightTimer = null;
-        }}, marqueeDuration * 2);
+        }}, PROVERB_INTERVAL * 2);
       }}
 
-      setInterval(() => {{ setHeadlineToProverb(); }}, marqueeDuration);
+      function startProverbRotation() {{
+        if (proverbRotationTimer) {{ clearInterval(proverbRotationTimer); }}
+        proverbRotationTimer = setInterval(() => {{
+          setHeadlineToProverb();
+        }}, PROVERB_INTERVAL);
+      }}
 
       window.addEventListener('load', () => {{
-        restartMarqueeAnimation();
+        swapHeadline(headlineText.textContent, {{ immediate: true }});
+        startProverbRotation();
       }});
 
-      function appendLogLine(line) {{
-        const span = document.createElement('span');
-        span.classList.add('log-line');
-        if (line.includes('📨')) {{
-          span.classList.add('incoming');
-          showMessageHeadline(line);
-        }} else if (line.includes('📤') || line.includes('📡')) {{
-          span.classList.add('outgoing');
-          showMessageHeadline(line);
-        }} else if (/local time|uptime/i.test(line)) {{
-          span.classList.add('clock');
+      function appendLogLine(html) {{
+        const temp = document.createElement('div');
+        temp.innerHTML = html;
+        const span = temp.firstElementChild || temp;
+        const textContent = (span.textContent || '').trim();
+
+        if (textContent.includes('📨')) {{
+          showMessageHeadline(textContent);
+        }} else if (textContent.includes('📤') || textContent.includes('📡')) {{
+          showMessageHeadline(textContent);
         }}
-        span.innerHTML = linkify(line);
+
         logbox.appendChild(span);
-        logbox.appendChild(document.createTextNode('
-'));
+        span.classList.add('animate-up');
+        setTimeout(() => span.classList.remove('animate-up'), 600);
       }}
+
 
       let autoScroll = true;
       let isUserScrolling = false;
       let scrollTimeout;
       const logbox = document.getElementById('logbox');
       const scrollStatus = document.getElementById('scrollStatus');
+      const scrollLabel = document.getElementById('scrollLabel');
+
+      function updateScrollLabel(text, arrowOn) {{
+        scrollLabel.textContent = text;
+        if (arrowOn) {{
+          scrollStatus.classList.add('on');
+        }} else {{
+          scrollStatus.classList.remove('on');
+        }}
+      }}
+
+      updateScrollLabel('Auto-scroll ON', true);
 
       function smoothScrollToBottom() {{
         if (autoScroll && !isUserScrolling) {{
-          window.scrollTo({{
-            top: document.body.scrollHeight,
+          logbox.scrollTo({{
+            top: logbox.scrollHeight,
             behavior: 'smooth'
           }});
         }}
       }}
 
-      window.addEventListener('scroll', () => {{
+      logbox.addEventListener('scroll', () => {{
         isUserScrolling = true;
         clearTimeout(scrollTimeout);
-        const isAtBottom = window.innerHeight + window.scrollY >= document.body.scrollHeight - 10;
-        if (isAtBottom) {{
+                const nearBottom = logbox.scrollHeight - logbox.scrollTop <= logbox.clientHeight + 10;
+                if (nearBottom) {{
           autoScroll = true;
-          scrollStatus.innerHTML = '🟢 Auto-scroll ON';
-          scrollStatus.style.background = '#333';
+          updateScrollLabel('Auto-scroll ON', true);
         }} else {{
           autoScroll = false;
-          scrollStatus.innerHTML = '🔴 Auto-scroll OFF (scroll to bottom to enable)';
-          scrollStatus.style.background = '#660000';
+          updateScrollLabel('Auto-scroll OFF', false);
         }}
         scrollTimeout = setTimeout(() => {{
           isUserScrolling = false;
@@ -8616,7 +7617,8 @@ def logs():
       let lastMessageTime = Date.now();
 
       function createEventSource() {{
-        eventSource = new EventSource('/logs_stream');
+        const url = `/logs_stream?v=${Date.now()}`;
+        eventSource = new EventSource(url);
 
         eventSource.onmessage = function(event) {{
           if (event.data.includes('heartbeat') || event.data.includes('keepalive')) {{
@@ -8633,7 +7635,7 @@ def logs():
         eventSource.onopen = function(event) {{
           reconnectAttempts = 0;
           lastMessageTime = Date.now();
-          scrollStatus.innerHTML = autoScroll ? '🟢 Auto-scroll ON' : '🔴 Auto-scroll OFF (scroll to bottom to enable)';
+          updateScrollLabel(autoScroll ? 'Auto-scroll ON' : 'Auto-scroll OFF', autoScroll);
         }};
 
         eventSource.onerror = function(event) {{
@@ -8643,8 +7645,7 @@ def logs():
             reconnectAttempts += 1;
             setTimeout(createEventSource, delay);
           }} else {{
-            scrollStatus.innerHTML = '⚠️ Log stream offline';
-            scrollStatus.style.background = '#660000';
+            updateScrollLabel('Log stream offline', false);
           }}
         }};
       }}
@@ -8656,11 +7657,9 @@ def logs():
           const now = Date.now();
           const elapsed = now - lastMessageTime;
           if (elapsed > 30000) {{
-            scrollStatus.innerHTML = '🟡 Waiting for new logs...';
-            scrollStatus.style.background = '#b38f00';
+            updateScrollLabel('Waiting for new logs…', false);
           }} else {{
-            scrollStatus.innerHTML = autoScroll ? '🟢 Auto-scroll ON' : '🔴 Auto-scroll OFF (scroll to bottom to enable)';
-            scrollStatus.style.background = autoScroll ? '#333' : '#660000';
+            updateScrollLabel('Auto-scroll ON', true);
           }}
         }}
         requestAnimationFrame(smoothScrollCheck);
@@ -8677,66 +7676,8 @@ def logs():
     return html_page
 
 # -----------------------------
-# Revised Discord Webhook Route for Inbound Messages
+# Web Routes
 # -----------------------------
-@app.route("/discord_webhook", methods=["POST"])
-def discord_webhook():
-    if not DISCORD_RECEIVE_ENABLED:
-        return jsonify({"status": "disabled", "message": "Discord receive is disabled"}), 200
-    data = request.json
-    if not data:
-        return jsonify({"status": "error", "message": "No JSON payload provided"}), 400
-
-    # Extract the username (default if not provided)
-    username = data.get("username", "DiscordUser")
-    channel_index = DISCORD_INBOUND_CHANNEL_INDEX
-    message_text = data.get("message")
-    if message_text is None:
-        return jsonify({"status": "error", "message": "Missing message"}), 400
-
-    # Prepend username to the message
-    formatted_message = f"**{username}**: {message_text}"
-
-    try:
-        log_message("Discord", formatted_message, direct=False, channel_idx=int(channel_index))
-        if interface is None:
-            print("❌ Cannot route Discord message: interface is None.")
-        else:
-            send_broadcast_chunks(interface, formatted_message, int(channel_index))
-        print(f"✅ Routed Discord message back on channel {channel_index}")
-        return jsonify({"status": "sent", "channel_index": channel_index, "message": formatted_message})
-    except Exception as e:
-        print(f"⚠️ Discord webhook error: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-# -----------------------------
-# New Twilio SMS Webhook Route for Inbound SMS
-# -----------------------------
-@app.route("/twilio_webhook", methods=["POST"])
-def twilio_webhook():
-    sms_body = request.form.get("Body")
-    from_number = request.form.get("From")
-    if not sms_body:
-        return "No SMS body received", 400
-    target = config.get("twilio_inbound_target", "channel")
-    if target == "channel":
-        channel_index = config.get("twilio_inbound_channel_index")
-        if channel_index is None:
-            return "No inbound channel index configured", 400
-        log_message("Twilio", f"From {from_number}: {sms_body}", direct=False, channel_idx=int(channel_index))
-        send_broadcast_chunks(interface, sms_body, int(channel_index))
-        print(f"✅ Routed incoming SMS from {from_number} to channel {channel_index}")
-    elif target == "node":
-        node_id = config.get("twilio_inbound_node")
-        if node_id is None:
-            return "No inbound node configured", 400
-        log_message("Twilio", f"From {from_number}: {sms_body}", direct=True)
-        send_direct_chunks(interface, sms_body, node_id)
-        print(f"✅ Routed incoming SMS from {from_number} to node {node_id}")
-    else:
-        return "Invalid twilio_inbound_target config", 400
-    return "SMS processed", 200
-
 @app.route("/", methods=["GET"])
 def root():
   # Redirect to dashboard for convenience
@@ -8847,8 +7788,6 @@ def dashboard():
     .dm-thread .message { margin-left: 0; }
     .dm-thread .reply-btn { margin-top: 5px; }
     .dm-thread .thread-replies { margin-left: 30px; border-left: 2px dashed #555; padding-left: 10px; }
-    /* Hide Discord section by default */
-    #discordSection { display: none; }
     /* Node sort controls */
     .nodeSortBar { margin-bottom: 10px; }
     .nodeSortBar label { margin-right: 8px; }
@@ -9295,7 +8234,6 @@ def dashboard():
         updateDirectMessagesUI(msgs, nodes);
         highlightRecentNodes(nodes);
         showLatestMessageTicker(msgs);
-        updateDiscordMessagesUI(msgs);
       } catch (e) { console.error(e); }
     }
 
@@ -9631,13 +8569,11 @@ def dashboard():
 
     // Show latest inbound message in ticker, dismissable, timeout after 30s, and persist dismiss across refreshes
     function showLatestMessageTicker(messages) {
-      // Show both channel and direct inbound messages, but not outgoing (WebUI, Discord, Twilio, DiscordPoll, AI_NODE_NAME)
+      // Show both channel and direct inbound messages, but not outgoing (WebUI, AI_NODE_NAME)
       // and not AI responses (reply_to is not null)
       let inbound = messages.filter(m =>
         m.node !== "WebUI" &&
-        m.node !== "Discord" &&
         m.node !== "Twilio" &&
-        m.node !== "DiscordPoll" &&
         m.node !== """ + json.dumps(AI_NODE_NAME) + """ &&
         (!m.reply_to) // Only show original messages, not replies (AI responses)
       );
@@ -9726,33 +8662,6 @@ def dashboard():
       toggleMode(); // Set initial mode
     }
     window.addEventListener("load", onPageLoad);
-
-    // --- Discord Messages Section ---
-    function updateDiscordMessagesUI(messages) {
-      // Only show Discord messages if any exist
-      let discordMsgs = messages.filter(m => m.node === "Discord" || m.node === "DiscordPoll");
-      let discordSection = document.getElementById("discordSection");
-      let discordDiv = document.getElementById("discordMessagesDiv");
-      if (discordMsgs.length === 0) {
-        discordSection.style.display = "none";
-        discordDiv.innerHTML = "";
-        return;
-      }
-      discordSection.style.display = "block";
-      discordDiv.innerHTML = "";
-      discordMsgs.forEach(m => {
-        const wrap = document.createElement("div");
-        wrap.className = "message";
-        if (isRecent(m.timestamp, 60)) wrap.classList.add("newMessage");
-        const ts = document.createElement("div");
-        ts.className = "timestamp";
-        ts.textContent = `💬 ${getTZAdjusted(m.timestamp)} | ${m.node}`;
-        const body = document.createElement("div");
-        body.textContent = m.message;
-        wrap.append(ts, body);
-        discordDiv.appendChild(wrap);
-      });
-    }
   </script>
 </head>
 <body onload="onPageLoad()">
@@ -9835,9 +8744,6 @@ def dashboard():
     </div>
   </div>
 
-  <div class="lcars-panel" id="discordSection" style="margin:20px;">
-    <h2>Discord Messages</h2>
-    <div id="discordMessagesDiv"></div>
   </div>
 
     <div class="settings-toggle" id="settingsToggle" onclick="toggleSettings()">Show UI Settings</div>
@@ -10198,25 +9104,6 @@ def main():
     else:
         clean_log("Radio watchdog TX disabled", "🛡️", show_always=True)
 
-    # Additional startup info:
-    if ENABLE_DISCORD:
-        print(f"Discord configuration enabled: Inbound channel index: {DISCORD_INBOUND_CHANNEL_INDEX}, Webhook URL is {'set' if DISCORD_WEBHOOK_URL else 'not set'}, Bot Token is {'set' if DISCORD_BOT_TOKEN else 'not set'}, Channel ID is {'set' if DISCORD_CHANNEL_ID else 'not set'}.")
-    else:
-        print("Discord configuration disabled.")
-    if ENABLE_TWILIO:
-        if TWILIO_SID and TWILIO_AUTH_TOKEN and ALERT_PHONE_NUMBER and TWILIO_FROM_NUMBER:
-            print("Twilio is configured for emergency SMS.")
-        else:
-            print("Twilio is not properly configured for emergency SMS.")
-    else:
-        print("Twilio is disabled.")
-    if ENABLE_SMTP:
-        if SMTP_HOST and SMTP_USER and SMTP_PASS and ALERT_EMAIL_TO:
-            print("SMTP is configured for emergency email alerts.")
-        else:
-            print("SMTP is not properly configured for emergency email alerts.")
-    else:
-        print("SMTP is disabled.")
     # Determine Flask port: prefer environment `MESH_MASTER_PORT`, then config keys, then default 5000
     flask_port = SERVER_PORT
     clean_log(f"Launching Flask web interface on port {flask_port}...", "🌐", show_always=True)
@@ -10228,9 +9115,6 @@ def main():
     api_thread.start()
     # Start keepalive worker to prevent USB idle timeout without RF noise
     threading.Thread(target=keepalive_worker, daemon=True).start()
-    # If Discord polling is configured, start that thread.
-    if DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID:
-        threading.Thread(target=poll_discord_channel, daemon=True).start()
 
     # Start monitors (connection watchdog and scheduled refresh)
     threading.Thread(target=connection_monitor, args=(20,), daemon=True).start()
@@ -10445,50 +9329,6 @@ def live():
 def ready():
   ready = (connection_status == "Connected")
   return jsonify({'ok': ready, 'status': connection_status}), (200 if ready else 503)
-
-# Start the watchdog thread after 20 seconds to give node a chance to connect
-def poll_discord_channel():
-    """Polls the Discord channel for new messages using the Discord API."""
-    # Wait a short period for interface to be set up
-    time.sleep(5)
-    last_message_id = None
-    headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
-    url = f"https://discord.com/api/v9/channels/{DISCORD_CHANNEL_ID}/messages"
-    while True:
-        try:
-            params = {"limit": 10}
-            if last_message_id:
-                params["after"] = last_message_id
-            response = requests.get(url, headers=headers, params=params, timeout=10)
-            if response.status_code == 200:
-                msgs = response.json()
-                msgs = sorted(msgs, key=lambda m: int(m["id"]))
-                for msg in msgs:
-                    if msg["author"].get("bot"):
-                        continue
-                    # Only process messages that arrived after the script started
-                    if last_message_id is None:
-                        msg_timestamp_str = msg.get("timestamp")
-                        if msg_timestamp_str:
-                            msg_time = datetime.fromisoformat(msg_timestamp_str.replace("Z", "+00:00"))
-                            if msg_time < server_start_time:
-                                continue
-                    username = msg["author"].get("username", "DiscordUser")
-                    content = msg.get("content")
-                    if content:
-                        formatted = f"**{username}**: {content}"
-                        log_message("DiscordPoll", formatted, direct=False, channel_idx=DISCORD_INBOUND_CHANNEL_INDEX)
-                        if interface is None:
-                            print("❌ Cannot send polled Discord message: interface is None.")
-                        else:
-                            send_broadcast_chunks(interface, formatted, DISCORD_INBOUND_CHANNEL_INDEX)
-                        print(f"Polled and routed Discord message: {formatted}")
-                        last_message_id = msg["id"]
-            else:
-                print(f"Discord poll error: {response.status_code} {response.text}")
-        except Exception as e:
-            print(f"Error polling Discord: {e}")
-        time.sleep(10)
 
 if __name__ == "__main__":
     # App-level single-instance guard (complements service/script lock)

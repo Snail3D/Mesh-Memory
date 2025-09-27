@@ -1,5 +1,14 @@
 # Enhanced Mesh-Master Fork - Technical Changes Summary
 
+## v1.1.0 (2025-09-27)
+
+Refinements aimed at fully offline operation and faster knowledge lookups.
+
+- Removed the `/weather` command along with all city/ZIP datasets and forecasting code; Mesh Master now operates with zero network lookups by default.
+- Slimmed the bundled MeshTastic knowledge base to the highest-value sections (≈982 lines) so `/meshtastic` answers stay within a tighter context budget.
+- Added an in-memory warm cache for `/meshtastic` queries (configurable TTL); follow-up questions reuse the prepared context instead of re-tokenizing the file each time.
+- Introduced `meshtastic_kb_max_context_chars` (default 3200) and `meshtastic_kb_cache_ttl` (default 600s) in `config.json` for fine-grained control.
+
 ## v1.0.0 (2025-09-25)
 
 Highlights focused on operational stability, visibility, and admin ergonomics.
@@ -18,7 +27,6 @@ Highlights focused on operational stability, visibility, and admin ergonomics.
   - Atomic writes for `config.json` and `motd.json` to prevent partial files on power loss or crashes.
 
 - Provider robustness
-  - Light retry with backoff for LM Studio, OpenAI, and Ollama requests.
   - Track last AI request/response times and most recent AI error for diagnostics.
 
 - Process safety

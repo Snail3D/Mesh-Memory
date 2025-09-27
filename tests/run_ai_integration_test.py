@@ -78,29 +78,21 @@ pubsub_mod = types.ModuleType('pubsub')
 pub_obj = types.SimpleNamespace(subscribe=lambda *a, **k: None, unsubscribe=lambda *a, **k: None)
 pubsub_mod.pub = pub_obj
 
-# twilio.rest.Client mock
-twilio_mod = types.ModuleType('twilio')
-twilio_rest_mod = types.ModuleType('twilio.rest')
-class _FakeTwilioClient:
-    def __init__(self, *a, **k):
-        pass
-twilio_rest_mod.Client = _FakeTwilioClient
-
 # unidecode fallback
 unidecode_mod = types.ModuleType('unidecode')
+
 def _fake_unidecode(s):
     return s
+
 unidecode_mod.unidecode = _fake_unidecode
 
-# Insert into sys.modules so imports in mesh-master.py resolve
+# Insert mocks into sys.modules so mesh-master imports succeed
 sys.modules.setdefault('meshtastic', fake_meshtastic)
 sys.modules.setdefault('meshtastic.serial_interface', fake_serial)
 sys.modules.setdefault('meshtastic.mesh_interface', mesh_interface_mod)
 sys.modules.setdefault('meshtastic.tcp_interface', tcp_interface_mod)
 sys.modules.setdefault('pubsub', pubsub_mod)
 sys.modules.setdefault('pubsub.pub', pub_obj)
-sys.modules.setdefault('twilio', twilio_mod)
-sys.modules.setdefault('twilio.rest', twilio_rest_mod)
 sys.modules.setdefault('unidecode', unidecode_mod)
 
 # Provide a minimal google.protobuf.message.DecodeError exception class

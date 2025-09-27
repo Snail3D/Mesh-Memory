@@ -1,9 +1,7 @@
 # MeshTastic Operational Knowledge Base
-
 Curated from Meshtastic's official documentation repository (https://github.com/meshtastic/meshtastic) on demand.
 Scope: hardware characteristics, firmware workflows, configuration, integrations, and operational safety.
 Usage policy: Treat this as authoritative for field operations. When uncertainty remains, advise the user to consult upstream docs.
-
 
 ## About / Introduction
 
@@ -18,25 +16,35 @@ Image: LoRa Topology (/img/introduction/lora-topology-2.webp)
 - Send and receive text messages between members of the mesh
 - Optional GPS based location features
 - And more!
+
+
 ## How it works
 Meshtastic utilizes LoRa, a long-range radio protocol, which is widely accessible in most regions without the need for additional licenses or certifications, unlike ham radio operations.
 These radios are designed to rebroadcast messages they receive, forming a mesh network. This setup ensures that every group member, including those at the furthest distance, can receive messages.
 Additionally, Meshtastic radios can be paired with a single phone, allowing friends and family to send messages directly to your specific radio. It's important to note that each device is capable of supporting a connection from only one user at a time.
 If you are interested in a more technical overview of how Meshtastic works, visit the overview section below: Technical Overview
+
+
 ## Contributors
-Meshtastic is an open source project available on GitHub. Our generous volunteers donate their personal time to write and maintain this codebase. If you would like to contribute see our GitHub (https://github.com/meshtastic), join our Discord server (https://discord.gg/ktMAKGBnBs), and read up on our Meshtastic Discussions (https://github.com/orgs/meshtastic/discussions). Contribute!
+Meshtastic is an open source project available on GitHub. Our generous volunteers donate their personal time to write and maintain this codebase. If you would like to contribute see our GitHub (https://github.com/meshtastic), participate in the community forums (https://github.com/orgs/meshtastic/discussions). Contribute!
+
+
 ## Start using Meshtastic
-Hopefully your "Getting Started" experience is straight forward and headache free. If you encounter any issues, please consider updating our documentation to improve future user experiences or reach out on the forum or Discord.
+Hopefully your "Getting Started" experience is straight forward and headache free. If you encounter any issues, please consider updating our documentation to improve future user experiences or reach out on the community forum.
 Our support is 100% volunteer based. We are passionate about the project and hope to help newcomers become Meshtastic experts! Getting Started
 
 
+
 ## About / Overview / Index
+
 
 ## How it works
 When you send a message on your Meshtastic companion app, it is relayed to the radio using Bluetooth, Wi-Fi/Ethernet or serial connection. That message is then broadcasted by the radio. If it hasn't received a confirmation from any other device after a certain timeout, it will retransmit the message up to three times.
 When a receiving radio captures a packet, it checks to see if it has heard that message before. If it has it ignores the message. If it hasn't heard the message, it will rebroadcast it.
 For each message a radio rebroadcasts, it marks the "hop limit" down by one. When a radio receives a packet with a hop limit of zero, it will not rebroadcast the message.
 The radio will store a small amount of packets (around 30) in its memory for when it's not connected to a client app. If it's full, it will replace the oldest packets with newly incoming text messages only.
+
+
 ## What is a mesh?
 At the radio level a Meshtastic mesh is a set of nodes that share the same LoRa spreading factor, center frequency, and bandwidth. A node can only be in one radio mesh; it will not see or respond to messages from nodes using different values for these settings. For a mesh to form, nodes need to share the same values.
 These values are grouped into "presets" that can be easily chosen in the LoRa configuration section. Presets make it easy for nodes to configure the same radio parameters.
@@ -44,7 +52,9 @@ Sitting on top of this radio mesh are Channels. A logical mesh is formed by a Ch
 Nodes can belong to a maximum of 8 Channels in the radio mesh. A custom Channel can be created for use by a specific group. Only nodes configured with the same Channel name and encryption key will be able to read and display messages on that Channel. However, all nodes in the radio mesh will receive and may retransmit messages (depending on their Role) regardless of the Channel settings for the message.
 
 
+
 ## About / Overview / Mesh Alg
+
 
 ## Current Algorithm
 The routing protocol for Meshtastic is designed to support all kinds of different use-cases. Most importantly, it does not assume merely static nodes. If you want to test its theoretical performance, you can have a look at the simulator (https://github.com/GUVWAF/Meshtasticator). The protocol is heavily influenced by the mesh routing algorithm used in RadioHead (https://www.airspayce.com/mikem/arduino/RadioHead) (which was used in very early versions of this project). It has four conceptual layers and (since version 2.6) uses a different approach for broadcasts and direct messages.
@@ -82,15 +92,8 @@ This layer is conventional non-reliable LoRa packet transmission. A packet gener
 #### Carrier-Sense Multiple Access with Collision Avoidance (CSMA/CA)
 Meshtastic adopts CSMA/CA, similar as to what is used in WiFi. This means that all transmitters must perform Channel Activity Detection (CAD) before attempting to transmit. If the channel is considered busy, the node will wait until it is not anymore. Since once the channel becomes idle multiple nodes might want to start transmitting, a node has to wait a random multiple of slot times. The slot time is the time needed to reliably perform CAD. The amount of slot times to wait is randomly picked from a contention window (CW), which size depends on the current channel utilization. The contention window is larger for a higher channel utilization, in order to limit the chance of collisions.
 ### Layer 2: Reliable Zero Hop Messaging
-This layer adds reliable messaging between the node and its immediate neighbors only.
-The default messaging provided by Layer 1 is extended by setting the `WantAck` flag in the MeshPacket protobuf. If `WantAck` is set, the following documentation from mesh.proto applies:
-> This packet is being sent as a reliable message, we would prefer it to arrive at the destination. We would like to receive an ACK packet in response.
->
-> Broadcast messages treat this flag specially: Since ACKs for broadcasts would rapidly flood the channel, the normal ACK behavior is suppressed. Instead, the original sender listens to see if at least one node is rebroadcasting this
-> packet (because naive flooding algorithm). If it hears that, the odds (given typical LoRa topology) are very high that every node should eventually receive the message. So FloodingRouter.cpp generates an implicit ACK which is delivered to the original sender. If after some time we don't hear anyone rebroadcast our packet, we will timeout and re-transmit, using the regular resend logic.
-If a transmitting node does not receive an ACK (or NAK) packet after a certain expiration time, it will use Layer 1 to attempt a re-transmission of the sent packet. A reliable packet (at this 'zero hop' level) will be resent a maximum of three times. If no ACK or NAK has been received by then the local node will internally generate a NAK (either for local consumption or use by higher layers of the protocol). The re-transmission expiration time is based on the maximum time it would take to receive an (implicit) ACK, taking the airtime of the sent packet and any processing delay into account.
-For direct messages, the intended recipient will also send a real ACK all the way back to the original sender, but the device will only retransmit when it received no ACK at all.
-### Layer 3: Multi-Hop Messaging
+... (section truncated for brevity)
+
 ## Broadcasts using Managed Flooding
 Given the various use-cases and scenarios Meshtastic supports, most of our protocol is built around flooding ( ), meaning that every node rebroadcasts a packet it receives, up till a certain hop limit. However, an important difference in Meshtastic is that before rebroadcasting, a node listens a short while to see if another node has already rebroadcasted the packet. If so, it will not rebroadcast. "Managed Flooding" is therefore a better term.
 The principle is as follows. If any mesh node sees a packet with a HopLimit other than zero, it will decrement that HopLimit and attempt to rebroadcast on behalf of the original sending node. In order to promote letting nodes that are further away flood the message, such that the message eventually reaches farther, the contention window (see Layer 1) for a flooding message depends on the Signal-to-Noise Ratio (SNR) of the received packet. The CW size is small for a low SNR, such that nodes that are further away are more likely to flood first and closer nodes that hear this will refrain from flooding. An exception to this rule is for the `ROUTER` and `REPEATER` roles, that have a higher priority to rebroadcast and will do so even if they hear another node rebroadcasting.
@@ -100,6 +103,8 @@ Due to limited coverage, it only reaches nodes 1 and 2. Since node 2 is farther 
 After node 0 received this rebroadcast, its message is acknowledged. Note that a message is already acknowledged once a rebroadcast from any Meshtastic node (whether or not it has the same encryption key) is received.
 Since node 1 heard the rebroadcast by 2, it will not rebroadcast again. Node 3 heard the message for the first time and the HopLimit is not yet zero, so it starts a rebroadcast for potential other receivers.
 Image: Mesh algorithm example (/img/SNR_based_flooding.webp)
+
+
 ## Direct messages using Next-Hop routing
 Since version 2.6, Meshtastic uses a different approach for direct messages. Initially, the managed flooding approach as mentioned before is used to reach the destination.
 We'll then keep track of the node(s) that are trying to relay the packet for us. If upon a successful delivery, a response comes back (e.g., a NodeInfo response, acknowledgment or traceroute) and the node that relays this towards you was also (one of) the node(s) that relayed the original packet, it will be denoted as next-hop from now on. This means that instead of letting all nodes try to relay the packet, only the node for which the next-hop byte matches will. Note that this is determined per hop, so if there is an asymmetric link or a node on older firmware in between, managed flooding will be used on this hop. When a node moves, or RF conditions change, it might be the next-hop is not valid anymore. Therefore, a node will always fall back to managed flooding at the last retransmission attempt if it doesn't hear its next-hop relay.
@@ -116,10 +121,13 @@ Starting with version 2.4.0, the firmware will scale back Telemetry, Position, a
 For example an active mesh of 62 nodes would scale back `telemetry.device_update_interval` to 79.5 minutes instead of the 30 minute default.
 
 
+
 ## About / Overview / Radio Settings
 
 Meshtastic is **not** LoRaWAN, Helium or TTN (TheThingsNetwork). Meshtastic uses the full spectrum frequency range designated to LoRa technology per region. This allows for several hundred possible frequency channels in the US region alone.
 Power limits will generally be lifted in the software if `is_licensed` is set to `true`. See Ham Mode (/docs/faq#amateur-radio-ham) for more information. ## Frequency Slot Calculator
+
+
 ## Europe Frequency Bands
 EU countries will generally be covered by the Radio Equipment Directive (2014/53/EU (http://data.europa.eu/eli/dir/2014/53/2023-10-01)) and subsequent amendments, which is then enacted in local laws. Useful information on this is located here (https://single-market-economy.ec.europa.eu/single-market/european-standards/harmonised-standards/radio-equipment_en).
 The bands below were selected based on the maximum power and the duty cycle available. It may be possible to use other frequency bands for specific applications, but these are not currently supported "out of the box".
@@ -132,11 +140,15 @@ The maximum power allowed for Europe is +27 dBm ERP (Effective Radiated Power (h
 The band range is from 869.40 to 869.65 MHz. This is less than the 863–870 MHz range defined as SRD (Short Range Devices (https://www.etsi.org/technologies/short-range-devices)) Band, but allows for a higher ERP and a duty cycle of 10%.
 There is one frequency slot defined with the standard radio preset `LongFast`. After factory reset the radio will be set to frequency slot 1 with a center frequency of 869.525 MHz.
 It is worth noting that 868 MHz is generally the most popular frequency band for Meshtastic in Europe.
+
+
 ## North America Frequency Bands
 ### 915 MHz (ISM Band)
 The maximum output power for North America is +30 dBm ERP (Effective Radiated Power (https://en.wikipedia.org/wiki/Effective_radiated_power)).
 The band range is from 902 to 928 MHz.
 In North America, the available Frequency Slots depend on the bandwidth setting, which is included in the selected Radio Preset. The standard Preset, LongFast, provides 104 Frequency Slots. After a factory reset, the radio defaults to LongFast with a Frequency Slot of 0, which translates to Slot 20 (centered at 906.875 MHz) based on the channel hashing algorithm.
+
+
 ## Data Rates
 ### Considerations
 Various data-rate options are available when configuring a frequency slot and are inversely proportional to the theoretical range of the devices.
@@ -173,15 +185,16 @@ Some example settings:
 | 0.610 kbps | 10 / 1024 | 4/8 | 125 kHz | 149dB | |
 | 0.488 kbps | 11 / 2048 | 4/6 | 125 kHz | 152dB | |
 | 0.073 kbps | 12 / 4096 | 4/5 | 31 kHz | 160dB | Twice the range and/or coverage of "Long Slow", low resilience to noise |
-| 0.046 kbps | 12 / 4096 | 4/8 | 31 kHz | 160dB | Twice the range and/or coverage of "Long Slow", high resilience to noise |
-The link budget used by these calculations assumes a transmit power of 17dBm and an antenna with 0dB gain. Adjust your link budget assumptions based on your actual devices.
-These frequency slot settings may not have been tested. Use at your own discretion. Share on the Meshtastic Discussions page (https://github.com/orgs/meshtastic/discussions) with your successes or failure.
+... (section truncated for brevity)
+
 ## Cryptography
 The pre-shared key (PSK) used by the devices can be an AES128 or AES256 sequence. Alternatively, encryption can be turned off, which may be useful if you are operating under a ham radio license.
 [^1]: Short Turbo is the fastest preset and the only one with 500kHz bandwidth. It is not legal to use in all regions due to this wider bandwidth.
 
 
+
 ## About / Overview / Encryption / Index
+
 
 ## Explanation
 Meshtastic provides AES256-CTR encryption for the payload of each packet when sending via LoRa, with a different key for each channel (/docs/configuration/radio/channels/). The packet header (/docs/overview/mesh-algo/#layer-1-unreliable-zero-hop-messaging) is always sent unencrypted, which allows nodes to relay packets they can't decrypt as well. One can disable this by setting a different rebroadcast mode (/docs/configuration/radio/device#rebroadcast-mode).
@@ -189,6 +202,8 @@ By default, you have one primary channel, which is encrypted with a simple known
 Direct messages to a specific node are now encrypted using Public Key Cryptography (PKC). Each node is equipped with a unique public/private key pair, and direct messages are encrypted with the recipient's public key. This ensures that only the recipient can decrypt the message using their private key. Additionally, messages are signed with the sender's private key, allowing the recipient to verify the sender's identity and ensuring the message's integrity.
 All periodic broadcasts (position, telemetry, traceroutes, etc.) the device sends out itself are sent over the primary channel and thus encrypted with that key.
 The device will decrypt the payload before sending it to a client app via BLE, serial, Wi-Fi/Ethernet. For MQTT, you can specify (/docs/configuration/module/mqtt#encryption-enabled) whether you want to send an encrypted or unencrypted payload.
+
+
 ## Is it as secure as Wi-Fi WPA3, HTTPS TLS1.3, or Signal?
 **No**.
 WPA3 (https://en.wikipedia.org/wiki/WPA3), TLS1.3 (https://en.wikipedia.org/wiki/TLS1.3), Signal (https://en.wikipedia.org/wiki/Signal_Protocol), and Meshtastic can all use AES256. Yet AES is one of the many cogs required in a modern encryption system. Below are the main features "missing" in Meshtastic.
@@ -224,6 +239,8 @@ Some other networks like Yggdrasil (https://yggdrasil-network.github.io/), cjdns
 - Keep in mind that the sender field is indicative, and anyone with access to the channel key can trivially lie.
 #### Changes since 2.5.0 Firmware release
 - The above now only relates to group chats/channels as DM's are protected when messaging between devices on 2.5 or newer, messaging to legacy 2.4 or older devices are not afforded this addition authentication.
+
+
 ## Direct Messages
 Direct Messages (DMs) are now implemented using Public Key Cryptography (PKC). This provides a significant upgrade in security compared to the previous channel-based encryption:
 - **Message Encryption:** Each DM is encrypted using the recipient's public key, ensuring that only the recipient can decrypt the message with their private key.
@@ -232,6 +249,8 @@ Direct Messages (DMs) are now implemented using Public Key Cryptography (PKC). T
 Previously, DMs were implemented as channel messages with a `to` protobuf field set. This meant anyone in the channel could read all your direct messages. With PKC, this issue is resolved, as only the intended recipient can decrypt and read the message.
 ### Recommendations
 - While PKC significantly enhances the security of DMs, it's still advisable to avoid sharing sensitive information in direct messages without proper verification of the recipient's public key.
+
+
 ## Admin Messages
 Admin Messages/Control are now protected by enhanced security features, making sure that critical operations within the network are more secure than ever before.
 - **Stronger Encryption:** Admin Messages now use advanced encryption methods to ensure that only the intended recipients can access and read them.
@@ -243,25 +262,27 @@ Previously, admin messages were not as secure, but with these updates, they are 
 - Regularly monitor your network for any unusual activity to maintain a high level of security.
 
 
+
 ## About / Overview / Encryption / Limitations
 
 Meshtastic’s security model sits at the intersection of multiple conflicting requirements. This document explains the requirements, the tradeoffs they represent, and characterizes the current limitations chosen to make Meshtastic usable. It also covers recent changes and upcoming fixes.
-This information is not new, but until now was spread through Discord discussions, GitHub issues, and comments in the Meshtastic codebase. This document is an effort to plainly lay it out in one place.
-## History
-First, Meshtastic was originally designed to work with closed, trusted groups only. Meshtastic channels are encrypted with a Pre-Shared Key (PSK) and AES-CTR. This encryption type does not include authentication, and as such, anyone with the PSK can send a message as any other user on that channel.
-AES-CTR does have another weakness, in that it produces a cipher stream for a given Initialization Vector (IV), and the actual encryption step is done by XOR’ing the plaintext with that stream. In Meshtastic Channel messages, this IV is a combination of the sender’s Nodenum and the PacketID of the given message. This does mean that if an attacker can deduce the exact plaintext of an encrypted message, an attacker can re-use the Nodenum and PacketID combination to send spoofed messages, even without knowing the PSK of the channel. This is of limited use due to the requirement for PacketID and source NodeNum reuse, to get a matching IV.
-In its first iteration, Meshtastic handled Direct Messages (DMs) by simply using the existing channel PSK, and marking DMs as only directed to the target node. This approach was acceptable when Meshtastic only being used by small groups, but the advent of public meshes with the potential for bad actors has changed the equation significantly. For about a year, Meshtastic has been intentionally adding features to harden it against this scenario, but with minimal compatibility breaks.
-The PSK DMs in particular were recognized as a problem, and the new DM system was rolled out with Meshtastic 2.5. This system uses x25519 public key cryptography and AES-CCM to encrypt and authenticate DMs sent between nodes. These public keys are sent inside User packets encrypted with the existing channel PSKs.
+This information is not new, but until now was spread through community discussions, GitHub issues, and comments in the Meshtastic codebase. This document is an effort to plainly lay it out in one place.
+
+
 ## Limitations
 This system, by necessity, uses a Trust On First Use (TOFU) model. There is no central authority to sign user keys, and so nodes will store and retain the first public key announced for a given node number. This is essentially a hard requirement of a decentralized mesh network.
 This issue is compounded by the limited memory for storing nodes on a Meshtastic node. The NodeDB is limited to 100 nodes on most hardware, and when more Nodes are seen on a network, the oldest and least interesting node rolls off the NodeDB to make room for new nodes. The exception to this is that favorited nodes are guaranteed not to be removed from the NodeDB.
 The combination of the TOFU model and constrained hardware leads to a problem. When a node rolls off the NodeDB, the Meshtastic firmware has no way to confirm that a future User packet isn’t a spoof of that Node Number, with a different public key. This problem is made worse by the possibility that an attacker on the channel can quickly create fake nodes, and cause legitimate nodes to roll off the NodeDB sooner.
 This attack was anticipated when the DM system was designed, and accepted as an inevitable result of building an ad-hoc, decentralized mesh. Again, there is no central authority to sign keys. As a result, multiple mitigations were built in to the system to minimize the actual usefulness of this attack.
+
+
 ## Intended Behavior
 First, while the NodeDB is limited to 100 nodes on embedded hardware, a connected mobile client has the ability to store information about many more nodes, and flag to the user when one of those nodes shows up with a different public key. This is what happens when a node on a client shows up with a red key icon. The firmware has seen a different public key for that node, and the mobile client knows that it has changed.
 The second major mitigation is that nodes that are marked as favorite are never dropped from the NodeDB. Clients have now automatically mark nodes as favorite when a DM is sent to that node, further ensuring that the node a user was chatting with is still the same node.
 The meshtastic firmware does also support falling back to the old DM behavior. This is tightly controlled via the use of the “pki_encrypted” boolean and the “public_key” byte field. When the firmware receives a packet from the mesh, if that packet is sent using the DM PKI encryption, the bool is marked true, and the source public key is copied into the bytes field. DMs using the old channel PSK method will still be received and processed, but the pki_encrypted field is set false.
 Packets sent from a connected client may set the “pki_encrpyted” boolean to true, and populate the public_key byte field on a packet sent through the local API. If the boolean is set to true, then the packet will only be sent via a PKI DM. If the bytes are populated, the packet will only be sent if the public key in the API message matches the public key for that node in the local NodeDB. If the boolean is not set to true, the firmware will send the packet as a PKI DM if it is indeed sent to a single target, and the firmware has a public key for that target. Outgoing messages will fall back to using the less secure channel encryption if no public key is known for the remote node and the pki_encrypted bool is unset
+
+
 ## The ED25519 Future
 A few weaknesses of the Meshtastic system can be addressed by adding a message signing system to channel messages. As we still have limited NodeDB storage space and LoRa packets are still limited to 256 byte maximum size, it’s a virtual requirement that this signing system reuse the existing public/private key pairs, and the signatures be as small as possible.
 There has been an additional suggestion repeatedly made, that the nodeNum should be derived from the publicKey, to minimize the ability of an attacker to spoof a User packet from an existing nodenum with a new public key. While the Meshtastic security team has generally agreed with the wisdom of this suggestion, it has been impractical to implement as a breaking change to the mesh. The addition of signed messages actually presents an opportunity to enforce this new nodenum source, while still remaining backwards compatible with the older system.
@@ -270,74 +291,9 @@ Once a node has successfully signed a User message with this scheme, the HAS_XED
 Once this bit is set, unsigned user packets from this source will be dropped. To be determined is how other unsigned packets will be treated. At this point, the recommendation is that short packets, that could be signed, should be dropped when unsigned.
 
 
-## About / Overview / Range Test
-
-#### Current Ground Record: 331km
-- **Range:** 331km (205 miles)
-- **Record Holders:** _MartinR7_ & _alleg_
-- **Source:** reddit (https://www.reddit.com/r/meshtastic/comments/1fnduwo/mountain_to_mountain_331_km/) Modem Settings
-Default Very Long Slow
-- **Frequency:** 868MHz
-- **Bandwidth:** 62.5
-- **Spread Factor:** 12
-- **Coding Rate:** 4/8 Node A
-- **Device:** RAK4631 Core (/docs/hardware/devices/rak-wireless/wisblock/core-module/?rakcore=RAK4631)+RAK19003 (/docs/hardware/devices/rak-wireless/wisblock/base-board/?rakbase=RAK19003)+RAK1906 (/docs/hardware/devices/rak-wireless/wisblock/peripherals/?rakmodules=Sensors#rak1906-environment-sensor)+INA219 (/docs/configuration/module/telemetry/#currently-supported-sensor-types)
-- **Firmware Version:** 2.3.6
-- **Antenna:** 55cm collinear 868mhz (AliExpress) Node B
-- **Device:** RAK4631 Core (/docs/hardware/devices/rak-wireless/wisblock/core-module/?rakcore=RAK4631)+RAK19003 (/docs/hardware/devices/rak-wireless/wisblock/base-board/?rakbase=RAK19003)+RAK1901 (/docs/hardware/devices/rak-wireless/wisblock/peripherals/?rakmodules=Sensors#rak1901-temperature-and-humidity-sensor)
-- **Firmware Version:** 2.4.2
-- **Antenna:** RAKARJ17
-#### Previous Ground Record: 254km
-- **Range:** 254km (158 miles)
-- **Record Holders:** _kboxlabs_
-- **Source:** Meshtastic Discourse (archive) (https://web.archive.org/web/20250102052417/https://meshtastic.discourse.group/t/practical-range-test-results/692/137) Modem Settings
-Default Long_Fast
-- **Frequency:** 915MHz
-- **Bandwidth:** 250
-- **Spread Factor:** 11
-- **Coding Rate:** 4/8 Node A
-- **Device:** RAK4631 Core (/docs/hardware/devices/rak-wireless/wisblock/core-module/?rakcore=RAK4631) with RAK 5005-O Base Board (/docs/hardware/devices/rak-wireless/wisblock/base-board/?rakbase=RAK5005-O)
-- **Firmware Version:** 2.1.17
-- **Antenna:** 902-928MHz 5.8 dBi Slinkdsco Outdoor Node B
-- **Device:** RAK4631 Core (/docs/hardware/devices/rak-wireless/wisblock/core-module/?rakcore=RAK4631) with RAK 19003 Mini Base Board (/docs/hardware/devices/rak-wireless/wisblock/base-board/?rakbase=RAK19003)
-- **Firmware Version:** 2.1.18
-- **Antenna:** Standard LoRa 915MHz 60mm 2dBi Omnidirectional
-#### Previous Record 166km
-- **Range:** 166km (103 miles)
-- **Record Holder:** _PuzzledPancake_
-- **Source:** Meshtastic Discourse (archive) (https://web.archive.org/web/20250102052417/https://meshtastic.discourse.group/t/practical-range-test-results/692/44) Modem Settings
-- **Frequency:** 868MHz
-- **Bandwidth:** 125
-- **Spread Factor:** 12
-- **Coding Rate:** 4/8 Node A
-- **Device:** LILYGO TTGO T-Beam w/ SX1262 (/docs/hardware/devices/lilygo/tbeam/?t-beam=sx1262)
-- **Firmware Version:** 1.2
-- **Antenna:** 868MHz 5dBi Antenna (https://ivent.co.nz/product/category/1000/868mhz%205dbi%20antenna%20193mm%20black%20sma%20%28m%29/38646) Node B
-- **Device:** LILYGO TTGO T-Beam w/ SX1262 (/docs/hardware/devices/lilygo/tbeam/?t-beam=sx1262)
-- **Firmware Version:** 1.2
-- **Antenna:** 868MHz Vertical 6dBi (https://ivent.co.nz/product/category/1000/868mhz%20vertical%206dbi%20antenna/38606)
-Image: Topographical Map (/img/records/topographical_map.webp)
-Image: Node A (/img/records/node_a.webp)
-Image: Node B (/img/records/node_b.webp) Resources Used
-- http://www.heywhatsthat.com
-#### Current Air Record: 206km
-- **Range:** 206km (128 miles)
-- **Record Holders:** _StarWatcher, CVR, rook, kboxlabs_
-- **Source:** Meshtastic Discourse (archive) (https://web.archive.org/web/20250102052417/https://meshtastic.discourse.group/t/practical-range-test-results/692/130) Modem Settings
-Default Long_Fast
-- **Frequency:** 915MHz
-- **Bandwidth:** 250
-- **Spread Factor:** 11
-- **Coding Rate:** 4/8 Node A
-- **Device:** LILYGO TTGO T-Beam (/docs/hardware/devices/lilygo/tbeam/?t-beam=1.1)
-- **Firmware Version:** 2.1.10
-- **Antenna:** Stock Antenna Node B
-- **Device:** LILYGO TTGO T-Beam (/docs/hardware/devices/lilygo/tbeam/?t-beam=1.1)
-- **Firmware Version:** 2.1.10 (modified to place GPS in flight mode)
-- **Antenna:** Stock Antenna
-
 
 ## Getting Started / Index
+
 
 ## Identify Hardware
 This guide assumes that you have already purchased the devices you will be using with Meshtastic. If you haven't, you can check out our list of supported hardware (/docs/hardware/devices/index.mdx)
@@ -357,7 +313,7 @@ The nRF52 chip is much more power efficient than the ESP32 chip and easier to up
 - LILYGO® TTGO T-Echo
 ### RP2040
 The RP2040 is a dual-core ARM chip developed by Raspberry Pi. Supported RP2040 devices include: - Raspberry Pi Pico + Waveshare LoRa Module (Note: **Bluetooth on the Pico W is not yet supported by Meshtastic**) - RAK11310 Core module for RAK WisBlock modular boards
-If your device is not listed above, please review our supported devices (/docs/hardware/devices/index.mdx) to determine which MCU your device has or contact us in Discord (https://discord.gg/ktMAKGBnBs) with any questions.
+If your device is not listed above, please review our supported devices (/docs/hardware/devices/index.mdx) to determine which MCU your device has or contact the community via the forum (https://github.com/orgs/meshtastic/discussions) with any questions.
 Never power on the radio without attaching an antenna as doing so could damage the radio chip!
 Prior to connecting your Meshtastic device to the computer, you should perform the following basic checks.
 ### Verify Data Cable
@@ -371,23 +327,10 @@ After completing the previous steps, you can now flash the Meshtastic firmware o
 After flashing the Meshtastic firmware onto your device, you can now move on to initial configuration. Connect and Configure Device
 
 
+
 ## Getting Started / Initial Config
 
-## Supported Clients per Connection Type
-Depending on your connection, some configuration options are not fully supported. Find out which client is best for your type of connection. Serial ), value: "serial", }, { label: ( <> Bluetooth ), value: "ble", }, { label: ( <> Network ), value: "windows", }, ]}>
-#### Serial
-- Python CLI (/docs/software/python/cli/)
-- Web Client (https://client.meshtastic.org)
-- Android App (/docs/category/android-app)
-#### Bluetooth
-- Android App (/docs/category/android-app)
-- Web Client (https://client.meshtastic.org)
-#### Network
-Connecting over network is only supported on ESP32 devices.
-- Web Client (https://client.meshtastic.org)
-- Android App (/docs/category/android-app)
-- iOS App (/docs/category/apple-apps)
-- Python CLI (/docs/software/python/cli/)
+
 ## Set Regional Settings
 In order to start communicating over the mesh, you must set your region. This setting controls which frequency range your device uses and should be set according to your regional location. Android ), value: "android", }, { label: ( <> Apple ), value: "apple", }, { label: ( <> CLI ), value: "cli", }, { label: ( <> Web ), value: "web", }, ]}>
 #### Android
@@ -407,84 +350,16 @@ Configuration of Region, Modem Preset and Hop Limit is available on iOS, iPadOS 
 4. Click **Save**.
 ### Region Codes
 Refer to LoRa Region by Country (/docs/configuration/region-by-country) for a more comprehensive list.
+
+
 ## Continue Configuration
 Now that you have set the LoRa region on your device, you can continue with configuring any additional configs to suit your needs. Device Configuration
 
 
-## Getting Started / Serial Drivers / Serial Drivers Esp32
 
-## Install ESP32 USB to Serial Drivers
-You may need to install a driver from Silicon Labs for the CP210X USB to UART bridge (https://www.silabs.com/products/development-tools/software/usb-to-uart-bridge-vcp-drivers)
-Some newer boards may require the CH9102 (CH340/CH341) Driver. Linux ), value: "linux", }, { label: ( <> macOS ), value: "macos", }, { label: ( <> Windows ), value: "windows", }, ]}>
-#### Linux
-- CP210X USB to UART bridge - Download (https://www.silabs.com/products/development-tools/software/usb-to-uart-bridge-vcp-drivers)
-- CH9102 Driver - Linux Download (http://www.wch-ic.com/downloads/CH341SER_LINUX_ZIP.html)
-#### macOS
-- CP210X USB to UART bridge - Download (https://www.silabs.com/products/development-tools/software/usb-to-uart-bridge-vcp-drivers)
-- CH9102 Driver - MacOS Download (https://github.com/WCHSoftGroup/ch34xser_macos)
-#### Windows
-- CP210X USB to UART bridge - Download (https://www.silabs.com/products/development-tools/software/usb-to-uart-bridge-vcp-drivers)
-- CH9102 Driver - Windows Download (http://www.wch.cn/downloads/CH343SER_ZIP.html)
-- CH9102 Driver - Windows Download (Direct Download for Windows 7) (https://github.com/Xinyuan-LilyGO/CH9102_Driver)
-After installing the driver, make sure to reboot your computer to finish the installation process.
-You can also test your serial driver installation (/docs/getting-started/serial-drivers/test-serial-driver-installation) at this step if required.
-### Flash Firmware
-After installing the serial drivers, you can now flash the Meshtastic firmware onto your device. To proceed, select the appropriate device type for your device. Flash ESP32 Firmware
-
-
-## Getting Started / Serial Drivers / Serial Drivers Nrf52
-
-## Install nRF52/RP2040 USB to Serial Drivers
-nRF52/RP2040 devices typically do not require serial drivers. They use the UF2 bootloader which makes the devices appear as flash drives. Do _NOT_ download the USB device drivers unless required to install UF2 support. Linux ), value: "linux", }, { label: ( <> macOS ), value: "macos", }, { label: ( <> Windows ), value: "windows", }, ]}>
-#### Linux
-- CH34x Driver - Linux Download (http://www.wch-ic.com/downloads/CH341SER_LINUX_ZIP.html)
-#### macOS
-With the latest versions of MacOS, the USB Serial driver is built-in. If you downloaded/installed any already, please remove them.
-##### Remove the CH34x USB Driver (macOS)
-If you have already downloaded/installed the macOS WCH-IC CH340/CH341
-("CH341SER_MAC") drivers via the CH34x_Install_V1.5.pkg, you will have to
-Uninstall the kernel extension:
-1. Unplug your device
-2. Open the Terminal and run:
-3. `sudo rm -rf /Library/Extensions/usbserial.kext`
-4. Reboot
-##### Install the CH34x Driver
-- CH34x Driver- macOS Download (https://github.com/WCHSoftGroup/ch34xser_macos)
-#### Windows
-- CH34x Driver - Windows Download (http://www.wch-ic.com/downloads/CH341SER_EXE.html)
-After installing the driver, make sure to reboot your computer to finish the installation process.
-You can also test your serial driver installation (/docs/getting-started/serial-drivers/test-serial-driver-installation) at this step if required.
-### Flash Firmware
-After installing the serial drivers, you can now flash the Meshtastic firmware onto your device. To proceed, select the appropriate device type for your device. Flash nRF52/RP2040 Firmware
-
-
-## Getting Started / Serial Drivers / Test Serial Driver Installation
-
-### Test Serial Driver Installation
-You can verify that you have a proper data cable (rather than a charge-only type cable) and that the appropriate drivers for your system are installed by performing the following test: Linux ), value: "linux", }, { label: ( <> macOS ), value: "macos", }, { label: ( <> Windows ), value: "windows", }, ]}>
-#### Linux
-1. Connect your Meshtastic device to your USB port
-2. Open a **Terminal** and enter the following command: ```shell lsusb ```
-3. You should see something like: ```shell ID xxxx:xxxx Silicon Labs CP210x UART Bridge # or ID xxxx:xxxx QinHeng Electronics USB Single Serial # or ID xxxx:xxxx Adafruit WisCore RAK4631 Board ```
-#### macOS
-1. Navigate to `Apple Menu  > About This Mac > More Info > System Report... > Hardware > USB`.
-2. You should see similar to one of the following entries:
-- `CP210X USB to UART Bridge Controller`
-- `CH9102 USB to UART Bridge Controller`
-- `WisCore RAK4631 Board`
-- `USB Single Serial`
-#### Windows
-1. Navigate to `Device Manager > Ports (COM & LPT)`
-2. You should see similar to one of the following entries:
-- `Silicon Labs CP210X USB to UART Bridge (COM5)`
-- `Silicon Labs CH9102 USB to UART Bridge (COM5)`
-- `USB-Enhanced-SERIAL CH9102 (COM5)`
-- `USB Serial Device (COM5)`
-If you are unable to see your device:
-- Make sure that your cable is not only for charging but also for data transfer (/docs/getting-started#verify-data-cable).
-- It's possible that you need to reinstall the USB serial driver (/docs/getting-started/serial-drivers).
 ## Flash Firmware
 After completing the previous steps, you can now flash the Meshtastic firmware onto your device. To proceed, select the appropriate device type for your device. Flash ESP32 Firmware Flash nRF52/RP2040 Firmware
+
 
 
 ## Configuration / Radio / Index
@@ -504,12 +379,15 @@ There are several config sections in the Meshtastic firmware, these are broken o
 | User (./user) | The user config options are: Long Name, Short Name, and Is Licensed |
 
 
+
 ## Configuration / Radio / Channels
 
 The Channels config options are: Index, Roles, and Settings. Channel config uses an admin message sending a `Channel` protobuf which also consists of a `ChannelSettings` or `ModuleSettings` protobuf.
 **Channel Settings** (as described on this page) should not be confused with Modem Preset Settings (/docs/configuration/radio/lora#modem-preset)
 Modem Preset Settings (/docs/configuration/radio/lora#modem-preset) contain the modem configuration (frequency settings, spreading factor, bandwidth, etc.) used for the LoRa radio. These settings are identical for all channels and can **not** be unique per channel.
 **Channel Settings** contain information for segregating message groups, configuring optional encryption, and enabling or disabling messaging over internet gateways. These settings **are** unique and configurable per channel.
+
+
 ## Channel Config Values
 ### Index
 The channel index begins at 0 and ends at 7.
@@ -532,96 +410,20 @@ Each channel is assigned one of 3 roles:
 3. `DISABLED` or `0` - The channel is no longer available for use. - The channel settings are set to default.
 While you can have a different PRIMARY channel and communicate over SECONDARY channels with the same Name & PSK, a hash of the PRIMARY channel's name sets the LoRa frequency slot, which determines the actual frequency you are transmitting on in the band.
 To ensure devices with different PRIMARY channel name transmit on the same frequency, you must explicitly set the LoRa frequency slot.
+
+
 ## Channel Settings Values
 The Channel Settings options are: Name, PSK, Downlink Enabled, and Uplink Enabled. Channel settings are embedded in the `Channel` protobuf as a `ChannelSettings` protobuf and sent as an admin message.
 ### Name
 A short identifier for the channel. _(
 The client applications have implemented different levels of precision giving the user a practical range to choose from. Setting across the full range of integers can be done via the Python CLI. See Setting Position Precision (/docs/configuration/radio/channels/#setting-position-precision) for examples on setting different levels of precision using CLI.
-## Channel Config Client Availability Android ), value: "android", }, { label: ( <> Apple ), value: "apple", }, { label: ( <> CLI ), value: "cli", }, { label: ( <> Web ), value: "web", }, ]}>
-#### Android
-Channel Config options are available on Android.
-Image: Android Menu Tabs (/img/android/android-menu-channel.webp)
-The Radio Configuration tab can be used for common tasks:
-1. View your current channel configuration QR code and URL.[^1]
-2. Quickly create or modify your primary channel.
-3. Select a modem preset for all your channels i.e. `Long Range / Fast`.
-[^1]:
-See Android App Usage (/docs/software/android/usage#setup-a-channel) for more further instruction on setting up your primary channel.
-Image: Channel Editor (/img/android/android-channel-edit-sm.webp) (/img/android/android-channel-edit.webp)
-Tap "Edit" to access the Channel Menu:
-1. Add, remove, or modify secondary channels
-2. Create or modify encryption keys
-3. Enable uplink and downlink for individual channels
-4. Position enabled
-5. Precise location (if position is enabled)
-6. Position precision (if precise location is disabled)
-#### Apple
-A channel editor is available on the iOS, iPadOS and macOS applications at Settings > Radio Configuration > Channels.
-#### CLI
-All Channel config options are available in the python CLI. Example commands are below:
-Because the device will reboot after each command is sent via CLI, it is recommended when setting multiple values in a config section that commands be chained together as one.
-```shell title="Example:"
-meshtastic --ch-set name "My Channel" --ch-set psk random --ch-set uplink_enabled true --ch-index 4
-```
-##### Name
-```shell title="Set channel name for the PRIMARY channel"
-# without spaces
-meshtastic --ch-set name MyChannel --ch-index 0
-# with spaces
-meshtastic --ch-set name "My Channel" --ch-index 0
-```
-##### PSK
-If you use Meshtastic for exchanging messages you don't want other people to see, `random` is the setting you should use. Selecting `default` or any of the `simple` values from the following table will use publicly known encryption keys. They're shipped with Meshtastic source code and thus, anyone can listen to messages encrypted by them. They're great for testing and public channels.
-| Setting | Behavior |
-| :--------------------: | :-----------------------------------------------------------------------------------: |
-| `none` | Disable Encryption |
-| `default` | Default Encryption (use the weak encryption key) |
-| `random` | Generate a secure 256-bit encryption key. Use this setting for private communication. |
-| `simple0`- `simple254` | Uses a single byte encoding for encryption |
-```shell title="Set encryption to default on PRIMARY channel"
-meshtastic --ch-set psk default --ch-index 0
-```
-```shell title="Set encryption to random on PRIMARY channel"
-meshtastic --ch-set psk random --ch-index 0
-```
-```shell title="Set encryption to single byte on PRIMARY channel"
-meshtastic --ch-set psk simple15 --ch-index 0
-```
-```shell title="Set encryption to your own key on PRIMARY channel"
-meshtastic --ch-set psk 0x1a1a1a1a2b2b2b2b1a1a1a1a2b2b2b2b1a1a1a1a2b2b2b2b1a1a1a1a2b2b2b2b --ch-index 0
-```
-```shell title="Set encryption to your own key on PRIMARY channel (Base64 encoded)"
-meshtastic --ch-set psk base64:puavdd7vtYJh8NUVWgxbsoG2u9Sdqc54YvMLs+KNcMA= --ch-index 0
-```
-Use this to copy and paste the `base64` encoded (single channel) key from the meshtastic --info command. Please don't use the omnibus (all channels) code here, it is not a valid key.
-```shell title="Disable encryption on PRIMARY channel"
-meshtastic --ch-set psk none --ch-index 0
-```
-##### Uplink / Downlink
-For configuring gateways, please see MQTT (/docs/configuration/module/mqtt)
-```shell title="Enable/Disable Uplink on PRIMARY channel"
-meshtastic --ch-set uplink_enabled true --ch-index 0
-meshtastic --ch-set uplink_enabled false --ch-index 0
-```
-```shell title="Enable/Disable Downlink on SECONDARY channel"
-meshtastic --ch-set downlink_enabled true --ch-index 1
-meshtastic --ch-set downlink_enabled false --ch-index 5
-```
-#### Setting Position Precision
-This is a per-channel setting. The `--ch-index` parameter must be specified to set the position precision for a specific channel, e.g., `--ch-index 0` for the primary channel or `--ch-index 1` for the secondary channel 1.
-```shell title="Set position precision to 13 bits (approx ±3 km)"
-meshtastic --ch-set module_settings.position_precision 13 --ch-index 0
-```
-```shell title="Set position precision to full precision (32 bits)"
-meshtastic --ch-set module_settings.position_precision 32 --ch-index 1
-```
-#### Web
-All Channel config options are available in the Web UI.
 
 
 ## Configuration / Radio / Security
 
 The security config options are: Public Key, Private Key, Admin Key, Is Managed, Serial Console, Debug Logs, and Admin Channel.
+
+
 ## Security Config Values
 ### Public Key
 Acceptable values: `bytes`
@@ -645,36 +447,8 @@ By default, logging is disabled when an API client connects to keep the shared s
 ### Admin Channel Enabled
 Acceptable values: `true` or `false`
 Allows incoming device control over the insecure legacy admin channel. Enabling this option permits control messages to be received through the older, less secure admin channel.
-## Device Config Client Availability Android ), value: "android", }, { label: ( <> Apple ), value: "apple", }, { label: ( <> CLI ), value: "cli", }, { label: ( <> Web ), value: "web", }, ]}>
-#### Android
-All Security config options are available for Android.
-1. Open the Meshtastic App
-2. Navigate to: **Vertical Ellipsis (3 dots top right) > Radio Configuration > Security**
-#### Apple
-All Security config options are available on iOS, iPadOS and macOS at Settings > Radio Configuration > Security.
-#### CLI
-All Security config options are available in the python CLI. Example commands are below:
-| Setting | Acceptable Values | Default |
-| ------------------------------ | ----------------- | ------- |
-| security.public_key | `bytes` | `None` |
-| security.private_key | `bytes` | `None` |
-| security.admin_key | `repeated bytes` | `None` |
-| security.is_managed | `true`, `false` | `false` |
-| security.serial_enabled | `true`, `false` | `true` |
-| security.debug_log_api_enabled | `true`, `false` | `false` |
-| security.admin_channel_enabled | `true`, `false` | `false` |
-Because the device may reboot after each command is sent via CLI, it is recommended when setting multiple values in a config section that commands be chained together as one.
-```shell title="Example:"
-meshtastic --set security.is_managed false --set device.debug_log_api_enabled true
-```
-```shell title="Disable serial console"
-meshtastic --set security.serial_enabled false
-```
-```shell title="Enable debug logging"
-meshtastic --set security.debug_log_api_enabled true
-```
-#### Web
-ALL Security config options are available in the Web client, but at present only 1 Remote Admin public key can be set.
+
+
 ## Security Keys - Backup and Restore
 ### Backup
 Public and private keys will be lost and regenerated by performing a firmware erase and reinstall. It is your responsibility to back up your keys to maintain encrypted direct messaging with existing nodes on your mesh.
@@ -688,11 +462,14 @@ To restore your keys you may:
 - Manually paste or retype the keys into the client app from your saved location.
 
 
+
 ## Configuration / Radio / Network
 
 The Network config options are: NTP Server, WiFi Enabled, WiFi SSID, WiFi PSK, Ethernet Enabled, IPv4 Networking Mode, Static Address rsyslog Server, and Protocol Flags. Network config uses an admin message sending a `Config.Network` protobuf.
 Enabling WiFi will disable Bluetooth. Only one connection method will work at a time.
 ESP32 devices have the ability to connect to WiFi as a client. SoftAP mode is not supported by the Meshtastic firmware.
+
+
 ## Network Config Values
 ### NTP Server
 The NTP server used if IP networking is available.
@@ -722,46 +499,8 @@ Defines which auxiliary network protocols are used to send packets. Values are s
 | NO_BROADCAST | Do not broadcast packets over any network protocol |
 | UDP_BROADCAST | Enable broadcasting packets via UDP over the local network |
 The first time your device restarts after enabling WiFi or Ethernet, it will take an additional 20-30 seconds to boot. This is to generate self-signed SSL keys. The keys will be saved for future reuse.
-## Network Config Client Availability Android ), value: "android", }, { label: ( <> Apple ), value: "apple", }, { label: ( <> CLI ), value: "cli", }, { label: ( <> Web ), value: "web", }, ]}>
-#### Android
-Network Config options are available for Android.
-1. Open the Meshtastic App
-2. Navigate to: **Vertical Ellipsis (3 dots top right) > Radio Configuration > Network**
-#### Apple
-All Network config options are available on iOS, iPadOS and macOS at Settings > Device Configuration > Network.
-#### CLI
-All Network config options are available in the python CLI.
-| Setting | Acceptable Values | Default |
-| :------------------: | :---------------: | :-----------------------: |
-| network.ntp_server | string | `meshtastic.pool.ntp.org` |
-| network.wifi_enabled | `true`, `false` | `false` |
-| network.wifi_ssid | string | `""` |
-| network.wifi_psk | string | `""` |
-| network.eth_enabled | `true`, `false` | `false` |
-| network.address_mode | `DHCP`, `STATIC` | `DHCP` |
-Because the device will reboot after each command is sent via CLI, it is recommended when setting multiple values in a config section that commands be chained together as one.
-```shell title="Example:"
-meshtastic --set network.wifi_enabled true --set network.wifi_ssid "my network" --set network.wifi_psk mypassword
-```
-```shell title="Set NTP Server"
-meshtastic --set network.ntp_server "meshtastic.pool.ntp.org"
-```
-```shell title="Enable / Disable WiFi"
-meshtastic --set network.wifi_enabled true
-meshtastic --set network.wifi_enabled false
-```
-```shell title="Set WiFi SSID"
-meshtastic --set network.wifi_ssid mynetwork
-// With spaces
-meshtastic --set network.wifi_ssid "my network"
-```
-```shell title="Set WiFi password"
-meshtastic --set network.wifi_psk mypassword
-// With spaces
-meshtastic --set network.wifi_psk "my password"
-```
-#### Web
-All Network config options are available in the Web UI.
+
+
 ## Examples
 ### WiFi Client
 With `network.wifi_ssid` & `network.wifi_psk` populated, the device will know to connect to your network. Make sure you are in range of your WiFi and it is a 2.4GHz-only network. If you have a single Meshtastic device on your local network it's easy to connect to your device with DNS `http://meshtastic.local`. If you have multiple Meshtastic devices you will need to connect using their respective IP addresses.
@@ -769,10 +508,13 @@ With `network.wifi_ssid` & `network.wifi_psk` populated, the device will know to
 To disable WiFi completely, set `network.wifi_enabled` to `false`.
 
 
+
 ## Configuration / Radio / Power
 
 Power settings are advanced configuration, most users should choose a role under Device Config (/docs/configuration/radio/device) to manage power for their device and shouldn't ever need to adjust these settings.
 The power config options are: Power Saving, Shutdown after losing power, ADC Multiplier Override, Wait Bluetooth Interval, Light Sleep Interval, Minimum Wake Interval, and Device Battery INA2xx Address. Power config uses an admin message sending a `Config.Power` protobuf.
+
+
 ## Power Config Values
 ### Power Saving
 If enabled, modifications to settings can be made by waking the device through pressing the user button, resetting, or through the admin channel (/docs/configuration/remote-admin/) for remote administration.
@@ -804,56 +546,14 @@ While in light sleep when we receive packets on the LoRa radio we will wake and 
 ### Device Battery INA2xx Address
 If an INA-2XX device is auto-detected on one of the I2C buses at the specified address, it will be used as the authoritative source for reading device battery level voltage. Setting is ignored for devices with PMUs (e.g. T-beams)
 I2C addresses are normally represented in hexadecimal and will require conversion to decimal in order to set via Meshtastic clients. For example the I2C address of 0x40 converted to decimal is 64.
-## Power Config Client Availability Android ), value: "android", }, { label: ( <> Apple ), value: "apple", }, { label: ( <> CLI ), value: "cli", }, { label: ( <> Web ), value: "web", }, ]}>
-#### Android
-Power Config options are available for Android.
-1. Open the Meshtastic App
-2. Navigate to: **Vertical Ellipsis (3 dots top right) > Radio Configuration > Power**
-#### Apple
-Select Power config options are available on iOS, iPadOS and macOS at Settings > Device Configuration > Power.
-#### CLI
-All Power config options are available in the python CLI.
-| Setting | Acceptable Values | Default |
-| :----------------------------------: | :--------------------------------: | :---------------------------------: |
-| power.is_power_saving | `true`, `false` | `false` |
-| power.on_battery_shutdown_after_secs | `integer` (seconds) | Default of `0` is off |
-| power.adc_multiplier_override | `2-4` (floating point value) | Default of `0` uses firmware values |
-| power.wait_bluetooth_secs | `integer` (seconds) | Default of `0` is 1 minute |
-| power.ls_secs | `integer` (seconds) | Default of `0` is 5 minutes |
-| power.min_wake_secs | `integer` (seconds) | Default of `0` is 10 seconds |
-| power.device_battery_ina_address | `integer` (I2C address as decimal) | Default of `0` is no address set |
-Because the device will reboot after each command is sent via CLI, it is recommended when setting multiple values in a config section that commands be chained together as one.
-```shell title="Example:"
-meshtastic --set power.is_power_saving true --set power.on_battery_shutdown_after_secs 120
-```
-```shell title="Enable / Disable Power Saving"
-meshtastic --set power.is_power_saving true
-meshtastic --set power.is_power_saving false
-```
-```shell title="Enable / Disable Shutdown after losing power"
-meshtastic --set power.on_battery_shutdown_after_secs 120
-meshtastic --set power.on_battery_shutdown_after_secs 0
-```
-```shell title="Set Wait Bluetooth Interval (Default of 0 is 60 seconds)"
-meshtastic --set power.wait_bluetooth_secs 0
-meshtastic --set power.wait_bluetooth_secs 120
-```
-```shell title="Set Light Sleep to default (Default of 0 is 5 minutes)"
-meshtastic --set power.ls_secs 0
-meshtastic --set power.ls_secs 120
-```
-```shell title="Set Minimum Wake Interval (Default of 0 is 10 seconds)"
-meshtastic --set power.min_wake_secs 0
-meshtastic --set power.min_wake_secs 120
-```
-#### Web
-All power config options are available in the Web UI.
 
 
 ## Configuration / Radio / Position
 
 Position data from GPS is provided by either the radio or your paired phone. It is not required to use Meshtastic, but time calculations require at least one device on the mesh to have either a GPS, RTC, or internet connection for NTP.
 The position config uses an admin message to send a `Config.Position` protobuf. The position config options are: GPS Mode, GPS Update Interval, Fixed Position, Smart Broadcast, Smart Broadcast Minimum Distance, Smart Broadcast Minimum Interval, Broadcast Interval, Position Packet Flags, and GPS RX/TX/EN Pins.
+
+
 ## Position Config Values
 ### GPS Mode
 Configures whether the GPS functionality is enabled, disabled, or not present on the node.
@@ -890,73 +590,13 @@ Defines which options are sent in POSITION messages. Values are stored as a bit 
 | ALTITUDE_MSL | Altitude value is MSL |
 | GEOIDAL_SEPARATION | Include geoidal separation |
 | DOP | Include the DOP value ; PDOP used by default, see below |
-| HVDOP | If POS_DOP set, send separate HDOP / VDOP values instead of PDOP |
-| SATINVIEW | Include number of "satellites in view" |
-| SEQ_NO | Include a sequence number incremented per packet |
-| TIMESTAMP | Include positional timestamp (from GPS solution) |
-| HEADING | Include positional heading (from GPS solution) |
-| SPEED | Include positional speed (from GPS solution) |
-### GPIO RX/TX/EN for GPS Module
-If your device does not have a fixed GPS chip, you can define the GPIO pins for the RX, TX, and EN pins of a GPS module.
-## Position Config Client Availability Android ), value: "android", }, { label: ( <> Apple ), value: "apple", }, { label: ( <> CLI ), value: "cli", }, { label: ( <> Web ), value: "web", }, ]}>
-#### Android
-Position Config options are available for Android.
-1. Open the Meshtastic App
-2. Navigate to: **Vertical Ellipsis (3 dots top right) > Radio Configuration > Position**
-#### Apple
-All position config values are available on iOS, iPadOS and macOS at Settings > Device Configuration > Position.
-#### CLI
-All Position config commands are available in the python CLI. Example commands are below:
-| Setting | Acceptable Values | Default |
-| :--------------------------------------------: | :---------------------------------------------------------------------------------------------------------------------------------------: | :--------------------------: |
-| position.gps_mode | `ENABLED`, `DISABLED`, `NOT_PRESENT` | `ENABLED` or `NOT_PRESENT` |
-| position.gps_update_interval | `integer` (seconds) | Default `0` is 2 Minutes |
-| position.fixed_position | `true`, `false` | `false` |
-| position.position_broadcast_smart_enabled | `true`, `false` | `true` |
-| position.broadcast_smart_minimum_distance | `integer` (meters) | Default of `0` is 100 Meters |
-| position.broadcast_smart_minimum_interval_secs | `integer` (seconds) | Default of `0` is 15 Minutes |
-| position.position_broadcast_secs | `integer` (seconds) | Default of `0` is 15 minutes |
-| position.flags | `UNSET`, `ALTITUDE`, `ALTITUDE_MSL`, `GEOIDAL_SEPARATION`, `DOP`, `HVDOP`, `PDOP`, `SATINVIEW`, `SEQ_NO`, `TIMESTAMP`, `HEADING`, `SPEED` | `UNSET` |
-| position.rx_gpio | `integer` (0-39) | `UNSET` |
-| position.tx_gpio | `integer` (0-34) | `UNSET` |
-Because the device will reboot after each command is sent via CLI, it is recommended when setting multiple values in a config section that commands be chained together as one. **This is especially important for position values to ensure they are set at the same time and avoid being overwritten by subsequent commands.**
-```shell title="Example:"
-meshtastic --set position.fixed_position true --setlat 37.8651 --setlon -119.5383
-```
-```shell title="Set GPS update interval (Default of 0 is 2 Minutes)"
-meshtastic --set position.gps_update_interval 0
-meshtastic --set position.gps_update_interval 45
-```
-```shell title="Set Fixed Position - Current Location"
-meshtastic --set position.fixed_position true
-```
-The device will continue to acquire GPS coordinates according to the `gps_update_interval`, but will use the last saved coordinates as its fixed point.
-```shell title="Set and Enable Fixed Position - User Defined"
-meshtastic --setlat 37.8651 --setlon -119.5383
-```
-```shell title="Remove and Unset Fixed Position"
-meshtastic --remove-position
-```
-```shell title="Enable / Disable Smart position broadcast (Enabled by default)"
-meshtastic --set position.position_broadcast_smart_enabled true
-meshtastic --set position.position_broadcast_smart_enabled false
-```
-```shell title="Set Position Broadcast Interval (Default of 0 is 15 minutes)"
-meshtastic --set position.broadcast_secs 0
-meshtastic --set position.broadcast_secs 60
-```
-It may take some time to see that the change has taken effect. The GPS location is updated according to the value specified on `gps_update_interval` and the mesh will be notified of the new position in relation to the `position_broadcast_secs` value.
-```shell title="Set / Unset Position Flags"
-meshtastic --pos-fields ALTITUDE ALTITUDE_MSL
-meshtastic --pos-fields UNSET
-```
-#### Web
-All position config options are available in the Web UI.
-
+... (section truncated for brevity)
 
 ## Configuration / Radio / User
 
 The user config options are: Long Name, Short Name, Is Licensed, and Is Unmessageable. User config uses an admin message sending a `User` protobuf.
+
+
 ## User Config Values
 ### Long Name
 A personalized name for your device.
@@ -974,34 +614,10 @@ By enabling `IsLicensed`, you should also review the following related configura
 ### Is Unmessageable
 Whether or not the node can be direct messaged
 Default is False except for roles that typically would not be monitored for direct messages: ROUTER, ROUTER_LATE, REPEATER, SENSOR, LOST_AND_FOUND, TRACKER, TAK_TRACKER
-## User Config Client Availability Android ), value: "android", }, { label: ( <> Apple ), value: "apple", }, { label: ( <> CLI ), value: "cli", }, { label: ( <> Web ), value: "web", }, ]}>
-#### Android
-All User config options are available for Android.
-1. Open the Meshtastic App
-2. Navigate to: **Vertical Ellipsis (3 dots top right) > Radio Configuration > User**
-#### Apple
-All User config options are available on iOS, iPadOS and macOS at Settings > Device Configuration > User.
-#### CLI
-All User config options are available in the python CLI. Example commands are below:
-Please see instructions for Enabling Ham License (/docs/software/python/cli/usage#ham-radio-support)
-Because the device will reboot after each command is sent via CLI, it is recommended when setting multiple values in a config section that commands be chained together as one.
-```shell title="Example:"
-meshtastic --set-owner 'your node name' --set-owner-short 'NODE'
-```
-```shell title="Set the LongName Value"
-meshtastic --set-owner 'your node name'
-```
-```shell title="Set the ShortName Value"
-meshtastic --set-owner-short 'NODE'
-```
-```shell title="Enable Ham Mode, set name to license, disable encryption"
-meshtastic --set-ham 'CALLSIGN'
-```
-#### Web
-All User config options are available in the Web UI.
 
 
 ## Configuration / Tips
+
 
 ## Roles
 It is strongly recommended to keep your ROLE (/docs/configuration/radio/device#roles) set to `CLIENT`, `CLIENT_MUTE`, or `CLIENT_BASE`. Only use other roles if you have a specific, well-understood reason to do so. Read our blog post about choosing the best role (/blog/choosing-the-right-device-role/).
@@ -1020,6 +636,8 @@ These roles are for very specific applications. Before changing from `CLIENT`, c
 Remember: A network of `CLIENT` nodes with a small number of well-placed `ROUTERS` is usually the most efficient and stable configuration.
 Image: Router Node Example (/img/configuration/router.webp)
 *One example of a 'Router' node. Photo credit: Cully@KBOXLABS*
+
+
 ## (Not) Sharing Your Location
 Telemetry is shared over your PRIMARY channel (/docs/configuration/radio/channels#role). This means that if your node has acquired GPS coordinates from an integrated GPS chip, or from your mobile device, your coordinates will be sent to the mesh over this channel, using its defined encryption (if any).
 By default the PRIMARY channel's name is LongFast with the encryption key "AQ==" (Base64 equivalent of Hex 0x01). If this is left unchanged, your location will be shared with all nodes in range that are also using the default channel.
@@ -1043,12 +661,16 @@ Imagine you’re in the following channels:
 - CampChat (Channel 1) receives your live, automatic location updates because it’s the lowest-indexed channel with location sharing enabled.
 - Friends (Channel 2) can request your location manually, but it won’t receive automatic updates.
 - TutuTuesdayGroup (Channel 3) allows chatting but does not share or receive location data.
+
+
 ## Rebroadcast "Public" Traffic
 Meshtastic nodes will rebroadcast all packets if they share LoRa modem settings (/docs/configuration/radio/lora#lora-config-values), regardless of encryption (unless Rebroadcast mode (/docs/configuration/radio/device#rebroadcast-mode) is set to `LOCAL_ONLY`).
 If you would like your nodes to include/expand the "public" mesh, you must use the default modem preset (/docs/configuration/radio/lora#modem-preset) `LONG_FAST`. If you change your PRIMARY channel name, you must manually set the LoRa channel to the default for your region (see above).
 ### Hop Count
 It is **strongly** recommended to leave your MAX HOPS (/docs/configuration/radio/lora#max-hops) set to 3 unless you're sure you need more (or less) to reach your destination node. Unnecessarily high hop counts often lead to network issues. If you need to increase the hop count, apply changes only to nodes at the network’s edges, not those near the middle.
 Image: Hop Count Image (/img/configuration/max-hops.webp)
+
+
 ## Chat Channels and LoRa Frequency Slots
 Previously, Meshtastic used the word "channels" to define two different configuration properties: Messaging Channels & LoRa Channel Numbers. However, this could lead to confusion since "channels" was being used to refer to two distinct concepts. To clarify the distinction, the decision was made to change "LoRa Channel Number" to "LoRa Frequency Slot".
 ### Radio Config: Channels
@@ -1056,10 +678,13 @@ These configure "message groups" and include your PRIMARY and SECONDARY channels
 There are 8 total messaging channels. Channel 0 is your PRIMARY channel, with channels 1-7 available for private group messaging and/or special channels such as `admin` (/docs/configuration/remote-admin).
 ### Radio Config: LoRa Frequency Slot
 This property, formerly known as "LoRa Channel Number", configures the frequency the radio is set to. Check out the frequency calculator (/docs/overview/radio-settings#frequency-slot-calculator) to view the relationship between "frequency slot" and radio frequency.
+
+
 ## Best Practices
 - If you are part of a large mesh and don't know what a setting does, don't change it (unless you're super curious).
 - TEST your settings and hardware before you install in hard-to-reach locations.
 - Connecting a node to the public MQTT server (/docs/configuration/module/mqtt#connect-to-the-default-public-server) may publish the locations of all nodes in your mesh to the internet.
+
 
 
 ## Configuration / Region By Country
@@ -1098,114 +723,11 @@ If you'd like to contribute information for your country, click the "Edit this p
 | ------- | ------------------ | ------------------- |
 | Estonia | EU_868 EU_433 | |
 ### F
-| Country | LoRa Region | Regulatory document |
-| ------- | ------------------ | ------------------- |
-| France | EU_868 EU_433 | |
-| Finland | EU_868 EU_433 | |
-### G
-| Country | LoRa Region | Regulatory document |
-| ------- | ------------------ | ------------------- |
-| Germany | EU_868 EU_433 | |
-| Greece | EU_868 EU_433 | |
-### H
-| Country | LoRa Region | Regulatory document |
-| ------- | ------------------ | ------------------- |
-| Hungary | EU_868 EU_433 | |
-### I
-| Country | LoRa Region | Regulatory document |
-| ------- | ------------------ | ------------------- |
-| India | IN | |
-| Ireland | EU_868 EU_433 | |
-| Italy | EU_868 EU_433 | |
-### J
-| Country | LoRa Region | Regulatory document |
-| ------- | ----------- | ---------------------------------------------------------------------------------------------- |
-| Japan | JP | Japanese Regulations (https://www.arib.or.jp/english/html/overview/doc/5-STD-T108v1_5-E1.pdf) |
-### K
-| Country | LoRa Region | Regulatory document |
-| ------- | ----------- | --------------------------------------------------------------------------- |
-| Korea | KR | Korean Regulations (https://qiita.com/ammo0613/items/d952154f1195b64dc29f) |
-### L
-| Country | LoRa Region | Regulatory document |
-| ---------- | ------------------ | ------------------- |
-| Latvia | EU_868 EU_433 | |
-| Lithauania | EU_868 EU_433 | |
-| Luxembourg | EU_868 EU_433 | |
-### M
-| Country | LoRa Region | Regulatory document |
-| ---------- | ------------------ | ------------------------------------------------------------------------------------------------------------- |
-| Malaysia | MY_919 MY_433 | MCMC Regulations (https://www.mcmc.gov.my/skmmgovmy/media/General/pdf/Short-Range-Devices-Specification.pdf) |
-| Montenegro | EU_868 EU_433 | |
-### N
-| Country | LoRa Region | Regulatory document |
-| --------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------- |
-| Netherlands | EU_868 EU_433 | Overheid.nl (https://wetten.overheid.nl/BWBR0036378) |
-| New Zealand | ANZ NZ_865 | IoT Spectrum in NZ (https://iotalliance.org.nz/wp-content/uploads/sites/4/2019/05/IoT-Spectrum-in-NZ-Briefing-Paper.pdf) |
-| North Macedonia | EU_868 EU_433 | |
-| Norway | EU_868 EU_433 | |
-| Nepal | NP_865 | NTA Regulations (https://www.nta.gov.np/uploads/contents/Radio-Frequency-Policy-2080-English.pdf) |
-### O
-| Country | LoRa Region | Regulatory document |
-| ------- | ----------- | ------------------- |
-### P
-| Country | LoRa Region | Regulatory document |
-| -------- | ------------------ | ------------------- |
-| Poland | EU_868 EU_433 | |
-| Portugal | EU_868 EU_433 | |
-| Philippines | PH_915 PH_868 | NTC Regulations (https://ntc.gov.ph/wp-content/uploads/2022/frequencyallocations/NRFAT_Rev_2020.pdf)
-### Q
-| Country | LoRa Region | Regulatory document |
-| ------- | ----------- | ------------------- |
-### R
-| Country | LoRa Region | Regulatory document |
-| ------- | ------------------ | ----------------------------------------------------------------------------------------------------------- |
-| Romania | EU_868 EU_433 | |
-| Russia | RU | Russian Regulations (https://digital.gov.ru/uploaded/files/prilozhenie-12-k-reshenyu-gkrch-18-46-03-1.pdf) |
-### S
-| Country | LoRa Region | Regulatory document |
-| ----------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Serbia | EU_868 EU_433 | |
-| Singapore | SG_923 | IMDA Regulations (https://www.imda.gov.sg/-/media/imda/files/regulation-licensing-and-consultations/ict-standards/telecommunication-standards/radio-comms/imdatssrd.pdf) |
-| Slovakia | EU_868 EU_433 | Slovak regulations (https://eur-lex.europa.eu/legal-content/SK/TXT/PDF/?uri=CELEX:32022D0180) |
-| Slovenia | EU_868 EU_433 | |
-| Spain | EU_868 EU_433 | |
-| Sweden | EU_868 EU_433 | |
-| Switzerland | EU_868 EU_433 | |
-### T
-| Country | LoRa Region | Regulatory document |
-| -------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Taiwan | TW | Taiwan Regulations (https://www.ncc.gov.tw/english/files/23070/102_5190_230703_1_doc_C.PDF) |
-| Thailand | TH | LoRaWAN Regional Parameters (https://lora-alliance.org/wp-content/uploads/2020/11/lorawan_regional_parameters_v1.0.3reva_0.pdf) |
-| Türkiye | EU_868 EU_433 | Mevzuat (https://www.mevzuat.gov.tr/mevzuat?MevzuatNo=15416&MevzuatTur=7&MevzuatTertip=5), BTK Frekans Tahsisi (https://www.btk.gov.tr/uploads/pages/frekans-tahsisinden-muaf-telsiz-cihaz-sistemleri-olcutler-633d4ca68c0b1.pdf), BTK Milli Frekans Planı (https://www.btk.gov.tr/uploads/pages/milli-frekans-plani.pdf) |
-### U
-| Country | LoRa Region | Regulatory document |
-| ------------------------------ | ------------------ | ---------------------------------------------------------------------------------------------------------------------- |
-| Ukraine | UA_868 UA_433 | Ukrainian Regulations (https://nkek.gov.ua/static-objects/nkek/uploads/public/67a/b84/377/67ab8437759da831037158.pdf) |
-| United Kingdom (UK) | EU_868 EU_433 | IR2030 (https://www.ofcom.org.uk/siteassets/resources/documents/spectrum/interface-requirements/ir-2030.pdf) |
-| United States of America (USA) | US | LoRaWAN Regional Parameters (https://www.thethingsnetwork.org/docs/lorawan/regional-parameters/) |
-### V
-| Country | LoRa Region | Regulatory document |
-| ------------ | ------------------ | ------------------- |
-| Vatican City | EU_868 EU_433 | |
-### Y
-| Country | LoRa Region | Regulatory document |
-| ------- | ----------- | ------------------- |
-### Z
-| Country | LoRa Region | Regulatory document |
-| ------- | ----------- | ------------------- |
-
+... (section truncated for brevity)
 
 ## Hardware / Antennas / Index
 
-## Pages
-Antenna Testing (./testing.mdx)
-Guidance for testing and using your antennas.
-Antenna Reports (./antenna-report.mdx)
-Community submitted SWR testing.
-Antenna Selection (./lora-antennas.mdx)
-Considerations for choosing an antenna.
-Additional Resources (./resources.mdx)
-Antenna designs, tools, and coverage simulators.
+
 ## Community Favorites
 These antennas have garnered positive feedback and frequent recommendations within our community. However, we encourage you to conduct your own research to ensure the best choice for your needs. We are not responsible for individual experiences or results.
 ### Compact / Handheld
@@ -1231,16 +753,7 @@ These antennas have garnered positive feedback and frequent recommendations with
 | 915 | Taoglas TI.16.5F11 | DigiKey (https://www.digikey.com/en/products/detail/taoglas-limited/TI-16-5F11/3724558) |
 
 
-## Hardware / Antennas / Lora Antennas
 
-The stock antennas provided with the T-Beam and other boards usually come from 'mixed bags'. They may not have been designed or tuned for your given frequency range, and they may not be of a quality design.
-Matching an antenna to the transceiver frequency is important, as is choosing an appropriate design.
-The antenna's design will affect:
-- Efficiency - The proportion of the signal which leaves the antenna
-- Direction in which the signal is transmitted
-- Interference by horizontal or vertical polarization
-- Amount of signal which is reflected back to the device itself
-While the LoRa devices we use for Meshtastic are relatively low power radios, care should be taken _not_ to operate any radio transmission device without an antenna or with a poorly matched antenna. Radio signals transmitted without an antenna can reflect back and damage the device.
 ## Important considerations
 ### What transmission frequency are you using?
 Devices on another frequency will not be able to interact with yours. See this listing by The Things Network (https://www.thethingsnetwork.org/docs/lorawan/frequencies-by-country.html) for frequencies licensed for specific countries.
@@ -1258,24 +771,8 @@ The perfect antenna on paper, sourced from the other side of the world with mixe
 ### How close will the antenna be to my Meshtastic device?
 Most cables will significantly degrade the signal strength over any significant distance. It is often more effective to place a node outside than to have it indoors with the antenna outside. The exception might be if there is extreme heat, cold, or humidity, and if the shortest possible low loss cable is used.
 Still, a proper enclosure should mitigate bad weather.
-## Terminology / references
-You could do a lot worse than reading the Wikipedia entry for Antenna ( ), along with the Wikipedia entry for LoRa (https://en.wikipedia.org/wiki/LoRa).
-Instead of listing the terms, let us recommend this superb tutorial (https://www.youtube.com/watch?v=J3PBL9oLPX8) by Andreas Spiess (the 'guy with the Swiss accent').
 
 
-## Hardware / Antennas / Testing
-
-Testing of antennas can be both simple and complex. At its simplest, testing involves sending messages from different locations and seeing which ones are received, and then comparing the results against other antennas. At the complex end, this can be using expensive test chambers and equipment to measure the signal strength, gain, and radiation patterns. However, it seems that a reasonable job can be done with cheaper methods.
-If you have sufficient range with your existing aerial, skip this section. If you don't, consider either getting more nodes and / or replace the stock aerial with one tuned (to your region transmitter's frequency):
-- A quarter wave _tuned_ stubby aerial (\ 0 dBi .
-- Caution, avoid suppliers who: - don't state the aerial's tuned frequency and its specific purpose (LoRa network) - claim huge gain figures on omni-directional aerials - don't provide boringly professional datasheets
-If you want more range, directionality, or specificity read on.
-## General guidance
-The Meshtastic system is designed to be simple and intuitive to use. However, its LoRa radios rely on point-to-point communications, unit-to-unit, aerial-to-aerial; quite different to the near ubiquitous radio coverage of today's cellphone & Wifi connections.
-Some understanding of the factors affecting radio communications will help achieve substantially better service and faster transmission over a greater range with your devices. Here, we'll attempt to provide a top-level set of guidance for use and aerial selection, how to test the aerials, a set of resources for further research, and plenty of opportunity for going deeper.
-The Meshtastic devices (of various flavors) lend themselves to experimentation, not only because you can replace their aerials, but also because of their mesh operation. All nodes will, without alteration, relay communications from any other members of the mesh around obstacles and over greater distances. The cost of aerial investment should be weighed against investment in additional low-cost nodes.
-While the LoRa devices we are using for Meshtastic are relatively low power radios, care should be taken _not_ to operate any radio transmission device without an aerial or with a poorly matched aerial. Radio signals transmitted without an antenna can reflect back and damage the device.
-The information collected here is by no means definitive, and necessarily abbreviated (it's a huge topic).
 ## Range Testing
 As mentioned, while stating the obvious, the simplest way of performing a test is:
 - Walk around with a radio sending messages,
@@ -1284,35 +781,17 @@ As mentioned, while stating the obvious, the simplest way of performing a test i
 - Change aerials, repeat, and evaluate results.
 The range test module (/docs/configuration/module/range-test) has been designed for exactly this purpose. It allows one node to transmit a frequent message, and another node to record which messages were received. This data is saved and can be imported to applications such as Google Earth.
 On the topic of testing - performing your own testing and providing feedback is the lifeblood of Meshtastic and open source projects.
+
+
 ## Signal Strength Testing
 Real world testing is also discussed by Andreas Spiess (the 'guy with the Swiss accent') in his tutorial (https://www.youtube.com/watch?v=J3PBL9oLPX8). He has written code (https://github.com/SensorsIot/Antenna-Tester) for testing antennas using two Lora32 V1 boards to compare how different antennas behave. Lilygo have also made code available for testing the RSSI on the LORA32 (https://github.com/LilyGO/TTGO-LORA32) boards (https://github.com/Xinyuan-LilyGO/TTGO-LoRa-Series) and the T-Beam (https://github.com/LilyGO/TTGO-T-Beam).
 Here are a couple (https://medium.com/home-wireless/testing-lora-antennas-at-915mhz-6d6b41ac8f1d) of excellent (https://medium.com/home-wireless/testing-and-reviewing-lora-antennas-5b37dfa594a3) aerial comparisons. Their utility goes beyond the specific aerials tested, giving insight into:
 - Aerial types & their characteristics,
 - Testing approaches.
-## Antenna Matching & Vector Network Analyzers
-One of the first things to ensure, is that the antenna you have is tuned to the frequency that you are using. A lot of cheap antennas come labeled with an incorrect working frequency, and this will immediately reduce the emitted signal strength. A Vector Network Analyzer (VNA) can be used to ensure that the antenna is appropriately matched to the transmission circuit, ensuring that it is operating at the correct impedance, and has a low level of power reflected back from the antenna to the transmitter at the desired transmission frequency.
-Andreas Spiess also gives a great explanation of how to use Vector Network Analyzers (https://www.youtube.com/watch?v=ZpKoLvqOWyc) to correctly tune your antennas, as well as a more in depth tutorial of how to use VNAs (https://www.youtube.com/watch?v=_pjcEKQY_Tk). It is important to remember however, that VNAs can only tell you if the antenna is well-matched, not how well it is transmitting. A 50 ohm resistor across the transmitter output would show as ideally matched, but it would be useless at transmitting a signal. There are a number of VNAs now available for less than $100, making this no longer out of reach for most hobbyists, unlike expensive spectrum analyzers.
-## Non-aerial Factors Affecting Transmission
-Unless you're using your devices in a vacuum, with clear line of sight between aerials the following will have an effect:
-- Weather (temperature, humidity, and air pressure),
-- Transmission power, bandwidth, spreading factor, and other associated channel factors,
-- Number of nodes within reach of the mesh (affects retries consequent duty cycle hit),
-- Absorption by materials (with varying degrees attenuation, by material and depth),
-- Reflection off surfaces (and channeling through material tunnels, including warm / cold air tunnels commonly present in the atmosphere),
-- Diffraction around obstacles (over forests and around corners).
-- Fresnel Zone - A football shape between antennas that must be clear of obstructions or else the signal is attenuated.
-### Environmental Factors
-For a bit of light reading on environmental research:
-- RF attenuation in vegetation (https://web.archive.org/web/20201216041455/https://www.itu.int/dms_pubrec/itu-r/rec/p/R-REC-P.833-9-201609-I!!PDF-E.pdf) (yes really); if you wander through the woods wondering how your RF is bouncing off leaves dependent on their variety, and wind speed … well you do, now.
-- RF attenuation with various building materials (https://web.archive.org/web/20230606172231/https://www.ofcom.org.uk/__data/assets/pdf_file/0016/84022/building_materials_and_propagation.pdf).
-- This one by ITU again is very detailed in its analysis of the drivers of attenuation (https://web.archive.org/web/20211005174833/https://www.itu.int/dms_pubrec/itu-r/rec/p/R-REC-P.2040-1-201507-I!!PDF-E.pdf) (I wasn’t aware that all EMF radiation exhibits reflection / transmission characteristics akin to light hitting a material boundary. So, depending on the angle of incidence, material and the EMF wavelength, it will be reflected and / or transmitted through).
-- These RF bands are also made more noisy by adjacent LTE (https://www.ofcom.org.uk/__data/assets/pdf_file/0023/55922/lte-coexistence.pdf)
-In summary - wavelengths in Europe fair well in plain sight, curve over not-so-tall obstacles (including trees), and they reflect off surfaces at low angles of incidence. They go through humans without much attenuation; but not brick, stone, or anything with more attenuation than glass / Kevlar. Oh, and don’t sit under an LTE tower and expect it to be plain sailing. RF emissions at adjacent frequencies can interfere at a high enough power.
-## Discussion
-For further insights, join the conversation on antenna range and performance at Meshtastic Discussions on GitHub. (https://github.com/orgs/meshtastic/discussions)
 
 
 ## Hardware / Devices / Index
+
 
 ## Supported Devices
 Meshtastic firmware can be installed on a wide range of development boards. The list below provides a brief comparison of currently supported hardware.
@@ -1329,498 +808,15 @@ Please do your research and choose the board that meets your needs (or maybe alr
 - We **strongly** recommend choosing devices equipped with the newer Semtech SX126x or LR11xx series, as they offer improved performance and better compatibility than the SX127x series.
 - nRF52-based devices use less power than ESP32-based devices and are therefore generally preferred for solar and handset applications.
 - ESP32-based devices require more power to operate but are typically lower-cost alternatives that do perform well when using house power, or for handsets that only require a day or two of runtime, and for applications that require WiFi connectivity or more RAM.
-## RAK®
-### Wisblock (./rak-wireless/wisblock/)
-Modular hardware system with Base, Core and Peripheral modules including the low-power and solar ready nRF52840-based Meshtastic Starter Kit (19007 & 4631).
-**WisBlock Core Modules** (./rak-wireless/wisblock/core-module/)
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :--------------------------------------------------------------- | :------- | :----- | :--: | :-: | :----: |
-| RAK4631 (./rak-wireless/wisblock/core-module?rakcore=RAK4631) | nRF52840 | SX1262 | NO | 5.0 | ADD-ON |
-| RAK11310 (./rak-wireless/wisblock/core-module?rakcore=RAK11310) | RP2040 | SX1262 | NO | NO | ADD-ON |
-**Base Boards** (./rak-wireless/wisblock/base-board/)
-| Name | Type |
-| ----------------------------------------------------------------- | ------------------------------------ |
-| RAK5005-O (./rak-wireless/wisblock/base-board?rakbase=RAK5005-O) | WisBlock Base Board (End Of life). |
-| RAK19007 (./rak-wireless/wisblock/base-board?rakbase=RAK19007) | WisBlock Base Board (2nd Generation) |
-| RAK19003 (./rak-wireless/wisblock/base-board?rakbase=RAK19003) | WisBlock Mini Base Board. |
-| RAK19001 (./rak-wireless/wisblock/base-board?rakbase=RAK19001) | WisBlock Dual IO Base Board. |
-**WisBlock Peripherals** (./rak-wireless/wisblock/peripherals/)
-| Name | Type |
-| --------------------------------------------------------------------------------- | ------------------------------- |
-| RAK1910 (./rak-wireless/wisblock/peripherals?rakmodules=GPS) | GPS |
-| RAK12500 (./rak-wireless/wisblock/peripherals?rakmodules=GPS) | GPS |
-| RAK18001 (./rak-wireless/wisblock/peripherals?rakmodules=Buzzer) | Buzzer |
-| RAK13002 (./rak-wireless/wisblock/peripherals?rakmodules=IO) | IO Module |
-| RAK14001 | RGB LED |
-| RAK12002 (./rak-wireless/wisblock/peripherals?rakmodules=RTC) | Real Time Clock |
-| RAK1901 (./rak-wireless/wisblock/peripherals?rakmodules=Sensors&sensors=RAK1901) | Temperature and Humidity Sensor |
-| RAK1902 (./rak-wireless/wisblock/peripherals?rakmodules=Sensors&sensors=RAK1902) | Barometric Pressure Sensor |
-| RAK1906 (./rak-wireless/wisblock/peripherals?rakmodules=Sensors&sensors=RAK1906) | Environment Sensor |
-| RAK12013 | Radar Sensor |
-| RAK13800 | Ethernet Module |
-**WisBlock Displays** (./rak-wireless/wisblock/screens/)
-| Name | Type | Resolution |
-| ------------------------------------------------------------ | ----------------------- | ---------- |
-| RAK1921 (./rak-wireless/wisblock/screens?rakscreens=OLED) | 0.96 inch OLED | 128x64px |
-| RAK14000 (./rak-wireless/wisblock/screens?rakscreens=E-Ink) | 2.13 inch E-Ink display | 212x104px |
-### WisMesh (./rak-wireless/wismesh/)
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :---------------------------------------------------------------------------------------- | :------- | :----- | :--: | :-: | :----: |
-| WisMesh Pocket V2 (./rak-wireless/wismesh/pocket/?pocket=pocketv2) | nRF52840 | SX1262 | NO | 5.0 | YES |
-| WisMesh Pocket Mini (./rak-wireless/wismesh/pocket/?pocket=pocket-mini) | nRF52840 | SX1262 | NO | 5.0 | NO |
-| WisMesh Tag (./rak-wireless/wismesh/tag.mdx) | nRF52840 | SX1262 | NO | 5.0 | YES |
-| WisMesh TAP (./rak-wireless/wismesh/tap.mdx) | nRF52840 | SX1262 | NO | 5.0 | YES |
-| WisMesh Board ONE (./rak-wireless/wismesh/board-one.mdx) | nRF52840 | SX1262 | NO | 5.0 | ADD-ON |
-| WisMesh Repeater (./rak-wireless/wismesh/repeater/?repeater=repeater) | nRF52840 | SX1262 | NO | 5.0 | ADD-ON |
-| WisMesh Repeater Mini (./rak-wireless/wismesh/repeater/?repeater=repeater-mini) | nRF52840 | SX1262 | NO | 5.0 | ADD-ON |
-| WisMesh Ethernet MQTT Gateway (./rak-wireless/wismesh/gateway/?gateway=gateway-ethernet) | nRF52840 | SX1262 | NO | 5.0 | ADD-ON |
-| WisMesh WiFi MQTT Gateway (./rak-wireless/wismesh/gateway/?gateway=gateway-wifi) | ESP32 | SX1262 | YES | 5.0 | ADD-ON |
-## LILYGO®
-### T-Beam (./lilygo/tbeam/)
-Boards complete with GPS, 18650 battery holder, and optional screen.
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :---------------------------------------------- | :------- | :----- | :----------: | :-: | :-: |
-| T-Beam S3-Core (./lilygo/tbeam/?t-beam=s3core) | ESP32-S3 | SX1262 | 2.4GHz b/g/n | 5.0 | YES |
-| T-BeamSUPREME (./lilygo/tbeam/?t-beam=supreme) | ESP32-S3 | SX1262 | 2.4GHz b/g/n | 5.0 | YES |
-### T-Echo (./lilygo/techo/)
-All-in-one unit with E-Ink screen, GPS and battery in injection-molded case. Features the low-power nRF52840 for long battery life.
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :------------------------ | :------- | :----- | :--: | :-: | :-: |
-| T-Echo (./lilygo/techo/) | nRF52840 | SX1262 | NO | 5.0 | YES |
-### LoRa (./lilygo/lora/)
-Inexpensive basic ESP32-based boards.
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :----------------------------------------------- | :------- | :-------------------------------------- | :----------: | :-: | :-: |
-| LoRa32 T3-S3 V1.0 (./lilygo/lora/?t-lora=S3-v1) | ESP32-S3 | SX1262 SX1276 SX1280 LR1121 | 2.4GHz b/g/n | 5.0 | NO |
-### T-Deck (./lilygo/tdeck/)
-Standalone device with screen and keyboard
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :---------------------------------------------- | :---------- | :----- | :--: | :-: | :-: |
-| T-Deck (./lilygo/tdeck/?t-deck=t-deck) | ESP32-S3FN8 | SX1262 | YES | 5.0 | NO |
-| T-Deck Plus (./lilygo/tdeck/?t-deck=t-deck) | ESP32-S3FN8 | SX1262 | YES | 5.0 | YES |
-| T-Deck Pro (./lilygo/tdeck/?t-deck=t-deck-pro) | ESP32-S3FN8 | SX1262 | YES | 5.0 | YES |
-## HELTEC®
-### LoRa 32 (./heltec-automation/lora32/)
-Inexpensive basic ESP32-based boards.
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :---------------------------------------------------------------------------------- | :---------- | :----- | :----------: | :-: | :-: |
-| LoRa32 V3/3.1 (./heltec-automation/lora32/?heltec=v3) | ESP32-S3FN8 | SX1262 | 2.4GHz b/g/n | 5.0 | NO |
-| Wireless Stick Lite V3 (./heltec-automation/lora32/?heltec=Wireless+Stick+Lite+V3) | ESP32-S3FN8 | SX1262 | 2.4GHz b/g/n | 5.0 | NO |
-| Wireless Tracker v1.0 (./heltec-automation/lora32/?heltec=tracker-v1.0) | ESP32-S3FN8 | SX1262 | 2.4GHz b/g/n | 5.0 | YES |
-| Wireless Tracker v1.1 (./heltec-automation/lora32/?heltec=tracker-v1.1) | ESP32-S3FN8 | SX1262 | 2.4GHz b/g/n | 5.0 | YES |
-| Wireless Paper v1.0 (./heltec-automation/lora32/?heltec=paper-v1.0) | ESP32-S3FN8 | SX1262 | 2.4GHz b/g/n | 5.0 | NO |
-| Wireless Paper v1.1 (./heltec-automation/lora32/?heltec=paper-v1.1) | ESP32-S3FN8 | SX1262 | 2.4GHz b/g/n | 5.0 | NO |
-### Vision Master (./heltec-automation/vision-master/)
-Versatile ESP32-S3-based boards E-Ink development boards.
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :--------------------------------------------------------------------------------- | :--------- | :----- | :----------: | :-: | :-: |
-| Vision Master E213 (./heltec-automation/vision-master/?heltec=vision_master_e213) | ESP32-S3R8 | SX1262 | 2.4GHz b/g/n | 5.0 | NO |
-| Vision Master E290 (./heltec-automation/vision-master/?heltec=vision_master_e290) | ESP32-S3R8 | SX1262 | 2.4GHz b/g/n | 5.0 | NO |
-| Vision Master T190 (./heltec-automation/vision-master/?heltec=vision_master_t190) | ESP32-S3R8 | SX1262 | 2.4GHz b/g/n | 5.0 | NO |
-### Mesh Node (./heltec-automation/mesh-node)
-| Name | MCU | Radio | WiFi | BT | GPS |
-| --------------------------------------------------------------- | :------- | :----- | :--- | :-: | :------: |
-| Mesh Node T114 (./heltec-automation/mesh-node/?mesh_node_t114) | nRF52840 | SX1262 | NO | 5.0 | OPTIONAL |
-## Seeed Studio
-### SenseCAP (./seeed-studio/sensecap/)
-The SenseCAP product line offers a comprehensive range of solutions for both hobbyists and industrial users, featuring the T1000-E card tracker, an IP65-rated, ready-to-go Meshtastic handheld device, the Indicator with a 4-inch touchscreen driven by ESP32-S3 and RP2040 Dual-MCU, and the Solar Node, a solar-powered device designed for long-term outdoor deployment. These devices are designed to be user-friendly, with pre-flashed Meshtastic firmware for easy setup and operation.
-| Name | MCU | Radio | WiFi | BT | GPS |
-| ------------------------------------------------------------- | ------------- | ------ | ------------ | --- | -------- |
-| Card Tracker T1000-E (./seeed-studio/sensecap/card-tracker/) | nRF52840 | LR1110 | NO | 5.1 | YES |
-| SenseCAP Indicator (./seeed-studio/sensecap/indicator/) | ESP32, RP2040 | SX1262 | 2.4GHz b/g/n | 5.0 | OPTIONAL |
-| SenseCAP Solar Node (./seeed-studio/sensecap/solar-node/) | nRF52840 | SX1262 | NO | 5.0 | OPTIONAL |
-### Wio Series (./seeed-studio/wio-series/)
-A lineup of development boards and modules for hobbyists and prototyping, with a variety of MCU and sensor options. Most models are intended for integration into custom projects, while the Tracker L1 has a "Pro" variant that is available as a ready-to-go handheld device with a pre-installed case and battery.
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :------------------------------------------------------------------------------------------- | :------- | :--------- | :--: | :-: | :------: |
-| Wio Tracker L1 (./seeed-studio/wio-series/tracker-l1) | nRF52840 | SX1262 | NO | 5.0 | YES |
-| XIAO nRF52840 & Wio-SX1262 Kit (./seeed-studio/wio-series/wio-sx1262s/?wio-sx1262=nrf52840) | nRF52840 | Wio-SX1262 | NO | 5.0 | OPTIONAL |
-## B&Q Consulting (./b-and-q-consulting/)
-### Nano Series (./b-and-q-consulting/nano/)
-Portable and durable devices designed for Meshtastic.
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :--------------------------------------------------------- | :------- | :----- | :----------: | :-: | :-: |
-| Nano G2 Ultra (./b-and-q-consulting/nano/?nano-series=g2) | NRF52840 | SX1262 | 2.4GHz b/g/n | 5.0 | YES |
-### Station Series (./b-and-q-consulting/station-series/)
-High power LoRa transceiver designed for Meshtastic licensed ham operation.
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :------------------------------------------------- | :--------------- | :----- | :----------: | :-: | :------: |
-| Station G2 (./b-and-q-consulting/station-series/) | ESP32-S3 WROOM-1 | SX1262 | 2.4GHz b/g/n | 5.0 | OPTIONAL |
-## Elecrow (./elecrow/)
-### ThinkNode Series (./elecrow/thinknode/)
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :------------------------------------------------------- | :------- | :----- | :----------: | :-: | :-: |
-| ThinkNode M1 (./elecrow/thinknode/?thinknode-series=m1) | NRF52840 | SX1262 | NO | 5.0 | YES |
-| ThinkNode M2 (./elecrow/thinknode/?thinknode-series=m2) | ESP32-S3 | SX1262 | 2.4GHz b/g/n | 5.0 | NO |
-### CrowPanel Advance Series (./elecrow/crowpanel/)
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :--------------------------------------------------------- | :------- | :----- | :----------: | :-: | :-: |
-| CrowPanel 2.4/2.8/3.5/4.3/5.0/7.0" (./elecrow/crowpanel/) | ESP32-S3 | SX1262 | 2.4GHz b/g/n | 5.0 | NO |
-## Raspberry Pi (./raspberrypi/)
-### Raspberry Pi Pico (./raspberrypi/pico/)
-Fast versatile boards using the RP2040.
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :-------------------------------------- | :----- | :----- | :----------: | :-----------: | :-: |
-| Raspberry Pi Pico (./raspberrypi/pico) | RP2040 | SX1262 | 2.4GHz b/g/n | not supported | NO |
-**Pico Peripherals** (./raspberrypi/pico/peripherals/)
-SSD1306 OLED Display
-SH1106 OLED Display
-CardKB Keyboard
-### Raspberry Pi Zero/Zero2/3/4/400/5 (./linux-native-hardware/)
-Meshtastic offers support for Raspberry Pi devices through our Linux native platform, meshtasticd. For full information, please see our Linux Native Hardware (./linux-native-hardware/) documentation.
-
-
-## Hardware / Devices / Heltec Automation / Index
-
-## LoRa 32 (./lora32/)
-Inexpensive basic ESP32-based boards.
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :---------------------------------------------------------------- | :---------- | :----- | :----------: | :-: | :-: |
-| LoRa32 V3/3.1 (./lora32/?heltec=v3) | ESP32-S3FN8 | SX1262 | 2.4GHz b/g/n | 5.0 | NO |
-| Wireless Stick Lite V3 (./lora32/?heltec=Wireless+Stick+Lite+V3) | ESP32-S3FN8 | SX1262 | 2.4GHz b/g/n | 5.0 | NO |
-| Wireless Tracker v1.0 (./lora32/?heltec=tracker-v1.0) | ESP32-S3FN8 | SX1262 | 2.4GHz b/g/n | 5.0 | YES |
-| Wireless Tracker v1.1 (./lora32/?heltec=tracker-v1.1) | ESP32-S3FN8 | SX1262 | 2.4GHz b/g/n | 5.0 | YES |
-| Wireless Paper v1.0 (./lora32/?heltec=paper-v1.0) | ESP32-S3FN8 | SX1262 | 2.4GHz b/g/n | 5.0 | NO |
-| Wireless Paper v1.1 (./lora32/?heltec=paper-v1.1) | ESP32-S3FN8 | SX1262 | 2.4GHz b/g/n | 5.0 | NO |
-## Vision Master (./vision-master/)
-Versatile ESP32-S3-based boards E-Ink development boards.
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :--------------------------------------------------------------- | :--------- | :----- | :----------: | :-: | :-: |
-| Vision Master E213 (./vision-master/?heltec=vision_master_e213) | ESP32-S3R8 | SX1262 | 2.4GHz b/g/n | 5.0 | NO |
-| Vision Master E290 (./vision-master/?heltec=vision_master_e290) | ESP32-S3R8 | SX1262 | 2.4GHz b/g/n | 5.0 | NO |
-| Vision Master T190 (./vision-master/?heltec=vision_master_t190) | ESP32-S3R8 | SX1262 | 2.4GHz b/g/n | 5.0 | NO |
-## Mesh Node (./mesh-node)
-| Name | MCU | Radio | WiFi | BT | GPS |
-| --------------------------------------------- | :------- | :----- | :--- | :-: | :------: |
-| Mesh Node T114 (./mesh-node/?mesh_node_t114) | nRF52840 | SX1262 | NO | 5.0 | OPTIONAL |
-
-
-## Hardware / Devices / Lilygo / Index
-
-## T-Beam (./tbeam/)
-Boards complete with GPS, 18650 battery holder, and optional screen.
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :--------------------------------------- | :------- | :----- | :----------: | :-: | :-: |
-| T-Beam S3-Core (./tbeam/?t-beam=s3core) | ESP32-S3 | SX1262 | 2.4GHz b/g/n | 5.0 | YES |
-| T-BeamSUPREME (./tbeam/?t-beam=supreme) | ESP32-S3 | SX1262 | 2.4GHz b/g/n | 5.0 | YES |
-## T-Echo (./techo/)
-All-in-one unit with E-Ink screen, GPS and battery in injection-molded case. Features the low-power nRF52840 for long battery life.
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :----------------- | :------- | :----- | :--: | :-: | :-: |
-| T-Echo (./techo/) | nRF52840 | SX1262 | NO | 5.0 | YES |
-## LoRa32 (./lora/)
-Inexpensive basic ESP32-based boards.
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :----------------------------------- | :------- | :-------------------------------------- | :----------: | :-: | :-: |
-| LoRa32 T3-S3 (./lora/?t-lora=S3-v1) | ESP32-S3 | SX1262 SX1276 SX1280 LR1121 | 2.4GHz b/g/n | 5.0 | NO |
-## T-Deck (./tdeck/)
-Standalone device with screen and keyboard.
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :--------------------------------------- | :---------- | :----- | :--: | :-: | :-: |
-| T-Deck (./tdeck/?t-deck=t-deck) | ESP32-S3FN8 | SX1262 | YES | 5.0 | NO |
-| T-Deck Plus (./tdeck/?t-deck=t-deck) | ESP32-S3FN8 | SX1262 | YES | 5.0 | YES |
-| T-Deck Pro (./tdeck/?t-deck=t-deck-pro) | ESP32-S3FN8 | SX1262 | YES | 5.0 | YES |
-
-
-## Hardware / Devices / Rak Wireless / Index
-
-RAKwireless offers a variety of Meshtastic-compatible hardware, including modular starter kits and ready-to-use prebuilt devices. The RAK Meshtastic Collection (https://msh.to/rak-collection) showcases both options, making it easy to find the right solution for your needs. If you’re assembling a Meshtastic device using RAK hardware, the RAK Meshtastic Designer (http://meshtastic-designer.rakwireless.com?utm_source=website_partner&utm_medium=referral&utm_campaign=rak_meshtastic_collab) helps you select the right modules to match your use case.
-## RAK Wisblock (./wisblock/)
-Modular hardware system with Base, Core and Peripheral modules including the low-power and solar ready nRF52840-based Meshtastic Starter Kit (19007 & 4631).
-**WisBlock Core Modules** (./wisblock/core-module/)
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :-------------------------------------------------- | :------- | :----- | :----------: | :-: | :----: |
-| RAK4631 (./wisblock/core-module?rakcore=RAK4631) | nRF52840 | SX1262 | NO | 5.0 | ADD-ON |
-| RAK11200 (./wisblock/core-module?rakcore=RAK11200) | ESP32 | ADD-ON | 2.4GHz b/g/n | 4.2 | ADD-ON |
-| RAK11310 (./wisblock/core-module?rakcore=RAK11310) | RP2040 | SX1262 | NO | NO | ADD-ON |
-**Base Boards** (./wisblock/base-board/)
-| Name | Type |
-| :--------------------------------------------------- | :----------------------------------- |
-| RAK5005-O (./wisblock/base-board?rakbase=RAK5005-O) | WisBlock Base Board (End Of life). |
-| RAK19007 (./wisblock/base-board?rakbase=RAK19007) | WisBlock Base Board (2nd Generation) |
-| RAK19003 (./wisblock/base-board?rakbase=RAK19003) | WisBlock Mini Base Board. |
-| RAK19001 (./wisblock/base-board?rakbase=RAK19001) | WisBlock Dual IO Base Board. |
-**WisBlock Peripherals** (./wisblock/peripherals/)
-| Name | Type |
-| :------------------------------------------------------------------- | :------------------------------ |
-| RAK1910 (./wisblock/peripherals?rakmodules=GPS) | GPS |
-| RAK12500 (./wisblock/peripherals?rakmodules=GPS) | GPS |
-| RAK18001 (./wisblock/peripherals?rakmodules=Buzzer) | Buzzer |
-| RAK13002 (./wisblock/peripherals?rakmodules=IO) | IO Module |
-| RAK14001 | RGB LED |
-| RAK12002 (./wisblock/peripherals?rakmodules=RTC) | Real Time Clock |
-| RAK1901 (./wisblock/peripherals?rakmodules=Sensors&sensors=RAK1901) | Temperature and Humidity Sensor |
-| RAK1902 (./wisblock/peripherals?rakmodules=Sensors&sensors=RAK1902) | Barometric Pressure Sensor |
-| RAK1906 (./wisblock/peripherals?rakmodules=Sensors&sensors=RAK1906) | Environment Sensor |
-| RAK12013 | Radar Sensor |
-| RAK13800 | Ethernet Module |
-### WisBlock Displays (./wisblock/screens/)
-| Name | Type | Resolution |
-| ----------------------------------------------- | ----------------------- | ---------- |
-| RAK1921 (./wisblock/screens?rakscreens=OLED) | 0.96inch OLED | 128x64px |
-| RAK14000 (./wisblock/screens?rakscreens=E-Ink) | 2.13 inch E-Ink display | 212x104px |
-## RAK WisMesh (./wismesh/)
-RAK WisMesh is a series of ready-to-use Meshtastic devices designed for seamless deployment. Unlike the WisBlock modular system, which allows users to build and customize their own devices, WisMesh devices provide pre-built, purpose-driven solutions that eliminate the need for assembly or additional configuration.
-### WisMesh Devices (./wismesh/)
-| Device Name | Type | Features |
-| ---------------------------------------------------------------------------- | --------- | ---------------------------------------------------------------------------- |
-| WisMesh Pocket V2 (./wismesh/pocket/?pocket=pocketv2) | Handheld | Compact, built-in display with GPS, and battery-powered |
-| WisMesh Pocket Mini (./wismesh/pocket/?pocket=pocket-mini) | Handheld | Ultra-compact, lightweight, and battery-powered |
-| WisMesh Tag (./wismesh/tag) | Compact | Portable location tracking, IP66 weather resistance, 1000mAh battery |
-| WisMesh Tap (./wismesh/tap) | Versatile | Touchscreen, multi-functional, weather-resistant, and battery-powered |
-| WisMesh Board ONE (./wismesh/board-one) | Versatile | Compact, extensible, enclosed handheld option or base board to build from |
-| WisMesh Repeater (./wismesh/repeater/?repeater=repeater) | Solar | Fixed position, solar-powered, waterproof, high-gain antenna, extended range |
-| WisMesh Repeater Mini (./wismesh/repeater/?repeater=repeater-mini) | Solar | Portable, solar-powered, waterproof, multiple mounting options |
-| WisMesh Ethernet MQTT Gateway (./wismesh/gateway/?gateway=gateway-ethernet) | MQTT | Connects Meshtastic to MQTT over Ethernet with optional PoE support |
-| WisMesh WiFi MQTT Gateway (./wismesh/gateway/?gateway=gateway-wifi) | MQTT | Connects Meshtastic to MQTT over WiFi |
-
-
-## Hardware / Devices / Seeed Studio / Index
-
-Seeed Studio is a tech company focused on Edge AI and IoT. With the mission of "making technology accessible for all", Seeed Studio has been embracing open source since DAY 1. Seeed works closely with the Meshtastic community to bring easy-to-use, affordable products to community members. By listening to the voices, communicating and collaborating closely with innovators in this community, iterations of products and new services are brought to life.
-### SenseCap (./sensecap/)
-The SenseCAP product line offers a comprehensive range of solutions for both hobbyists and industrial users, featuring the T1000-E card tracker, an IP65-rated, ready-to-go Meshtastic handheld device, the Indicator with a 4-inch touchscreen driven by ESP32-S3 and RP2040 Dual-MCU, and the Solar Node, a solar-powered device designed for long-term outdoor deployment. These devices are designed to be user-friendly, with pre-flashed Meshtastic firmware for easy setup and operation.
-| Name | MCU | Radio | WiFi | BT | GPS |
-| ------------------------------------------------ | ------------- | ------ | ------------ | --- | -------- |
-| Card Tracker T1000-E (./sensecap/card-tracker/) | nRF52840 | LR1110 | NO | 5.1 | YES |
-| SenseCAP Indicator (./sensecap/indicator/) | ESP32, RP2040 | SX1262 | 2.4GHz b/g/n | 5.0 | OPTIONAL |
-| SenseCAP Solar Node (./sensecap/solar-node/) | nRF52840 | SX1262 | NO | 5.0 | OPTIONAL |
-### Wio Series (./wio-series/)
-A lineup of development boards and modules for hobbyists and prototyping, with a variety of MCU and sensor options. Most models are intended for integration into custom projects, while the Tracker L1 has a "Pro" variant that is available as a ready-to-go handheld device with a pre-installed case and battery.
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :------------------------------------------------------------------------------ | :------- | :--------- | :--: | :-: | :------: |
-| Wio Tracker L1 (./wio-series/tracker-l1) | nRF52840 | SX1262 | NO | 5.0 | YES |
-| XIAO nRF52840 & Wio-SX1262 Kit (./wio-series/wio-sx1262s/?wio-sx1262=nrf52840) | nRF52840 | Wio-SX1262 | NO | 5.0 | OPTIONAL |
-
-
-## Hardware / Devices / Raspberrypi / Index
-
-### Raspberry Pi Pico (./pico/)
-Fast versatile boards using the RP2040/RP2350.
-| Name | MCU | Radio | WiFi | BT | GPS |
-| :--------------------------- | :------------ | :----- | :--------------: | :-----------: | :-: |
-| Raspberry Pi Pico (./pico/) | RP2040/RP2350 | SX1262 | 2.4GHz b/g/n[^1] | not supported | NO |
-[^1]: 2.4GHz b/g/n WiFi support is available on the Raspberry Pi Pico **W** variant.
-### Raspberry Pi Zero/Zero2/3/4/400/5 (/docs/hardware/devices/linux-native-hardware/)
-Meshtastic offers support for Raspberry Pi devices through our Linux native platform, meshtasticd. For full information, please see our Linux Native Hardware (/docs/hardware/devices/linux-native-hardware/) documentation.
-
-
-## Hardware / Devices / Linux Native Hardware / Linux Native Hardware
-
-This page outlines the setup of Meshtastic on Linux-native devices, utilizing portduino to run the Meshtastic firmware under Linux.
-## Prerequisites and Hardware Compatibility
-Before proceeding with the setup, ensure the device meets the following requirements:
-### Tested Devices
-#### SPI
-- Raspberry Pi: Zero 2, 3, 4, Pi 400, and Pi 5 on Raspbian `bookworm`.
-- Luckfox Pico: femtofox (https://github.com/noon92/femtofox/tree/main) on Ubuntu 22.04 `jammy`.
-#### USB (CH341)
-- Debian 12 (`bookworm`) with MeshStick.
-- Ubuntu LTS (`24.04`, `22.04`) with MeshStick.
-- Fedora `41` with MeshStick.
-- meshtasticd Docker container with MeshStick passed-through.
-### Hardware Compatibility
-- **UART** HATs and SX1302/SX1303 chip-based HATs are not supported. Only hats that use a SPI radio can work with Meshtastic.
-- The Waveshare SX1262 LoRaWAN Hat for Raspberry Pi is not recommended for deployment. It has known hardware limitations that may affect longer messages. If you must use it, please use the **CLIENT_MUTE** role to avoid rebroadcasting.
-- The Pine64 Pinedio is also not recommended for deployment, as it suffers from similar hardware limitations as the Waveshare SX1262 LoRaWAN Hat.
-See: The Meshtastic CRC Problem (https://www.youtube.com/watch?v=PND1GlMSrEM)
-- Tested USB devices include the MeshStick (https://github.com/markbirss/MESHSTICK) and Pinedio CH341 USB adapter.
-- Tested Raspberry Pi LoRa hats include the MeshAdv-Pi v1.1 (https://github.com/chrismyers2000/MeshAdv-Pi-Hat), Adafruit RFM9x, and Elecrow Lora RFM95 IOT.
-- Support for I²C displays, SPI displays, and keyboard input has been confirmed. It is necessary to be aware of potential pin conflicts when stacking hats.
-### System Requirements
-- The Meshtastic binary, `meshtasticd`, necessitates root access or a user with permissions to access GPIO, SPI, and other interfaces.
-- A Linux distribution compatible with the Meshtastic installation packages.
-## Installation
-### Installing Meshtasticd
-## Hardware Interfaces
-### USB
-USB support via the **CH341** was added in Meshtastic 2.5.18.
-Note that in order for Linux to recognize multiple CH341-USB devices, an EEPROM must be included onboard, burned with a unique serial number.
-Devices like the Pine64 Pinedio v1 do not include this.
-### SPI (Raspberry Pi)
-Enable SPI support for LoRa Radio
-- This can be done by running the below commands on a Raspberry Pi (2-5)
-```shell
-sudo raspi-config nonint set_config_var dtparam=spi on /boot/firmware/config.txt # Enable SPI
-# Ensure dtoverlay=spi0-0cs is set in /boot/firmware/config.txt without altering dtoverlay=vc4-kms-v3d or dtparam=uart0
-sudo sed -i -e '/^\s*#\?\s*dtoverlay\s*=\s*vc4-kms-v3d/! s/^\s*#\?\s*(dtoverlay|dtparam\s*=\s*uart0)\s*=.*/dtoverlay=spi0-0cs/' /boot/firmware/config.txt
-# Insert dtoverlay=spi0-0cs after dtparam=spi=on if not already present
-if ! sudo grep -q '^\s*dtoverlay=spi0-0cs' /boot/firmware/config.txt; then sudo sed -i '/^\s*dtparam=spi=on/a dtoverlay=spi0-0cs' /boot/firmware/config.txt
-fi
-```
-- Or this can be accomplished by manually enabling SPI support in `/boot/firmware/config.txt`:
-```plaintext
-dtparam=spi=on
-dtoverlay=spi0-0cs
-```
-### I²C (Raspberry Pi)
-Enable I²C support
-Enabled with:
-```shell
-sudo raspi-config nonint set_config_var dtparam=i2c_arm on /boot/firmware/config.txt # Enable i2c_arm
-```
-Or manually enabled in `/boot/firmware/config.txt`:
-```plaintext
-dtparam=i2c_arm=on
-```
-### UART (Raspberry Pi)
-Enable UART support for GPS
-- You can enable UART by running the below commands (which additionally will disable serial console tty)
-```shell
-sudo raspi-config nonint do_serial_hw 0 # Enable Serial Port (enable_uart=1)
-sudo raspi-config nonint do_serial_cons 1 # Disable Serial Console
-```
-- Or you can manually enable UART for GPS hats by making modifications in `/boot/firmware/config.txt`:
-```plaintext
-# Needed for all Pi device.
-enable_uart=1
-# Needed for the Pi 5 only.
-dtoverlay=uart0
-```
-- The correct port for UART GPS on the Pi 5 after a reboot is `/dev/ttyAMA0`.
-- The correct port for UART GPS on earlier Pi versions after a reboot is `/dev/ttyS0`.
-- You may need to disable the serial console on a Pi and then reboot
-```shell
-sudo raspi-config nonint do_serial_cons 1 # Disable Serial Console
-```
-## Configuration
-### Meshtasticd Configuration
-- The meshtasticd configuration is at `/etc/meshtasticd/config.yaml` by default. If a `config.yaml` is found in the current directory, that takes precedence. And a config file specified with the `-c/--config` option has the highest precedence.
-To enable a LoRa radio connected to your device, first locate it's configuration in the presets, then copy to `config.d`.
-```shell
-# First, locate your radio hardware
-ls /etc/meshtasticd/available.d
-# Ex: display-waveshare-2.8.yaml lora-MeshAdv-900M30S.yaml lora-meshstick-1262.yaml
-# Then, copy desired config to `config.d`
-# Example:
-cp /etc/meshtasticd/available.d/lora-MeshAdv-900M30S.yaml /etc/meshtasticd/config.d/
-```
-The `config.yaml` file is sensitive to spacing, so ensure that the indentation and spacing are correct.
-### Web Server
-`meshtasticd` has web server support starting with release `2.3.0`.
-To enable this:
-```yaml
-Webserver: Port: 443 # Port for Webserver & Webservices RootPath: /usr/share/meshtasticd/web # Root Dir of WebServer
-```
-### Bluetooth Support
-Bluetooth is currently unsupported and not functional on Linux Native devices. This may change in the future.
-### Persistence
-- The persistent .proto db files of the portduino version of meshtasticd are stored under: `/root/.portduino/default/prefs/`.
-## Advanced Setup and Troubleshooting
-### Enabling the systemd service
-To configure the device to start and stop meshtasticd as a service using systemctl you can setup the service unit using the instructions below. Create the systemd service (only for manual installs)
-The `meshtasticd` systemd service is automatically installed when using the official Meshtastic packages.
-These instructions are only needed when installing manually.
-Create the service unit file:
-Create a new file in the /etc/systemd/system/ directory with a name like meshtasticd.service.
-```shell
-sudo nano /etc/systemd/system/meshtasticd.service
-```
-Add the following content to the file:
-```plaintext
-[Unit]
-Description=Meshtastic Daemon
-After=network.target
-[Service]
-ExecStart=/usr/sbin/meshtasticd
-Restart=always
-User=root
-Group=root
-Type=simple
-[Install]
-WantedBy=multi-user.target
-```
-Reload systemd to recognize the new service:
-```shell
-sudo systemctl daemon-reload
-```
-Enable the service to start on boot:
-```shell
-sudo systemctl enable meshtasticd
-```
-#### Starting and Stopping the Service
-Start the service:
-```shell
-sudo systemctl start meshtasticd
-```
-Check the status of the service:
-```shell
-sudo systemctl status meshtasticd
-```
-This will give you a detailed view of the service status and any potential errors.
-Stop the service:
-```shell
-sudo systemctl stop meshtasticd
-```
-By following these steps, you set up a systemd service for meshtasticd that will start automatically at boot and restart if it crashes. You can manage it using the standard systemctl commands (start, stop, restart, status, etc.).
-### View Logs of Meshtastic
-To view the log output of the meshtasticd service, use the below command to read them out of the system journal.
-```shell
-journalctl -u meshtasticd -b
-```
-### Avahi setup
-This will allow the Android client to auto-discover your Linux Native device.
-- Install avahi-daemon (debian/ubuntu)
-```shell
-sudo apt install avahi-daemon
-```
-- Configure Avahi to advertise the node
-Create the service file:
-```shell
-sudo nano /etc/avahi/services/meshtastic.service
-```
-And paste the following:
-```xml Meshtastic _meshtastic._tcp 4403
-```
-Then save and exit.
-## CLI Configuration
-Interaction with Meshtastic can be conducted via the command line:
-```plaintext
-meshtastic --host localhost ...
-```
-See:
-- CLI Installation (/docs/software/python/cli/installation/)
-- CLI Usage (/docs/software/python/cli/usage/)
 
 
 ## Hardware / Solar Powered / Measure Device Power Consumption
 
 Before you can calculate what size solar panel and battery bank are required you need to determine how much power your device consumes. This is an essential and first step in building a solar powered anything.
-## Setup and Requirements
-To measure the average power consumption of a radio device, like a Meshtastic node, requires some hardware and some understanding.
-### Power Meter
-You need a way to measure power. This could be a bench power supply with voltage and amperage readings. It could be a dedicated device like a USB power meter or something else. Most important is that you need to read either volts and amps OR watts over time (over time means it needs to keep track of power used over time, not just instantaneous readings). Also consider if your meter has the resolution to measure as low as you need it to. For example, some nodes consume 0.005A at 5v. Can your power meter measure and display results that small? The important part here is that your meter needs to keep track of amp hours or watt hours. A normal multimeter won't track this.
-### What Are We Measuring?
-A watt is the unit used to measure power. Use this unit to express how much power your device consumes. If you measure volts and amps you get watts. It's an easy equation. Just multiply volts times amps to get watts: 5v x 50mA = 250mW (also described as 5v x 0.05A = 0.25W). 250mW is a measure of consumed power at a specific instance. Technically, it describes the power consumed over one hour. We can't use this number because radio devices like Meshtastic spend a lot of time receiving and only some time transmitting (transmitting consumes a lot more power than receiving). If we measure power when the device is receiving and we say that's how much it consumes in an hour we are not accounting for the less frequent but more power hungry transmissions. We need to get an average over time. To measure power over time we use watt hours. For example, if your device consumes 250mW for one hour and you want to know how much power it consumes in 24 hours, we express it like this: 24h * 250mW = 6000mWh. This result is expressed in milliwatt hours (it can also be expressed as: 6Wh).
-### Duty Cycle
-Radios consume relatively little power when receiving. In contrast, they consume a lot more power when transmitting. Duty cycle is the percentage of time the radio transmits. Over a period of time how much of that time is spent transmitting? 5%? 10%? 25%? It's hard to know. It depends on your use-case. Instead of trying to run calculations of receive power vs transmit power based on datasheet numbers, you can run a simulated test and measure power consumption over a period of time. Run your power consumption test for at least 1 hour but the longer you run the test the more accurate it will be (if your test conditions are representative of real life). Consider 2-6 hours as a good test duration.
-## Test Conditions
-Running a test is pretty simple in practice but requires some understanding of how Meshtastic operates in the background.
-### Background Network Activity
-Meshtastic nodes transmit data at regular intervals. These data packets are not messages you might send to other people. They're like beacons; used to tell the mesh your node is operational and on the network. Your node will know if other nodes are online and where they are (for GPS-enabled nodes). These data packets are sent in the background and are required for the network to function (though some of these can be disabled or configured to transmit less often). Other nodes on the network will respond to some of these beacons with an acknowledgement of receipt. This means there is a baseline of network activity that will consume some power through receiving and transmitting regardless of the messages you manually send.
-### Simulated Testing
-To set up a proper test you need to know or guess how much message traffic your network will have (manual messages sent from a node). Is it 5, 10, 20, or 50 messages in an hour? Only you can know this because everyone's situation is different.
-If your message rate is small (like 2-5 messages per hour) it may not impact power consumption very much. The node is already regularly transmitting through background activity so this small number of additional message transmissions will have a low impact on overall power consumption. Your message rate is entirely use-case dependent and no one can tell you what your duty-cycle is. But you can guess and add margin to your calculations to ensure uptime.
-#### Set A Low GPS Location Broadcast Interval
-One way to simulate a message in Meshtastic is to increase the number of times the node sends a GPS location update. Your device does not need a GPS module to use this option. At the time of this writing, the default interval is 2 minutes for a normal node with GPS or 15 minutes for a node with a fixed position. You can decrease this interval and it will broadcast a message more frequently, thus simulating a manual message on the network. You can change this interval on the iPhone app, Android app, web app and CLI. We can use this feature to force more frequent transmissions and thus simulate message traffic. This is helpful because it's automated and doesn't require you to remember to manually send messages during the test.
-#### Fixed Position Broadcast Interval
-Most solar base stations don't have a GPS module because it doesn't change location and GPS consumes a lot of power. In Meshtastic you can manually set the GPS coordinates for any node. This is common for solar nodes. When a node has a fixed position it will send out that position update every 15 minutes (by default). That's a baseline of 4 GPS location updates per hour. If you want to simulate 16 message transmissions per hour you can set this interval to 3 minutes. That will send an update every 3 minutes which is 20 updates in total. Subtract the baseline 4 updates (that will be present after your test, when deployed) and you get 16 "messages" per hour. For 56 simulated messages per hour you would set this interval to 1 minute.
-### Example Test Condition With Node Settings
-Tests will require at least 2 nodes. The node you measure power from and one other. Though, it may be more realistic to include 3 or 4 nodes on the network. The goal is to be as close to your final deployment network size when measuring power consumption. These test conditions would simulate a "chatty" network:
-- 3 nodes on the network.
-- 1 "other" node set to broadcast location every 60 seconds (disable smart location).
-- Test node is paired with phone over Bluetooth.
-- Test node has a fixed GPS position.
-- Test node is set to broadcast location every 60 seconds (disable smart location).
-Configure all your devices as indicated. It may be helpful to start the test on the hour or on a 15 minute interval (like 2:15). Write the start time on a sticky note and put it next to the test node. When you stop the test try to do it on the hour or at the 15 minute interval. This makes calculating the results easier. Make sure to reset any previous power measurements on your power meter before starting. Run the test and record the stop time and the total power consumed during the test.
-## Results
-Your results will hopefully be listed in watt hours. Just divide the recorded watt hours by the number of hours for your test to achieve your average power rating in watt hours or milliwatt hours. Save this result and continue to calculating solar panel size.
-If your meter measures amp hours you need to convert it.
-### Convert Amp Hours To Watt Hours
-Take your total amp hour result and multiply it by the volts used for the test. For example, your test ran for 3 hours at 5.1v and your meter reads 142mAh. That's 5.1v * 142mAh = 724.2mWh. Now divide the total by the test duration: 724.2mWh / 3h = 241.4mW. This example shows an average power consumption of 241.1mW. Save your test result for the next step, calculating solar panel size.
 
 
 ## Software / Integrations / Mqtt / Index
+
 
 ## Public MQTT Server
 Image: Common MQTT Layout (/img/software/mqtt/mqtt.webp)
@@ -1844,6 +840,8 @@ On the default PSK, the public server also limits the precision of location data
 This filtering focuses network resources on critical traffic, improving overall performance and reducing unnecessary data flow. Since these restrictions are applied at the network level, no firmware updates are required. As Meshtastic networks continue to grow, further traffic reduction measures may become necessary to manage network load and maintain reliable performance across all channels.
 ### Using Private Brokers
 It is not recommended to use the default key (PSK) on a private broker. Doing so potentially allows security vulnerabilities and can flood the mesh with traffic, as private brokers do not enforce the zero-hop policy needed for public channels. Private brokers are intended for use with private channels, where custom PSKs provide secure, isolated communication.
+
+
 ## Software Integrations
 Using or emitting packets directly in/from smart home control software such as Home Assistant or other consumers that can work with JSON messages.
 When MQTT is enabled, the Meshtastic device simply uplinks and/or downlinks every raw protobuf MeshPacket that it sees to the MQTT broker, encapsulated in a ServiceEnvelope protobuf (https://buf.build/meshtastic/protobufs/docs/main:meshtastic#meshtastic.ServiceEnvelope). In addition, some packet types are serialized or deserialized from/to JSON messages for easier use in consumers. All packets are sent to the broker, whether they originate from another device on the mesh, or the gateway node itself.
@@ -1880,39 +878,15 @@ The meaning of these fields is as follows:
 - "`timestamp`" is the Unix Epoch when the message was received, represented as an integer in decimal.
 - "`to`" is the decimal-equivalent Node ID of the destination of the message. In this case, "-1" means it was a broadcast message (this is the decimal integer representation of `0xFFFFFFFF`).
 - "`type`" is the type of the message, in this case it was a `NODEINFO_APP` message.
-The `from` field can thus be used as a stable identifier for a specific node. Note that in firmware prior to 2.2.0, this is a signed value in JSON, while in firmware 2.2.0 and higher, the JSON values are unsigned.
-If the message received contains valid JSON in the payload, the JSON is deserialized and added as a JSON object rather than a string containing the serialized JSON.
-#### JSON downlink to instruct a node to send a message
-You can also send a JSON message to the topic `msh/US/2/json/mqtt/` to instruct a gateway node to send a message to the mesh.
-To make this work, ensure that your node has a Meshtastic channel configured called "mqtt". Enable Downlink. The PSK can be random and doesn't matter. This channel allows the node to listen to messages on the `msh/US/2/json/mqtt/` topic.
-Reboot your device after creating this channel.
-The JSON message should contain the following fields:
-```json
-{ "from": , "to": , "channel": , "type": "type", "payload": { "key":"value" ... }
-}
-```
-`from` and `payload` fields are required for a valid envelope (note that in firmware &lt;2.2.20 a field `sender` was required, but this is no longer the case). The `from` field should be equal to the decimal Node ID of the node that will transmit the message. If the Node ID (sometimes called User ID) is !7efeee00, then the decimal equivalent would be 2130636288. Optionally, you can specify a different channel than the primary channel by setting the `channel` field to a channel index (0-7). Furthermore, you can send a direct message by setting the `to` field to the decimal Node ID of the destination. If the `to` field is not set, the message will be broadcast to all nodes on the mesh.
-Currently two types of messages are supported: `"sendtext"` and `"sendposition"`.
-For the type `sendtext`, the `payload` should be a string containing the text to send. For the type `sendposition`, the payload should be an object with the fields `latitude_i`, `longitude_i`, `altitude` (optional) and `time` (optional).
-### Basic Configuration
-Check out MQTT Settings (/docs/configuration/module/mqtt) for full information. For quick start instructions, read on.
-- Connect your gateway node to wifi, by setting the `network.wifi_ssid`, `network.wifi_psk` and `network.wifi_enabled` preferences.
-- Alternatively use the RAK4631 with Ethernet Module RAK13800, by setting `network.eth_mode` and `network.eth_enabled` (note that JSON is not supported on the nRF52 platform).
-- Configure your broker settings: `mqtt.address`, `mqtt.username`, and `mqtt.password`. If all are left blank, the device will connect to the Meshtastic broker.
-- Set `uplink_enabled` and `downlink_enabled` as appropriate for each channel. Most users will just have a single channel (at channel index 0). `meshtastic --ch-index 0 --ch-set uplink_enabled true`
-`uplink_enabled` will tell the device to publish mesh packets to MQTT.
-`downlink_enabled` will tell the device to subscribe to MQTT, and forward any packets from there onto the mesh.
-### Gateway nodes
-Any meshtastic node that has a direct connection to the internet (either via a helper app or installed WiFi/4G/satellite hardware) can function as a "Gateway node".
-Gateway nodes (via code running in the phone) will contain two tables to whitelist particular traffic to either be delivered toward the internet, or down toward the mesh. Users that are developing custom apps will be able to customize these filters/subscriptions.
-Since multiple gateway nodes might be connected to a single mesh, it is possible that duplicate messages will be published on any particular topic. Therefore, subscribers to these topics should
-deduplicate if needed by using the packet ID of each message.
+... (section truncated for brevity)
+
 ## Examples
 - Using mosquitto on a mac (/docs/software/integrations/mqtt/mosquitto.mdx)
 - Sending/receiving messages on mosquitto server using python (/docs/software/integrations/mqtt/python.mdx)
 - Using MQTT with Node-RED (/docs/software/integrations/mqtt/nodered.mdx)
 - Using MQTT with Home Assistant (/docs/software/integrations/mqtt/home-assistant.mdx)
 - Using MQTT with Adafruit IO (/docs/software/integrations/mqtt/adafruit-io.mdx)
+
 
 
 ## Software / Python Cli / Index
@@ -1922,6 +896,8 @@ For a more complete list of options, run:
 ```shell
 meshtastic --help
 ```
+
+
 ## Connection Arguments
 ### --port PORT
 The port the Meshtastic device is connected to, i.e. `/dev/ttyUSB0`, `/dev/cu.wchusbserial`, `COM4` etc. if unspecified, meshtastic will try to find it. Important to use when multiple devices are connected to ensure you call the command for the correct device.
@@ -1945,6 +921,8 @@ This argument can also be specified as `-b`.
 meshtastic --ble "device_name_or_address" --info
 meshtastic -b --info
 ```
+
+
 ## Help & Support Arguments
 ### -h or --help
 Shows a help message that describes the arguments.
@@ -1961,6 +939,8 @@ Print out info that would be helpful supporting any issues.
 ```shell title="Usage"
 meshtastic --support
 ```
+
+
 ## Optional Arguments
 ### --export-config
 Export the configuration of the device. (to be consumed by the '--configure' command).
@@ -1999,585 +979,4 @@ Set the Notification Ringtone (up to 230 characters).
 ```shell title="Usage"
 meshtastic --set-ringtone "LeisureSuit:d=16,o=6,b=56:f.5,f#.5,g.5,g#5,32a#5,f5,g#.5,a#.5,32f5,g#5,32a#5,g#5,8c#.,a#5,32c#,a5,a#.5,c#.,32a5,a#5,32c#,d#,8e,c#.,f.,f.,f.,f.,f,32e,d#,8d,a#.5,e,32f,e,32f,c#,d#.,c#"
 ```
-### --get-ringtone
-Show the stored ringtone.
-```shell title="Usage"
-meshtastic --get-ringtone
-```
-### --nodes
-Prints a node list in a pretty, formatted table.
-```shell title="Usage"
-meshtastic --nodes
-```
-### --qr[^1]
-Displays the URL and QR code that corresponds to the current primary channel.
-```shell title="Usage"
-meshtastic --qr
-```
-[^1]:
-### --qr-all
-Displays the URL and QR code that corresponds to all configured channels on the node.
-```shell title="Usage"
-meshtastic --qr-all
-```
-### --get [config_section]
-Gets a preferences field.
-Configuration values are described in: Configuration (https://meshtastic.org/docs/configuration).
-```shell title="Usage"
-meshtastic --get lora
-meshtastic --get lora.region
-```
-To see all valid values, pass an invalid value, such as `0`:
-```shell title="Usage"
-meshtastic --get 0
-```
-### --set [config_section].[option]&nbsp; [value]
-Sets a preferences field.
-Configuration values are described in: Configuration (https://meshtastic.org/docs/configuration).
-```shell title="Usage"
-meshtastic --set lora.region Unset
-```
-### --seturl SETURL
-Set the channel URL, which contains LoRa configuration plus the configuration of channels. Replaces your current configuration and channels completely.
-```shell title="Usage"
-meshtastic --seturl https://www.meshtastic.org/c/GAMiIE67C6zsNmlWQ-KE1tKt0fRKFciHka-DShI6G7ElvGOiKgZzaGFyZWQ=
-```
-### --pos-fields POS_FIELDS
-Configure position fields to send with positions; can pass multiple values. With 0 values, list current settings.
-```shell title="Usage"
-meshtastic --pos-fields
-meshtastic --pos-fields ALTITUDE HEADING SPEED
-```
-### --ch-index CH_INDEX
-Act on the specified channel index. Applies to options that configure channels (such as `--ch-set` and `--ch-del`) as well as options that send messages to the mesh (such as `--sendtext` and `--traceroute`).
-```shell title="Usage"
-meshtastic --ch-index 1 --ch-disable
-```
-### --ch-add CH_ADD
-Add a secondary channel, you must specify a channel name.
-Incompatible with `--ch-index`. If you pass `--ch-add`, any subsequent `--ch-set` and other commands that use a channel will use the index of the newly-added channel.
-```shell title="Usage"
-meshtastic --ch-add testing-channel
-```
-### --ch-del
-Delete the channel specified by `--ch-index`.
-```shell title="Usage"
-meshtastic --ch-index 1 --ch-del
-```
-### --ch-enable (deprecated)
-This option is deprecated. Using `--ch-add` is preferred in order to ensure there are no gaps in the channel list.
-Enable the channel specified by `--ch-index`.
-```shell title="Usage"
-meshtastic --ch-index 1 --ch-enable
-```
-### --ch-disable (deprecated)
-This option is deprecated. Using `--ch-del` is preferred in order to ensure there are no gaps in the channel list.
-Disable the channel specified by `--ch-index`.
-```shell title="Usage"
-meshtastic --ch-index 1 --ch-disable
-```
-### --ch-set CH_SET CH_SET
-Set a channel parameter on the channel specified by `--ch-index`.
-```shell title="Usage"
-meshtastic --ch-set id 1234 --ch-index 0
-```
-### --ch-vlongslow
-Change modem preset to `VERY_LONG_SLOW`.
-```shell title="Usage"
-meshtastic --ch-vlongslow
-```
-### --ch-longslow
-Change modem preset to `LONG_SLOW`.
-```shell title="Usage"
-meshtastic --ch-longslow
-```
-### --ch-longfast
-Change modem preset to (the default) `LONG_FAST`.
-```shell title="Usage"
-meshtastic --ch-longfast
-```
-### --ch-medslow
-Change modem preset to `MEDIUM_SLOW`.
-```shell title="Usage"
-meshtastic --ch-medslow
-```
-### --ch-medfast
-Change modem preset to `MEDIUM_FAST`.
-```shell title="Usage"
-meshtastic --ch-medfast
-```
-### --ch-shortslow
-Change modem preset to `SHORT_SLOW`.
-```shell title="Usage"
-meshtastic --ch-shortslow
-```
-### --ch-shortfast
-Change modem preset to `SHORT_FAST`.
-```shell title="Usage"
-meshtastic --ch-shortfast
-```
-### --set-owner SET_OWNER
-Set device owner name, sometimes called the long name.
-```shell title="Usage"
-meshtastic --set-owner "MeshyJohn"
-```
-### --set-owner-short SET_OWNER_SHORT
-Set device owner short name (4 characters max).
-```shell title="Usage"
-meshtastic --set-owner-short "MJ"
-```
-### --set-ham SET_HAM
-Set licensed Ham ID (by setting the owner name) and turn off encryption on the primary channel.
-To disable Ham mode, use `--set-owner` and `--set-owner-short` to reset the owner names, and use `--seturl` or `--ch-set` commands to configure channels with the name and encryption you wish them to have. Or, use `--factory-reset` to reset to default settings.
-```shell title="Usage"
-meshtastic --set-ham KI1345
-```
-### --dest DEST
-The destination node id for any sent commands, if not passed to a command another way. Used for Remote Node Administration (/docs/configuration/remote-admin).
-On many shells, exclamation points trigger special behavior unless enclosed in single quotes.
-```shell title="Usage"
-meshtastic --dest '!28979058' --set-owner "MeshyJohn"
-```
-### --sendtext SENDTEXT
-Send a text message. Can specify a channel index (`--ch-index`) and/or a destination (`--dest`).
-```shell title="Usage"
-meshtastic --sendtext 'Hello Mesh!'
-meshtastic --ch-index 1 --sendtext 'Hello secondary channel!'
-```
-### --traceroute TRACEROUTE
-Traceroute from connected node to a destination. You need pass the destination ID as an argument, and may pass `--ch-index` to specify a channel. The node you are tracing must have the same channel configured, and only nodes that share the channel will identify themselves within the response. With recent enough firmware, other nodes may be included as `!ffffffff` but not with their actual ID.
-```shell title="Usage"
-meshtastic --traceroute '!ba4bf9d0'
-```
-### --request-telemetry
-Request telemetry from a node. You need to pass the destination ID as an argument with `--dest`. For repeaters, using the node's decimal ID may be more effective, but a hexadecimal ID should work as well.
-```shell title="Usage"
-meshtastic --request-telemetry --dest '!ba4bf9d0'
-meshtastic --request-telemetry --dest 1828779180
-```
-### --request-position
-Request position from a node. You need to pass the destination ID as an argument with `--dest`.
-```shell title="Usage"
-meshtastic --request-position --dest '!ba4bf9d0' --ch-index 1
-```
-### --ack
-Used in combination with `--sendtext` and other commands to wait for an acknowledgment. Not all commands will be able to return an acknowledgment. Best used for commands that specify a single destination node.
-```shell title="Usage"
-meshtastic --sendtext 'Hello Mesh!' --dest '!28979058' --ack
-```
-### --reboot
-Tell the node to reboot.
-```shell title="Usage"
-meshtastic --reboot
-```
-### --shutdown
-Tell the node to shutdown.
-```shell title="Usage"
-meshtastic --shutdown
-```
-### --factory-reset
-Tell the node to install the default config.
-```shell title="Usage"
-meshtastic --factory-reset
-```
-### --reset-nodedb
-Tell the node to clear its list of nodes.
-```shell title="Usage"
-meshtastic --reset-nodedb
-```
-### --remove-node NODE
-Tell the node to remove the specified node from the NodeDB.
-```shell title="Usage"
-meshtastic --remove-node '!48759737'
-```
-### --reply
-Listen for messages. When one is received, send a message to the primary channel repeating the message along with some information.
-```shell title="Usage"
-meshtastic --reply
-```
-### --no-time
-Suppress sending the current time to the mesh on startup. May improve reliability and startup time.
-```shell title="Usage"
-meshtastic --port /dev/ttyUSB0 --no-time
-```
-### --no-nodes
-Instruct the node to not send nodeinfo from the NodeDB on startup. Requires firmware of sufficient version. Commands that use node information may behave unpredictably, since that information will not be populated, but this can improve efficiency for commands that don't.
-```shell title="Usage"
-meshtastic --no-nodes --no-time --sendtext "Firing off a quick message"
-```
-### --wait-to-disconnect WAIT_TO_DISCONNECT
-After performing whatever actions are specified by other options, wait before disconnecting from the device. Some devices will reboot when the serial connection disconnects, so adding a wait time may improve reliability. Defaults to 5 seconds if not provided.
-```shell title="Usage"
-meshtastic --set lora.channel_num 20 --wait-to-disconnect 10
-```
-### --setalt SETALT
-Set device altitude (allows use without GPS), and enables fixed position mode.
-Can only be used on locally-connected nodes and not along with `--dest`.
-```shell title="Usage"
-meshtastic --setalt 120
-```
-### --setlat SETLAT
-Set device latitude (allows use without GPS), and enables fixed position mode.
-Can only be used on locally-connected nodes and not along with `--dest`.
-```shell title="Usage"
-meshtastic --setlat 25.2
-```
-### --setlon SETLON
-Set device longitude (allows use without GPS), and enables fixed position mode.
-Can only be used on locally-connected nodes and not along with `--dest`.
-```shell title="Usage"
-meshtastic --setlon -16.8
-```
-### --remove-position
-Clear the node's currently set fixed position and disable fixed position mode.
-Can only be used on locally-connected nodes and not along with `--dest`.
-```shell title="Usage"
-meshtastic --remove-position
-```
-### --debug
-Show API library debug log messages.
-```shell title="Usage"
-meshtastic --debug --info
-```
-### --listen
-Stay open and listen to the stream of protocol buffer messages. This option enables `--debug` even if it is not provided alongside this argument.
-```shell title="Usage"
-meshtastic --listen
-```
-### --test
-Run stress test against all connected Meshtastic devices.
-```shell title="Usage"
-meshtastic --test
-```
-### --ble-scan
-Scan for available Meshtastic devices using BLE. This command lists discoverable devices, providing a convenient method to identify devices for connection via BLE.
-```shell title="Usage"
-meshtastic --ble-scan
-```
-### --noproto
-Don't start the API, just function as a dumb serial terminal. Useful for debugging because it doesn't count as a client. Depends on a physically cabled serial connection. It will connect but not display information over a network (--host) or Bluetooth (--ble) connection.
-```shell title="Usage"
-meshtastic --noproto
-```
-## Remote Hardware arguments
-### --gpio-wrb GPIO_WRB GPIO_WRB
-Set a particular GPIO # to 1 or 0.
-```shell title="Usage"
-meshtastic --port /dev/ttyUSB0 --gpio-wrb 4 1 --dest '!28979058'
-```
-### --gpio-rd GPIO_RD
-Read from a GPIO mask.
-```shell title="Usage"
-meshtastic --port /dev/ttyUSB0 --gpio-rd 0x10 --dest '!28979058'
-```
-### --gpio-watch GPIO_WATCH
-Start watching a GPIO mask for changes.
-```shell title="Usage"
-meshtastic --port /dev/ttyUSB0 --gpio-watch 0x10 --dest '!28979058'
-```
-## Tunnel arguments
-### --tunnel
-Linux only, very experimental. Low bandwidth and low reliability.
-Create a TUN tunnel device for forwarding IP packets over the mesh.
-## --subnet TUNNEL_NET
-Set the subnet for the local end of the tunnel established using `--tunnel`.
-
-
-## Software / Web Client
-
-Meshtastic Web is a Meshtastic client that runs directly in your browser.
-There are two ways of accessing the app:
-1. A hosted version located at client.meshtastic.org (https://client.meshtastic.org).
-2. Hosting it yourself.
-Image: WebUI (/img/webUI.webp)
-## Compatibility
-The application will work in all major browsers, but specific functionality is limited in some cases. For the best experience we recommend using a Chromium based browser such as Google Chrome (https://www.google.com/chrome) or Microsoft Edge (https://www.microsoft.com/en-us/edge).
-### HTTP
-This method of connecting is limited to esp32 devices.
-When using the hosted (https://client.meshtastic.org) version of the application, all traffic must be served over HTTPS.
-Meshtastic nodes generate self-signed certificates, and you must inform your browser that you wish to trust the aforementioned certificate.
-This can be done by first accessing your node directly via your browser: `https://NODE_IP_ADDRESS/` replacing `NODE_IP_ADDRESS` with the IP address of your node.
-This can be found on the screen of the device, via your router's DHCP lease page or serial console.
-You can accessing your device over HTTP after you set up your Network Connection (/docs/configuration/radio/network)
-### Bluetooth
-Bluetooth support is governed by the availability of the Web Bluetooth API (https://web.dev/bluetooth) as illustrated below. Support is primarily available in Chromium based browsers.
-Image: Web Bluetooth compatibility matrix (https://caniuse.bitsofco.de/image/web-bluetooth.png)
-### Serial (USB)
-The method with the least platform support, which uses the Web Serial API (https://web.dev/serial), allows us to connect directly to a Meshtastic node over USB and access it from directly within your browser.
-Image: Web Serial compatibility matrix (https://caniuse.bitsofco.de/image/web-serial.png)
-## Self Hosting
-The source code for the WebUI can be found on our GitHub (https://github.com/meshtastic/web)
-Instructions for building and running the project can be found in the repo's readme.
-
-
-## Software / Android / Installation
-
-## Installation Methods
-Our Android application is available on our F-Droid repo and Google Play Store. This allows you to connect to your Meshtastic device from your Android phone via Bluetooth, Wi-Fi (if on the same network) or USB On-The-Go (OTG).
-The minimum Android version is 8.0 (Oreo 2017).
-### Install with F-Droid
-1. Download and Install the F-Droid app from f-droid.org (https://f-droid.org/)
-2. Navigate to the `Categories` page and refresh (scroll down).
-3. Search for and install the `Meshtastic` App.
-### Install from Play Store
-There is a Play Store testing program (https://play.google.com/apps/testing/com.geeksville.mesh) with the latest cutting edge changes, though this may come with extra bugs.
-_Google Play and the Google Play logo are trademarks of Google LLC._
-### Install by Sideloading
-The app can also be sideloaded by downloading the .APK from the Github Releases (https://github.com/meshtastic/Meshtastic-Android/releases/latest) page.
-If you do sideload, you may have to give your browser permissions to run a package installer. If you wish to view the code or contribute to development of the app, please visit the app's GitHub page (https://github.com/meshtastic/Meshtastic-Android)
-### Install with Obtainium
-1. Download and Install the Obtainium app from Github (https://github.com/ImranR98/Obtainium).
-2. Open the Obtainium app and navigate to `+ Add App`.
-3. You can easily search for the Android repo with the search field by typing `Meshtastic-Android` and selecting the `Meshtastic/Meshtastic-Android` repo. You may also manually enter the Meshtastic Android Github Releases address as follows: `https://github.com/meshtastic/Meshtastic-Android/releases`.
-4. Under `Additional Options for Github` toggle as desired `Include prereleases`\* or `Fallback to older releases` and press `Add`.
-5. The first time you add an application, obtainium will prompt you for permission to install unknown apps, you will need to toggle `Allow from this source` and press back. Obtainium will download the Android .APK from the Github release page.
-6. Press `Install`. Android Installer will prompt "Do you want to install this app?" press `Install`.
-7. Press `Open`.
-Obtainium allows you to install and update Open-Source Apps directly from their releases pages, and receive notifications when new releases are made available.
-\*Alpha releases include the latest cutting edge changes which may come with extra bugs. It is recommended that you follow the Meshtastic Alpha Testers Channel on Discord (https://discord.com/invite/ktMAKGBnBs) if you decide to use these versions.
-
-
-## Software / Android / Usage
-
-## Introduction
-The Meshtastic Android app handles the communication and can show the location of everyone in your private group. Each member of your private mesh can see the location and distance of members and text messages sent to your group chat.
-Image: No device connected (/img/android/android-settings-none-sm.webp) (/img/android/android-settings-none.webp)
-Open the app and you should see the Settings tab like the screen above. Notice the cloud with a slash through it in the upper right, showing no device connection. You can move through the tabs but nothing much will be visible until you connect to a radio device.
-## Connecting
-You will need a device with Meshtastic installed to go any further. See the getting started (/docs/getting-started) section for information on how to do this.
-Image: Search for devices (/img/android/android-settings-none-c.webp) (/img/android/android-settings-none.webp)
-To find devices to connect via Bluetooth click the "+" button on the bottom right corner. Devices connected via Wi-Fi or Ethernet using the same network as your phone should be found automatically, or can be manually selected by entering its IP address. If you connect the device via USB OTG to your phone, it will be found automatically.
-Image: Device available to select (/img/android/android-settings-connect-sm.webp) (/img/android/android-settings-connect.webp)
-1. Select the device name, `Meshtastic_769d` in this example. (You will see devices within range, so make sure to get the right one.)
-2. Before you can connect for the first time, you need to "pair" the devices to allow communication between them. Some devices are pinless, others require entering a PIN shown on the device screen. If the device was flashed without a screen connected, it will automatically default to a pairing PIN of '123456'. If it was booted with a screen once, the config is set to random pin. If you remove the screen afterwards, it stays like this. Either set it to use the default pin manually, or factory reset it and it will revert to '123456' after the next boot.
-3. This starts the communication with the device. The cloud icon on the status bar should change and show a check mark.
-Image: Device connected (/img/android/android-settings-mike-c.webp) (/img/android/android-settings-mike-c.webp)
-The cloud icon at the top right corner indicates if you are connected to a device. This currently has three states:
-Cloud with a slash through it: No device connected to the application.
-Cloud with a check in it: Device connected to the application.
-Cloud with an up arrow in it: Device is connected, but currently sleeping or out
-of range.
-## Common tasks
-### Set your region
-In order to start communicating with your mesh, you must select a region. This setting controls which frequency range your device uses and should be set according to your location. See Region Settings (https://meshtastic.org/docs/getting-started/initial-config#set-regional-settings) for a list of region codes and their meanings.
-- Tap on the "Region" dropdown in the top-right corner and make the appropriate selection.
-### Change your name
-Edit the "Your name", e.g. to be "Mike Bird". This is the name that other people will see, so make it unique within your group. The initials e.g. "MB" should also be unique and will be used to identify you in the message history and on the device screens. Initials, or "short name", can be customized in the Radio configuration - User settings. The four characters displayed after your initials cannot be changed. These are the last four hex digits of the device MAC address. Devices with unset names will display these four characters as the device short name.
-Image: Changing device name (/img/android/android-settings-mike-sm.webp) (/img/android/android-settings-mike.webp)
-### Setup a channel
-If you have been sent a QR code or link for Meshtastic, then skip ahead to Join a Channel (#join-a-channel). Devices have a default channel preconfigured, shown as `#LongFast-I (Long range / Fast)`. It is OK to use this channel if you want your node to be visible to all Meshtastic users (within range) who are using the default channel.
-You can also create a new Channel and share the details with your group. The group is private and only those who have the details can join the group and see the messages. You will need to do this once initially, and then only when you want to change or make a new mesh network group.
-The Channel tab allows you to create a new private mesh. This screen is initially locked so that you don't change it accidentally. Press the lock symbol, and you will be able to edit. First, select the Channel options, as shown here, and chose the most appropriate option:
-Image: Changing channel settings (/img/android/android-change-channel-sm.webp) (/img/android/android-change-channel.webp)
-Here we selected `Long Range / Fast`, and then made a Channel Name using the keyboard. This identifies your group, here "Owl Team".
-Image: Changing channel name (/img/android/android-channel-owl-sm.webp) (/img/android/android-channel-owl.webp)
-You will see a warning because changing the Channel will break communications with your group, i.e. if you change your settings without sharing the new details with the group.
-Image: Do you want to change the channel? (/img/android/android-new-channel-sm.webp) (/img/android/android-new-channel.webp)
-The app will generate a new QR code on the screen. This encodes the channel details and a random 256-bit key for sharing with the new group. You can share the QR code with other Meshtastic users, or use the Share button and share the link via chat message, SMS, or email. The link is a very long code, for example: https://www.meshtastic.org/d/#CgUYAyIBAQ
-### Join a channel
-1. If another user shares a QR code, you will be able to scan it directly with your camera using the `Scan` button.[^1] Image: Open with Meshtastic (/img/android/android-open-with-c.webp) (/img/android/android-open-with.webp)
-[^1]:
-2. If the channel is shared from a file or link using the `Share` button, you can click on the file or link and you need to choose "Open with Meshtastic".
-1. Go to Android Settings > Apps > Default apps > Meshtastic > Opening links
-2. Make sure you have in "links/web address": www.meshtastic.org
-3. If you see the option "Open the supported links", make sure it is enabled.
-Image: Accept new channel (/img/android/android-accept-channel-c.webp) (/img/android/android-accept-channel.webp)
-Proceed and you should see a message like "Do you want to switch to the 'Owl Team' channel?".
-Accept this, and the app will change to this new channel. You will lose any current channel setting!
-Setting the same Name and Options directly doesn't work as there are other radio settings (like the unique pre-shared key) encoded in the QR code or link.
-You can test changing channels with the QR code shown below.[^1]
-Image: Meshtastic Default Channel (/img/android/default-channel.webp)
-### Adjust a channel
-You can change the following settings by tapping on the name of an existing channel:
-1. MQTT Uplink
-2. MQTT Downlink
-3. Position enabled
-4. Precise location (if position is enabled)
-5. Position precision (if precise location is disabled)
-#### Position Precision
-The precision levels currently used in the app correspond the values in the table below. These can be thought of as the radius of a circle around a point (not your current location) which you are within.
-### Send a message
-Image: Messages (/img/android/android-messages-sm.webp) (/img/android/android-messages.webp)
-The message window operates like most messaging apps. Note that your primary channel i.e. `LongFast` contact is always shown and works as a group chat. Other contacts are for direct messaging, or private group chats.
-- Long press contacts or messages for options, like delete.
-- Press a node from the Nodes tab to send Direct Messages.
-With LoRa (or any radio) there is some uncertainty that the message has been received, so there is a confirmation built-in to the protocol. There are small icons shown to the right of the messages you send:
-Cloud with an up arrow: the message is queued in the app, waiting to be handed
-to the device.
-- Cloud only: the device received the message from the app, and it has been sent
-and transmitted via LoRa.
-- Cloud with a check mark: received at least one node's acknowledgement
-response. Confirmations could be from any one device.
-- Person with a check mark - The intended recipient node of your direct message
-acknowledged the message.
-- Cloud crossed out: the initial sender did not receive any confirmation within
-a certain timeout.
-By default there is no long-term store-and-forward of messages, so messages not received during transmission are lost.
-### View your network
-Image: Local Meshtastic network (/img/android/android-nodes-sm.webp) (/img/android/android-nodes.webp)
-The network list shows all the users (devices) that have connected to the same Channel. For each entry, it shows the last time they were active, their location and distance (when available), and their last known power status. In the example above, Monkey is the local user, Rabbit was last heard from 10 minutes ago and is 50m away, and Panda was last heard 11 minutes ago and 5m away.
-- Tap on a node in the list to show more details about the node. A Show Details toggle is in the filter menu.
-- Tap on a node's colored chip to start Direct Messaging, request a position update, request a traceroute (/docs/configuration/module/traceroute) or add it to your Ignore Incoming Array (/docs/configuration/radio/lora#ignore-incoming-array).
-- Tap on a node's location coordinates to open in your maps application, long press to copy the coordinates to your clipboard.
-- If you have an Admin Channel (/docs/configuration/remote-admin) enabled on your devices, tapping on the node's colored chip will also display an option to remotely configure the node.
-### View the map
-Image: Meshtastic Map View (/img/android/android-map-sm.webp) (/img/android/android-map.webp)
-The Map tab will show a local map with an icon for each active mesh node that has a known position. The users names are shown above the icon.
-Image: Map Layers (/img/android/android-map-layers-c.webp) (/img/android/android-map-layers.webp)
-- Clicking the layers icon in the top-right will allow you to select the map type.
-### Offline maps
-Image: Download offline maps (/img/android/android-map-download-c.webp) (/img/android/android-map-download.webp)
-- Some map types allow downloading for offline use. If offline maps are available for your selected map type, a download icon will appear in the bottom-right corner of the map. Tap this icon and choose the option to Download Region, then select the area you wish to download.
-## Configuration options
-Image: Meshtastic configuration options (/img/android/android-settings-options-c.webp) (/img/android/android-settings-options.webp)
-Pressing the three vertical dots in the top right corner shows the configuration menu.
-### Debug Panel
-Image: Debug page (/img/android/android-debug-sm.webp) (/img/android/android-debug.webp)
-The debug panel allows you to see all packets sent between the application and the device. This can be useful for debugging purposes.
-### Radio Configuration
-Image: Meshtastic configuration options (/img/android/android-radio-configuration-c.webp) (/img/android/android-radio-configuration.webp)
-Radio Configuration opens a list of all radio and module configuration settings.
-- See Radio Config (/docs/configuration/radio) for radio settings.
-- See Module Config (/docs/configuration/module) for module settings.
-- At the end of this list are buttons for Reboot, Shutdown, Factory reset, and NodeDB reset.
-### Export rangetest.csv
-Allows you to save all your network's position data with GPS coordinates into a .csv (comma separated value) file on your phone. This file can be imported into the spreadsheet application of your choice for easy viewing. This feature is similar but independent from the device range test module (/docs/configuration/module/range-test), and results may differ.
-To reset the values go to the Debug Panel and press the "Clear" button.
-### Theme
-Image: Meshtastic theme (/img/android/android-settings-theme-c.webp) (/img/android/android-settings-theme.webp)
-Allows you to change between light and dark themes, or to select the system default.
-### Language
-Allows you to select a language for the application's user interface.
-### Show Introduction
-Opens the introduction slideshow.
-### Quick chat options
-Image: Quick Chat (/img/android/android-quick-chat-sm.webp) (/img/android/android-quick-chat.webp)
-Brings up an editor to create and edit quick response messages. These will appear as buttons in the chat window. Messages have the option to send instantly, or be appended to your message and sent manually.
-### About
-Displays the current app version.
-
-
-## Software / Apple / Usage
-
-## Offline Maps
-### Apple Maps
-By default, the Meshtastic app for iOS supports the use of native offline Apple Maps.
-To download offline maps, follow the official instructions from Apple for iPhone (https://support.apple.com/en-gb/105084) or iPad (https://support.apple.com/en-gb/guide/ipad/ipadc6e7e4d7/ipados). Video instructions are also available (https://youtube.com/watch?v=L260qixQrYs).
-## Shortcuts and Siri
-The Meshtastic app includes integrations with Siri and Shortcuts, allowing you to perform actions like sending waypoints or rebooting a node hands free or through automated workflows.
-### Shortcuts
-You can create a shortcut by opening the Shortcuts app, creating a new shortcut and looking for actions listed under the Meshtastic app
-All Shortcuts:
-- Add Contact - Takes a Meshtastic contact URL and saves it to the nodes database
-- Send a Direct Message - Send a message to a certain meshtastic node
-- Send a Waypoint
-- Send a Group Message - Send a message to a certain meshtastic channel
-- Get Node Position - Fetch the latest position of a cetain node
-- Shut Down - Send a shutdown to the node you are connected to
-- Restart - Restart to the node you are connected to
-- Factory Reset - Perform a factory reset on the node you are connected to
-- Save Channel Settings - Takes a Meshtastic channel URL and saves the channel settings
-- Disconnect Node - Disconnect the currently connected node
-### Siri
-You can perform the following Siri actions by speaking the phrase after activating Siri.
----
-#### Shut Down Node
-Phrases:
-- Shut down Meshtastic node
-- Shut down my Meshtastic node
-- Turn off Meshtastic node
-- Power down Meshtastic node
-- Deactivate Meshtastic node
----
-#### Restart Node
-Phrases:
-- Restart Meshtastic node
-- Restart my Meshtastic node
-- Reboot Meshtastic node
-- Reboot my Meshtastic node
----
-#### Group Message
-Phrases:
-- Message a Meshtastic channel
-- Send a Meshtastic group message
----
-#### Disconnect Node
-Phrases:
-- Disconnect Meshtastic node
-- Disconnect my Meshtastic node
-- Disconnect from Meshtastic
-- Disconnect Meshtastic
-
-
-## Software / Linux / Installation
-
-See Also:
-- Linux Devices (/docs/hardware/devices/linux-native-hardware)
-- Linux Usage (/docs/software/linux/usage)
-- Linux Development (/docs/development/linux)
-
-
-## Software / Linux / Usage
-
-## meshtasticd CLI options
-Additional arguments can be given to the program, which are listed as follows:
-- `-c CONFIG_FILE`: The configuration file to use.
-- `-d DIRECTORY`: The directory to use as the virtual filesystem (VFS).
-- `-e`: Erase the virtual filesystem before use.
-- `-h MAC_ADDRESS`: The MAC address to assign to this virtual machine.
-- `-p TCP_PORT`: The local TCP port to use for running the Meshtastic API.
-## Usage with Docker
-If you do not own a Linux machine, or you just want to separate things, you might want
-to run the application inside a docker container.
-### Usage
-First, Pull the image (/docs/software/linux/installation/?os=docker)
-To run a container, type
-```shell
-docker run -p 4403:4403 --restart unless-stopped --name meshtasticd meshtastic/meshtasticd:beta
-```
-or, to get an interactive shell on the docker created container:
-```shell
-docker run -it -p 4403:4403 --restart unless-stopped --name meshtasticd meshtastic/meshtasticd:beta bash
-```
-### CH341 USB
-If you want to use a `CH341` USB adapter (MeshStick), you need to pass the `bus` device to the container with the `--device` flag:
-First, locate the USB device with `lsusb`:
-```shell
-lsusb
-```
-You should see something like this:
-```plaintext
-Bus 001 Device 001: ID 1d6b:0002 Linux Foundation 2.0 root hub
-Bus 001 Device 002: ID 1199:9091 Sierra Wireless, Inc. EM7565-9
-Bus 001 Device 003: ID 8087:0032 Intel Corp. AX210 Bluetooth
-Bus 001 Device 004: ID 13d3:56b2 IMC Networks Integrated Camera
-Bus 001 Device 005: ID 06cb:009a Synaptics, Inc. Metallica MIS Touch Fingerprint Reader
-Bus 001 Device 006: ID 1a86:5512 QinHeng Electronics CH341 in EPP/MEM/I2C mode, EPP/I2C adapter
-```
-Locate the `CH341` device and take note of the **Bus** and **Device** numbers. In this example: `001/006`.
-Then, run the container with the `--device` flag,
-additionally mounting a local configuration file:
-```shell
-docker run -it -p 4403:4403 --restart unless-stopped --name meshtasticd --device=/dev/bus/usb/001/006 -v ./config.yaml:/etc/meshtasticd/config.yaml:ro meshtastic/meshtasticd:beta
-```
-### Executing the application interactively
-To use Python CLI against exposed TCP port 4403,
-type this in the host machine:
-```shell
-meshtastic --info --host localhost
-```
-You can interact with the container in the same way as a normal device using a client that supports TCP connections.
-### Stop the container
-If started with the `--name meshtasticd` arg, you can stop the container with the following command:
-```shell
-docker kill meshtasticd
-```
-Else, run this to get the ID:
-```shell
-docker ps
-```
-Then, stop the container with command:
-```shell
-docker kill
-```
-> Tip: you can just use the first few characters of the ID in docker commands
+... (section truncated for brevity)
