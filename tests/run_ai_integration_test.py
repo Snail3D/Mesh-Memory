@@ -17,9 +17,9 @@ import sys
 import types
 from pathlib import Path
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / 'mesh-ai.py'
+MODULE_PATH = Path(__file__).resolve().parents[1] / 'mesh-master.py'
 if not MODULE_PATH.exists():
-    print('mesh-ai.py not found at expected path:', MODULE_PATH)
+    print('mesh-master.py not found at expected path:', MODULE_PATH)
     sys.exit(1)
 
 # Read the source and execute in an isolated namespace
@@ -31,7 +31,7 @@ src_mod = src.replace("app = Flask(__name__)", "app = None  # patched by test ha
 src_mod = src_mod.replace("@app.route", "@_no_op_route")
 
 # Provide a sane module identity and file path for Flask-related helpers
-ns['__name__'] = 'mesh_ai_test_module'
+ns['__name__'] = 'mesh_master_test_module'
 ns['__file__'] = str(MODULE_PATH)
 
 # Provide a no-op decorator to replace @app.route usages
@@ -43,7 +43,7 @@ def _no_op_route(*a, **k):
 ns['_no_op_route'] = _no_op_route
 
 # Inject lightweight mocks for optional external modules so the test harness
-# can exec the real `mesh-ai.py` source without requiring all dependencies.
+# can exec the real `mesh-master.py` source without requiring all dependencies.
 # These mocks provide only the attributes the module expects at import time.
 fake_meshtastic = types.ModuleType('meshtastic')
 fake_serial = types.ModuleType('meshtastic.serial_interface')
@@ -56,7 +56,7 @@ class _FakeSerialInterface:
 
 fake_serial.SerialInterface = _FakeSerialInterface
 
-# Provide constants and submodules expected by mesh-ai.py
+# Provide constants and submodules expected by mesh-master.py
 fake_meshtastic.serial_interface = fake_serial
 fake_meshtastic.BROADCAST_ADDR = 0xffffffff
 
@@ -92,7 +92,7 @@ def _fake_unidecode(s):
     return s
 unidecode_mod.unidecode = _fake_unidecode
 
-# Insert into sys.modules so imports in mesh-ai.py resolve
+# Insert into sys.modules so imports in mesh-master.py resolve
 sys.modules.setdefault('meshtastic', fake_meshtastic)
 sys.modules.setdefault('meshtastic.serial_interface', fake_serial)
 sys.modules.setdefault('meshtastic.mesh_interface', mesh_interface_mod)
@@ -171,7 +171,7 @@ send_to_ollama = ns.get('send_to_ollama')
 build_ollama_history = ns.get('build_ollama_history')
 
 if not parse_incoming_text or not send_to_ollama:
-    print('Required functions not found in mesh-ai.py')
+    print('Required functions not found in mesh-master.py')
     sys.exit(1)
 
 # Ensure runtime globals reflect the test config and that network calls are mocked

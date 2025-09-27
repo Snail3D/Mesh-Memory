@@ -1,5 +1,5 @@
 name: Bug Report
-description: Report a bug or issue with Mesh Memory
+description: Report a bug or issue with Mesh Master
 title: "[BUG] "
 labels: ["bug"]
 assignees: []
@@ -13,7 +13,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: Mesh Memory Version
+      label: Mesh Master Version
       description: What version are you running?
       placeholder: ex. latest main branch, specific commit hash
     validations:
@@ -67,7 +67,7 @@ body:
       label: Steps to Reproduce
       description: Steps to reproduce the behavior
       placeholder: |
-        1. Start mesh-memory with './start_mesh_ai.sh'
+        1. Start mesh-master with './start_mesh_master.sh'
         2. Send a DM with '/ai hello'
         3. See error
     validations:
@@ -79,7 +79,7 @@ body:
       label: Relevant Logs
       description: Please copy and paste any relevant log output
       render: shell
-      placeholder: Paste logs from mesh-ai.log or terminal output
+      placeholder: Paste logs from mesh-master.log or terminal output
 
   - type: textarea
     id: context

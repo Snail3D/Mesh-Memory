@@ -169,10 +169,24 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Mesh runtime state & sensitive data
+log/
+logs/
 *.log
+*.pid
+*.lock
+*.db
+*.db-journal
+messages.log
 messages_archive.json
 script.log
-mesh-ai.log
-mesh-ai.lock
-mesh-ai.pid
-mesh-ai.app.lock
+mesh-master.log
+mesh-master.pid
+mesh-master.lock
+mesh-master.app.lock
+mesh_mail.db
+mesh_mailboxes.json
+user_ai_settings.json
+data/bible_progress.json
+data/meshtastic_kb_sources/

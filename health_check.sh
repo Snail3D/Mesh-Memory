@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# MESH-AI Health Check Script
-# This script checks if MESH-AI is running properly
+# MESH-MASTER Health Check Script
+# This script checks if MESH-MASTER is running properly
 
 set -euo pipefail
 
-echo "🔍 MESH-AI Health Check $(date)"
+echo "🔍 MESH-MASTER Health Check $(date)"
 echo "=================================="
 
 # Check if service is enabled
-if systemctl is-enabled mesh-ai.service &>/dev/null; then
+if systemctl is-enabled mesh-master.service &>/dev/null; then
     echo "✅ Service enabled for auto-start"
 else
     echo "❌ Service NOT enabled for auto-start"
@@ -16,7 +16,7 @@ else
 fi
 
 # Check if service is active
-if systemctl is-active mesh-ai.service &>/dev/null; then
+if systemctl is-active mesh-master.service &>/dev/null; then
     echo "✅ Service is running"
 else
     echo "❌ Service is NOT running"
@@ -52,11 +52,11 @@ else
 fi
 
 # Check service logs for recent errors
-if journalctl -u mesh-ai.service --since "5 minutes ago" --no-pager -q | grep -i error; then
+if journalctl -u mesh-master.service --since "5 minutes ago" --no-pager -q | grep -i error; then
     echo "⚠️  Recent errors found in service logs"
 else
     echo "✅ No recent errors in service logs"
 fi
 
 echo "=================================="
-echo "🎯 MESH-AI appears to be healthy!"
+echo "🎯 MESH-MASTER appears to be healthy!"

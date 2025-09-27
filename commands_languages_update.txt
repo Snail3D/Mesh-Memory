@@ -36,7 +36,7 @@ Internationalisation Updates
 
 Files Touched
 -------------
-- `mesh-ai.py`
+- `mesh-master.py`
   * Added menu definitions, survival content, and bilingual formatting helpers.
   * Implemented the cavalry adventure state machine, persistence, and command wiring.
   * Normalised language handling with config-driven defaults.

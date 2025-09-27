@@ -1,20 +1,27 @@
-# MESH MEMORY v1.0.0 - Enhanced AI with Persistent Memory
+# MESH MASTER v1.0.0 - Enhanced AI with Persistent Memory
 
-**MESH MEMORY** is an enhanced fork of MESH-AI that brings **persistent memor### 🔧 **New Administration Features (v1.0)**
+**MESH MASTER** is an enhanced evolution of the Mesh-AI project that brings
+persistent memory, non-blocking async processing, and rugged performance to
+Meshtastic LoRa mesh networks. Never lose context again—the assistant remembers
+every conversation across restarts and reconnections.
+
+### 🔧 New Administration Features (v1.0)
 - **Runtime configuration management**: Update AI prompts and MOTD without restart
 - **Secure DM-only commands**: Admin functions restricted to private messages
 - **Atomic configuration writes**: Safer config file updates
 - **Basic monitoring**: Health endpoints for container deployment
-- **Better diagnostics**: More detailed system health with performance metricsnc processing, and robust performance** to Meshtastic LoRa mesh networks. Never lose context again - your AI remembers every conversation across restarts and reconnections.
+- **Better diagnostics**: More detailed system health with performance metrics
 
 > **🧠 The Memory Advantage:**  
-> Unlike the original mesh-ai, MESH MEMORY maintains **full conversation history** and **context persistence**, making your mesh network AI truly intelligent and reliable.
+> Unlike the original Mesh-AI release, MESH MASTER maintains **full conversation
+> history** and **context persistence**, making your mesh network AI truly
+> intelligent and reliable.
 
-![MESH-AI](https://github.com/user-attachments/assets/438dc643-6727-439d-a719-0fb905bec920)
+![MESH-MASTER](https://github.com/user-attachments/assets/438dc643-6727-439d-a719-0fb905bec920)
 
-**Built on MESH-AI BETA v0.5.1** - An experimental project that bridges [Meshtastic](https://meshtastic.org/) LoRa mesh networks with powerful AI chatbots.
+**Built on MESH-MASTER BETA v0.5.1** - An experimental project that bridges [Meshtastic](https://meshtastic.org/) LoRa mesh networks with powerful AI chatbots.
 
-## 🌟 **Why Choose MESH MEMORY?**
+## 🌟 **Why Choose MESH MASTER?**
 
 ### 🧠 **Persistent Memory System**
 - **Never forget conversations** - Full chat history survives restarts, power cycles, and reconnections
@@ -44,7 +51,7 @@
 > This project is **NOT ASSOCIATED** with the official Meshtastic Project. It is provided solely as an extension to add AI and advanced features to your Mesh network.  
 
 > **Stable v1.0 Release:**  
-> MESH MEMORY v1.0 represents a stable release with significant reliability improvements over previous versions. While always maintain backup communication methods for emergencies, this version is much more reliable for daily use.
+> MESH MASTER v1.0 represents a stable release with significant reliability improvements over previous versions. While always maintain backup communication methods for emergencies, this version is much more reliable for daily use.
 
 >  
 > *Built with love by humans and AI working together. Field-tested with improved error handling and recovery mechanisms.*
@@ -82,7 +89,7 @@ The Meshtastic logo trademark is the trademark of Meshtastic LLC.
   - `/live`: Liveness probe for container deployments
   - `/ready`: Readiness probe (200 only when radio connected)
 - **Degraded state detection** - Returns 503 when issues detected
-- **Heartbeat logging** - Status updates every ~30 seconds in `mesh-ai.log`
+- **Heartbeat logging** - Status updates every ~30 seconds in `mesh-master.log`
 - **Performance metrics** - Track RX/TX ages, AI response times, and queue depths
 
 ### ⚡ **Enhanced Message Processing**
@@ -93,7 +100,7 @@ The Meshtastic logo trademark is the trademark of Meshtastic LLC.
 
 ## 🚀 **Enhanced Fork Features**
 
-This fork includes significant performance, reliability, and user experience improvements over the original mesh-ai:
+This fork includes significant performance, reliability, and user experience improvements over the original mesh-master:
 
 ### 🔄 **Async Message Processing System**
 - **Non-blocking message handling**: New messages are processed immediately even during long AI responses (200+ seconds)
@@ -114,7 +121,7 @@ This fork includes significant performance, reliability, and user experience imp
 - **Queue fallback processing**: Prevents message drops when system is busy
 
 ### 🔒 **Single-Instance Enforcement**
-- **Process conflict prevention**: Lock file mechanism prevents multiple mesh-ai instances
+- **Process conflict prevention**: Lock file mechanism prevents multiple mesh-master instances
 - **Automatic cleanup**: Stale process detection and cleanup on startup
 - **Resource protection**: Prevents serial port conflicts and resource contention
 - **Reliable restarts**: Clean shutdown and startup procedures
@@ -126,7 +133,7 @@ This fork includes significant performance, reliability, and user experience imp
 - **Channel vs DM distinction**: Different behaviors for private vs public commands
 
 ### 🛠️ **Infrastructure Improvements**
-- **Improved startup script**: `start_mesh_ai.sh` with better error handling
+- **Improved startup script**: `start_mesh_master.sh` with better error handling
 - **Better connection recovery**: Improved retry logic for Meshtastic device connections
 - **Enhanced logging**: More detailed debugging and status information
 - **Better error handling**: Improved exception handling and recovery
@@ -166,8 +173,9 @@ This fork includes significant performance, reliability, and user experience imp
 - **Home Assistant Integration**  
   - Seamlessly forward messages from a designated channel to Home Assistant’s conversation API. Optionally secure the integration using a PIN.
 - **Comprehensive /Commands System**  
-  - **Built-in Commands**: `/about`, `/test`, `/help`, `/motd`, `/ai` (aliases: `/bot`, `/query`, `/data`), `/emergency` (or `/911`), `/whereami`, `/reset`, plus fun trivia commands: `/bible`, `/chucknorris`, `/elpaso` 
-  - **Admin Commands (DM-only)**: `/changeprompt`, `/changemotd`, `/showprompt`, `/printprompt`
+  - **Built-in Commands**: `/about`, `/test`, `/help`, `/motd`, `/ai` (aliases: `/bot`, `/query`, `/data`), `/emergency` (or `/911`), `/reset`, plus fun trivia commands: `/bible`, `/chucknorris`, `/elpaso` 
+  - **Admin Commands (DM-only)**: `/changemotd`, `/showprompt`, `/printprompt` *(system prompt is fixed—tune tone with `/aipersonality` instead)*
+  - **Personalities (DM-only)**: `/aipersonality` to list options, set a new tone, add custom prompt text, or reset to defaults
   - **Custom Commands**: Fully configurable via `commands_config.json` with static responses or dynamic AI prompts
   - **Case-insensitive**: All commands work regardless of capitalization for mobile usability
   - **Smart Response System**: Instant replies for alarm bells 🔔 and position requests 📍
@@ -189,9 +197,10 @@ This fork includes significant performance, reliability, and user experience imp
   - Route messages to and from Discord.
   - New configuration options and a dedicated `/discord_webhook` endpoint allow for inbound Discord message processing.
 - **Speedy Quick Commands**  
-  - `/bible` shares one of 1,000 gospel-centered verses focused on Jesus as Lord.
+  - `/bible` now pulls straight from the public-domain **World English Bible** (English) or **Reina-Valera 1909** (Spanish)—ask for a random verse or target passages like `/bible Nehemiah 1:11` or `/bible Juan 3:16` (ranges up to five verses supported). Calling `/bible` with no reference resumes where you left off, so missionaries can keep a continuous reading plan.
   - `/chucknorris` replies with a random fact from a curated 1,000 item Chuck Norris library.
   - `/elpaso` surfaces one of 300 lesser-known facts about the Sun City’s people and history.
+  - `/meshtastic <question>` consults a bundled MeshTastic field guide (≈52k tokens of curated docs) and responds only with verified information—perfect for safety-critical operations.
   - Every slash/special command now buffers three seconds (`⏳`) before transmitting to keep mesh congestion low.
 - **Windows & Linux Focused**
   - Official support for Windows environments with installation guides; instructions for Linux available now - MacOS coming soon!
@@ -200,7 +209,7 @@ This fork includes significant performance, reliability, and user experience imp
 
 ![image](https://github.com/user-attachments/assets/8ea74ff1-bb34-4e3e-9514-01a98a469cb2)
 
-> An example of an awesome Raspberry Pi 5 powered mini terminal - running MESH-AI & Ollama with HomeAssistant integration!
+> An example of an awesome Raspberry Pi 5 powered mini terminal - running MESH-MASTER & Ollama with HomeAssistant integration!
 > - Top case model here by oinkers1: https://www.thingiverse.com/thing:6571150
 > - Bottom Keyboard tray model here by mr_tbot: https://www.thingiverse.com/thing:7084222
 > - Keyboard on Amazon here:  https://a.co/d/2dAC9ph
@@ -210,7 +219,7 @@ This fork includes significant performance, reliability, and user experience imp
 
 ## 🔋 RAK4631 Always-On Setup
 
-RAK's [RAK4631 quick start](https://docs.rakwireless.com/Product-Categories/WisBlock/RAK4631/Datasheet/) and [deep sleep tutorial](https://github.com/RAKWireless/WisBlock/tree/master/tutorials/RAK4631-Deep-Sleep-P2P) show how the core aggressively powers down (down to about 120 uA) whenever it can. On a USB-powered node with no LiPo or GPS that behavior can cut the USB serial path after a few idle minutes. Pin the module in an always-on profile before running MESH MEMORY:
+RAK's [RAK4631 quick start](https://docs.rakwireless.com/Product-Categories/WisBlock/RAK4631/Datasheet/) and [deep sleep tutorial](https://github.com/RAKWireless/WisBlock/tree/master/tutorials/RAK4631-Deep-Sleep-P2P) show how the core aggressively powers down (down to about 120 uA) whenever it can. On a USB-powered node with no LiPo or GPS that behavior can cut the USB serial path after a few idle minutes. Pin the module in an always-on profile before running MESH MASTER:
 
 - **Disable USB autosuspend.** Copy `99-rak-no-autosuspend.rules` into `/etc/udev/rules.d/` and reload udev so the host keeps the WisBlock CDC interface awake:
   ```bash
@@ -228,7 +237,7 @@ RAK's [RAK4631 quick start](https://docs.rakwireless.com/Product-Categories/WisB
 ## Changelog
 
 ### v1.0.0 - September 24, 2025 🎉
-**Major Release: MESH MEMORY Production Ready**
+**Major Release: MESH MASTER Production Ready**
 
 #### 🎨 **Beautiful Web Interface & Live Logging**
 - **Real-time log streaming** with Server-Sent Events (SSE) technology
@@ -260,7 +269,7 @@ RAK's [RAK4631 quick start](https://docs.rakwireless.com/Product-Categories/WisB
 - **Single-instance PID lock** prevents multiple conflicting processes
 
 ### New Updates in v0.4.2 → v0.5.1 - NOW IN BETA!
-- **REBRANDED TO MESH-AI** 
+- **REBRANDED TO MESH-MASTER** 
 - **WebUI Enhancements**  
   - **Node Search** added for easier node management.  
   - **Channel Message Organization** with support for custom channels in `config.json`.  
@@ -284,7 +293,7 @@ RAK's [RAK4631 quick start](https://docs.rakwireless.com/Product-Categories/WisB
 
 ### New Updates in v0.4.1 → v0.4.2
 - **Initial Ubuntu & Ollama Unidecode Support: -**  
-  - User @milo_o - Thank you so much!  I have merged your idea into the main branch - hoping this works as expected for users - please report any problems!  -  https://github.com/mr-tbot/mesh-ai/discussions/19
+  - User @milo_o - Thank you so much!  I have merged your idea into the main branch - hoping this works as expected for users - please report any problems!  -  https://github.com/mr-tbot/mesh-master/discussions/19
 - **Emergency Email Google Maps Link:**  
   - Emergency email now includes a Google Maps link to the sender's location, rather than just coordinates. - Great call, @Nlantz79!  (Remember - this is only as accurate as the sender node's location precision allows!)
 
@@ -351,7 +360,7 @@ RAK's [RAK4631 quick start](https://docs.rakwireless.com/Product-Categories/WisB
 - **Improved Command Handling**  
    - Replaced single-purpose code with a new, flexible **commands system** loaded from `commands_config.json`.  
    - Users can define custom commands that either have direct string responses or prompt an AI.  
-   - Built-in commands now include `/ping`, `/test`, `/emergency`, `/whereami`, `/help`, `/motd`, and more.  
+  - Built-in commands now include `/ping`, `/test`, `/emergency`, `/help`, `/motd`, and more.  
 - **Emergency Alert System**  
    - `/emergency` (or `/911`) triggers optional Twilio SMS, SMTP email, and/or Discord alerts.  
    - Retrieves node GPS coordinates (if available) to include location in alerts.  
@@ -366,7 +375,7 @@ RAK's [RAK4631 quick start](https://docs.rakwireless.com/Product-Categories/WisB
    - **`messages.log`** for persistent logging of all incoming messages, commands, and emergencies.  
    - Distinct JSON config files: `config.json`, `commands_config.json`, and `motd.json`.  
 - **Refined Startup & Script Structure**  
-   - A new `Run MESH-AI - Windows.bat` script for straightforward Windows startup.  
+   - A new `Run MESH-MASTER - Windows.bat` script for straightforward Windows startup.  
    - Added disclaimers for alpha usage throughout the code.  
    - Streamlined reconnection and exception handling logic with more robust error-handling.  
 - **General Stability & Code Quality Enhancements**  
@@ -378,11 +387,11 @@ RAK's [RAK4631 quick start](https://docs.rakwireless.com/Product-Categories/WisB
 ## Quick Start (Windows)
 
 1. **Download/Clone**  
-   - Clone the repository or copy the **mesh-ai** folder to your Desktop.  (Rename and remove "-main" tag from the folder name if downloading as ZIP)
+   - Clone the repository or copy the **mesh-master** folder to your Desktop.  (Rename and remove "-main" tag from the folder name if downloading as ZIP)
 2. **Install Dependencies:**  
    - Create a virtual environment:
      ```bash
-     cd path\to\mesh-ai
+     cd path\to\mesh-master
      python -m venv venv
      venv\Scripts\activate
      ```
@@ -394,9 +403,9 @@ RAK's [RAK4631 quick start](https://docs.rakwireless.com/Product-Categories/WisB
 3. **Configure Files:**  
    - Edit `config.json`, `commands_config.json`, and `motd.json` as needed. Refer to the **Configuration** section below.
 4. **Start the Bot:**  
-   - Run the bot by double‑clicking `Run MESH-AI - Windows.bat` or by executing:
+   - Run the bot by double‑clicking `Run MESH-MASTER - Windows.bat` or by executing:
      ```bash
-     python mesh-ai.py
+     python mesh-master.py
      ```
 5. **Access the WebUI Dashboard:**  
    - Open your browser and navigate to [http://localhost:5000/dashboard](http://localhost:5000/dashboard).
@@ -406,20 +415,20 @@ RAK's [RAK4631 quick start](https://docs.rakwireless.com/Product-Categories/WisB
 ## Quick Start (Ubuntu / Linux)
 
 1. **Download/Clone**  
-   - Clone the repository or copy the **mesh-ai** folder to your preferred directory:
+   - Clone the repository or copy the **mesh-master** folder to your preferred directory:
      ```bash
-     git clone https://github.com/mr-tbot/mesh-ai.git
-     cd mesh-ai
+     git clone https://github.com/mr-tbot/mesh-master.git
+     cd mesh-master
      ```
 
-2. **Create and Activate a Virtual Environment Named `mesh-ai`:**  
+2. **Create and Activate a Virtual Environment Named `mesh-master`:**  
    - Create the virtual environment:
      ```bash
-     python3 -m venv mesh-ai
+     python3 -m venv mesh-master
      ```
    - Activate the virtual environment:
      ```bash
-     source mesh-ai/bin/activate
+     source mesh-master/bin/activate
      ```
 
 3. **Install Dependencies:**  
@@ -436,12 +445,12 @@ RAK's [RAK4631 quick start](https://docs.rakwireless.com/Product-Categories/WisB
    - **Enhanced Method (Recommended for this fork):**  
      Use our improved startup script with single-instance enforcement and better error handling:
      ```bash
-     ./start_mesh_ai.sh
+     ./start_mesh_master.sh
      ```
    - **Standard Method:**  
      Run the bot directly:
      ```bash
-     python mesh-ai.py
+     python mesh-master.py
      ```
 
    **Benefits of Enhanced Startup Script:**
@@ -456,18 +465,18 @@ RAK's [RAK4631 quick start](https://docs.rakwireless.com/Product-Categories/WisB
 
 ### Optional: Enable Auto-Start on Boot (Headless / systemd)
 
-On a headless Raspberry Pi (or any Linux without a GUI session), use the included systemd installer to run MESH-AI at boot:
+On a headless Raspberry Pi (or any Linux without a GUI session), use the included systemd installer to run MESH-MASTER at boot:
 
 ```bash
-cd /path/to/mesh-ai
+cd /path/to/mesh-master
 sudo ./scripts/install-systemd-service.sh .
-sudo systemctl start mesh-ai
-sudo systemctl status mesh-ai
+sudo systemctl start mesh-master
+sudo systemctl status mesh-master
 ```
 
-- The service is installed as `mesh-ai.service` and enabled to start on boot.
-- Logs go to `mesh-ai.log` and the internal `script.log` for detailed events.
-  - View via: `journalctl -u mesh-ai -e -f`
+- The service is installed as `mesh-master.service` and enabled to start on boot.
+- Logs go to `mesh-master.log` and the internal `script.log` for detailed events.
+  - View via: `journalctl -u mesh-master -e -f`
 
 If you prefer using a Desktop environment autostart, the WebUI includes a toggle that manages a `.desktop` file. For reliable boot on headless devices, systemd is recommended.
 
@@ -482,7 +491,7 @@ If you prefer using a Desktop environment autostart, the WebUI includes a toggle
 
 2. **Prepare the Volume Structure**  
    - In the root of your project directory:
-   - Extract the "docker-required-volumes.zip" - The included "config" & "logs" folders should be within your "mesh-ai folder"
+   - Extract the "docker-required-volumes.zip" - The included "config" & "logs" folders should be within your "mesh-master folder"
    - This file structure differs from the standard release to accommodate volumes for docker
    - These files are placed in order to prevent docker from replacing these with directories on first start and throwing errors.
    - Make any changes to config files as needed before moving forward.
@@ -490,7 +499,7 @@ If you prefer using a Desktop environment autostart, the WebUI includes a toggle
 File structure should look like this:
 
    ```bash
-   mesh-ai/
+   mesh-master/
    ├── config/
    │   ├── config.json
    │   ├── commands_config.json
@@ -506,7 +515,7 @@ File structure should look like this:
    - An example docker-compose-yaml is included in the github repository - please adjust as needed.
    - From the project directory, run:
    ```bash
-   docker pull mrtbot/mesh-ai:latest
+   docker pull mrtbot/mesh-master:latest
    docker-compose up -d
   
 
@@ -526,8 +535,25 @@ File structure should look like this:
 - **Interacting with the AI:**  
   - Use `/ai` (or `/bot`, `/query`, `/data`) followed by your message to receive an AI response.
   - For direct messages, simply DM the AI node if configured to reply.
+- **Mesh Mail Inbox:**  
+  - Send `/m mailboxname message` (aliases `/mail`, `/email`) in a DM to drop mail into that inbox. If the mailbox doesn’t exist yet the bot will walk you through creating it and then save the message.  
+  - Check the latest three messages with `/c mailboxname` (aliases `/check`, `/checkmail`). Add a question right after the mailbox—for example `/c mailboxname what did we decide for Friday?`—and the bundled `llama3.2:1b` model will search the inbox and return a short answer.  
+  - Housekeeping commands: `/wipe mailbox <name>` clears a single inbox, `/wipe chathistory` wipes your DM thread, `/wipe personality` resets tone, and `/wipe all <name>` nukes mailbox + chat + tone after a Y/N confirmation.
+- **AI Personalities & Prompts (DM-only):**  
+  - Run `/aipersonality` to see your current persona, list the catalog, and grab quick tips.  
+  - Switch tones with commands like `/aipersonality set shakespeare` or `/aipersonality set sassy`.  
+  - Add extra guidance using `/aipersonality prompt Keep responses ultra brief.`  
+  - Use `/aipersonality reset` whenever you want to snap back to the default configuration.
+- **Need a walkthrough?**  
+  - `/emailhelp` sends a concise, mesh-friendly primer covering inbox creation, sending, reading, and wiping so new operators can get rolling fast.
+- **Game Hub:**  
+  - `/games` lists every mini-game. `/hangman start`, `/wordle start`, `/cipher start`, `/bingo start`, `/quizbattle start`, and `/morse start` all run in DMs.  
+  - `/adventure start <prompt>` spins up a llama-guided story; reply with `1`, `2`, or `3` to branch the scene—available in the language you're chatting in.  
+  - `/wordladder start cold warm` launches a llama-assisted ladder—use `guess` for your own rungs or `hint` to let the model propose the next word.  
+  - Quick hits: `/rps` for rock-paper-scissors banter, `/coinflip` for a dramatic mesh coin toss.  
+  - Games remember your current round per DM. Use `status`, `stop`, `hint`, or `answer` (depending on the title) for quick controls.
 - **Location Query:**  
-  - Send `/whereami` to retrieve the node’s GPS coordinates (if available).
+- Use the Meshtastic “Request Position” button to receive your node’s GPS coordinates (if available). The bot responds automatically when that control is pressed.
 - **Emergency Alerts:**  
   - Trigger an emergency using `/emergency <message>` or `/911 <message>`.  
     - These commands send alerts via Twilio, SMTP, and Discord (if enabled), including GPS data and timestamps.
@@ -586,7 +612,7 @@ Notes
 
 ## Using the API
 
-The MESH-AI server (running on Flask) exposes the following endpoints:
+The MESH-MASTER server (running on Flask) exposes the following endpoints:
 
 - **GET `/messages`**  
   Retrieve the last 100 messages in JSON format.
@@ -622,27 +648,27 @@ The MESH-AI server (running on Flask) exposes the following endpoints:
 
 - Heartbeat:
   - A concise heartbeat is logged roughly every 30 seconds showing connection status and activity ages.
-  - View with: `tail -f mesh-ai.log`
+  - View with: `tail -f mesh-master.log`
 
 ---
 
 ## Upgrade to v1.0
 
 1) Stop any running instance and service (if used)
-- `systemctl --user stop mesh-ai.service`
+- `systemctl --user stop mesh-master.service`
 
 2) Pull latest changes and update dependencies (if needed)
 - `git pull`
 - `source .venv/bin/activate` (or your venv) and `pip install -r requirements.txt`
 
 3) Start via the user service or helper script
-- `systemctl --user start mesh-ai.service`
-  - or: `NO_BROWSER=1 bash start_mesh_ai.sh`
+- `systemctl --user start mesh-master.service`
+  - or: `NO_BROWSER=1 bash start_mesh_master.sh`
 
 4) Verify readiness and health
 - `curl http://localhost:5000/ready`
 - `curl http://localhost:5000/healthz`
-- `tail -f mesh-ai.log` (look for periodic heartbeat lines)
+- `tail -f mesh-master.log` (look for periodic heartbeat lines)
 
 Notes
 - v1 enforces a single running instance via a lightweight PID lock to avoid serial port conflicts.
@@ -650,7 +676,7 @@ Notes
 
 ## Configuration
 
-Your `config.json` file controls almost every aspect of MESH-AI. Below is an example configuration that includes both the previous settings and the new options:
+Your `config.json` file controls almost every aspect of MESH-MASTER. Below is an example configuration that includes both the previous settings and the new options:
 
 ```json
 {
@@ -709,7 +735,7 @@ Your `config.json` file controls almost every aspect of MESH-AI. Below is an exa
   "chunk_buffer_seconds": 4,  // Delay between message chunks to reduce congestion (set higher for quieter meshes)
   
   "local_location_string": "@ YOUR LOCATION HERE",  // Local string for your node's location (e.g., "@ Home", "@ Roof Node")
-  "ai_node_name": "Mesh-AI-Alpha",  // Name for your AI node
+  "ai_node_name": "Mesh-Master-Alpha",  // Name for your AI node
   "max_message_log": 0,  // Set the maximum number of messages to log (set to 0 for unlimited)
 
   "enable_twilio": false,  // Set to true to enable Twilio for emergency alerts via SMS
@@ -788,7 +814,7 @@ Your `config.json` file controls almost every aspect of MESH-AI. Below is an exa
 - **Access the Developer Portal:**  
   Go to the [Discord Developer Portal](https://discord.com/developers/applications) and sign in with your Discord account.
 - **Create a New Application:**  
-  Click on "New Application," give it a name (e.g., *MESH-AI Bot*), and confirm.
+  Click on "New Application," give it a name (e.g., *MESH-MASTER Bot*), and confirm.
 - **Add a Bot to Your Application:**  
   - Select your application, then navigate to the **Bot** tab on the left sidebar.  
   - Click on **"Add Bot"** and confirm by clicking **"Yes, do it!"**  
@@ -838,10 +864,10 @@ Update your configuration file with the following keys (replace placeholder text
 - **Enable Message Polling:**  
   Set `"discord_receive_enabled": true` to allow the bot to poll for new messages.
 - **Routing:**  
-  The configuration key `"discord_inbound_channel_index"` determines the channel number used by MESH-AI for routing incoming Discord messages. Make sure it matches your setup.
+  The configuration key `"discord_inbound_channel_index"` determines the channel number used by MESH-MASTER for routing incoming Discord messages. Make sure it matches your setup.
 
 #### 6. Testing Your Discord Setup
-- **Restart MESH-AI:**  
+- **Restart MESH-MASTER:**  
   With the updated configuration, restart your bot.
 - **Check Bot Activity:**  
   Verify that the bot is present in your server, that it can see messages in the designated channel, and that it can send responses.  
@@ -867,7 +893,7 @@ Update your configuration file with the following keys (replace placeholder text
     - `"twilio_auth_token": "YOUR_TWILIO_AUTH_TOKEN"`
     - `"twilio_from_number": "YOUR_TWILIO_PHONE_NUMBER"`
     - `"alert_phone_number": "DESTINATION_PHONE_NUMBER"` (the number to receive emergency SMS)
-- **Usage:**  
+- **Use this by typing:**  
   - When an emergency is triggered, the bot sends an SMS containing the alert message (with a Google Maps link if GPS data is available).
 - **Tip:**  
   - Follow [Twilio's setup guide](https://www.twilio.com/docs/usage/tutorials/how-to-use-your-free-trial-account) to obtain your SID and Auth Token, and ensure that your phone numbers are verified.
@@ -893,11 +919,11 @@ Update your configuration file with the following keys (replace placeholder text
     - `/motd` - Display Message of the Day
     - `/ai`, `/bot`, `/query`, `/data` - AI conversation commands
     - `/emergency`, `/911` - Trigger emergency alerts with GPS
-    - `/whereami` - Get your current GPS coordinates
     - `/reset` - Clear conversation history for channel or DM
     
   - **Fun Trivia Commands**:
-    - `/bible` - Random Bible verse from `bible_jesus_verses.json` 📜
+    - `/bible` - WEB/RVR1909 verse with per-user reading progress (`/bible` resumes where you left off; `/bible John 3:16-17` jumps to a passage, nav via `<1,2>`) 📜
+    - `/biblehelp` - Mesh-friendly bible tips (language switching, navigation, quick start)
     - `/chucknorris` - Random Chuck Norris fact from `chuck_api_jokes.json` 🥋  
     - `/elpaso` - Random El Paso trivia from `el_paso_people_facts.json` 🌵
     
@@ -964,7 +990,7 @@ Update your configuration file with the following keys (replace placeholder text
 
 ## Conclusion
 
-MESH-AI BETA v0.5.1 takes the solid foundation of v0.4.2 and introduces even more significant improvements in logging, error handling, and a bit of polish on the web-UI and it's function.  Whether you’re chatting directly with your node, integrating with Home Assistant, or leveraging multi‑channel alerting (Twilio, Email, Discord), this release offers a more comprehensive and reliable off‑grid AI assistant experience.
+MESH-MASTER BETA v0.5.1 takes the solid foundation of v0.4.2 and introduces even more significant improvements in logging, error handling, and a bit of polish on the web-UI and it's function.  Whether you’re chatting directly with your node, integrating with Home Assistant, or leveraging multi‑channel alerting (Twilio, Email, Discord), this release offers a more comprehensive and reliable off‑grid AI assistant experience.
 
 **Enjoy tinkering, stay safe, and have fun!**  
 Please share your feedback or join our community on GitHub.

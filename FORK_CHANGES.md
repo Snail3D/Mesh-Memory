@@ -1,4 +1,4 @@
-# Enhanced Mesh-AI Fork - Technical Changes Summary
+# Enhanced Mesh-Master Fork - Technical Changes Summary
 
 ## v1.0.0 (2025-09-25)
 
@@ -22,12 +22,12 @@ Highlights focused on operational stability, visibility, and admin ergonomics.
   - Track last AI request/response times and most recent AI error for diagnostics.
 
 - Process safety
-  - Added app-level PID lock (`mesh-ai.app.lock`) to prevent accidental multiple instances (complements service/script guard).
+  - Added app-level PID lock (`mesh-master.app.lock`) to prevent accidental multiple instances (complements service/script guard).
 
 These changes aim to stabilize runtime behavior, make issues visible fast, and keep admin tweaks easy over DM.
 
 ## Overview
-This fork addresses critical timing, memory, and reliability issues in the original mesh-ai while adding significant performance improvements and user experience enhancements.
+This fork addresses critical timing, memory, and reliability issues in the original mesh-master while adding significant performance improvements and user experience enhancements.
 
 ## Key Problem Solved
 **Original Issue**: "Messages sent during AI response processing weren't handled until everything calmed down"
@@ -37,7 +37,7 @@ This fork addresses critical timing, memory, and reliability issues in the origi
 ## Technical Changes by Category
 
 ### 1. Async Message Processing System
-**Files Modified**: `mesh-ai.py`
+**Files Modified**: `mesh-master.py`
 - **Added**: `response_queue = queue.Queue(maxsize=10)`
 - **Added**: `process_responses_worker()` - Background thread for AI processing
 - **Modified**: `on_receive()` - Now queues messages instead of blocking
@@ -55,7 +55,7 @@ def process_responses_worker():
 ```
 
 ### 2. Enhanced Memory Management  
-**Files Modified**: `mesh-ai.py`, `config.json`
+**Files Modified**: `mesh-master.py`, `config.json`
 - **Added**: `messages_archive.json` - Persistent chat history storage
 - **Added**: Message archiving system with automatic loading on startup
 - **Modified**: Context management to use persistent history
@@ -70,7 +70,7 @@ def process_responses_worker():
 ```
 
 ### 3. Performance Optimizations
-**Files Modified**: `config.json`, `mesh-ai.py`
+**Files Modified**: `config.json`, `mesh-master.py`
 - **Reduced**: `ollama_timeout` from 200s to 120s
 - **Reduced**: `chunk_delay` from 10s to 3s  
 - **Optimized**: Ollama parameters for faster generation
@@ -85,8 +85,8 @@ def process_responses_worker():
 ```
 
 ### 4. Single-Instance Enforcement
-**Files Created**: `start_mesh_ai.sh`
-**Files Modified**: `mesh-ai.py`
+**Files Created**: `start_mesh_master.sh`
+**Files Modified**: `mesh-master.py`
 - **Added**: Lock file mechanism with PID validation
 - **Added**: Automatic cleanup of stale processes  
 - **Added**: Signal handling for clean shutdown
@@ -95,13 +95,13 @@ def process_responses_worker():
 **Key Features**:
 ```bash
 # Lock file mechanism
-LOCK_FILE="$SCRIPT_DIR/mesh-ai.lock"
+LOCK_FILE="$SCRIPT_DIR/mesh-master.lock"
 # PID validation before startup
 kill -0 "$LOCK_PID" 2>/dev/null
 ```
 
 ### 5. Robust DM Command Handling  
-**Files Modified**: `mesh-ai.py`
+**Files Modified**: `mesh-master.py`
 - **Fixed**: Empty `/ai` commands in DMs now work gracefully
 - **Added**: Smart command/message distinction 
 - **Fixed**: Async processing classification for AI commands
@@ -119,7 +119,7 @@ if cmd in ["/ai", "/bot", "/query", "/data"]:
 ```
 
 ### 6. Infrastructure Improvements
-**Files Created**: `start_mesh_ai.sh`, `tests/test_ai_integration.py`
+**Files Created**: `start_mesh_master.sh`, `tests/test_ai_integration.py`
 **Files Modified**: Multiple configuration files
 - **Added**: Comprehensive startup script with error handling
 - **Added**: Virtual environment auto-activation
@@ -151,15 +151,15 @@ if cmd in ["/ai", "/bot", "/query", "/data"]:
 ✅ **Commands**: All original commands work as expected  
 
 ## Installation Differences
-**Original**: `python mesh-ai.py`  
-**Enhanced**: `./start_mesh_ai.sh` (recommended) or `python mesh-ai.py`
+**Original**: `python mesh-master.py`  
+**Enhanced**: `./start_mesh_master.sh` (recommended) or `python mesh-master.py`
 
 ## Files Added/Modified Summary
-- **Modified**: `mesh-ai.py` (1236 insertions, 299 deletions)
+- **Modified**: `mesh-master.py` (1236 insertions, 299 deletions)
 - **Modified**: `config.json` (performance optimizations) 
-- **Created**: `start_mesh_ai.sh` (single-instance startup script)
+- **Created**: `start_mesh_master.sh` (single-instance startup script)
 - **Modified**: `README.md` (comprehensive documentation)
 - **Created**: `tests/test_ai_integration.py` (integration testing)
 - **Auto-Created**: `messages_archive.json` (persistent history)
 
-This fork transforms mesh-ai from a functional but timing-limited system into a robust, high-performance, production-ready solution for mesh network AI integration.
+This fork transforms mesh-master from a functional but timing-limited system into a robust, high-performance, production-ready solution for mesh network AI integration.

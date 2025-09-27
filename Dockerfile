@@ -38,10 +38,13 @@ RUN pip install --no-cache-dir --upgrade \
 # Application
 # ------------------------------------------------------------
 WORKDIR /app
-COPY mesh_ai.py .
+COPY mesh-master.py .
+COPY mesh_master ./mesh_master
+COPY mesh_master_mail.py .
+COPY data ./data
 COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
 EXPOSE 5000
-CMD ["python", "mesh_ai.py"]
+CMD ["python", "mesh-master.py"]

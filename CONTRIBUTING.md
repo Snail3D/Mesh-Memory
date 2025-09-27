@@ -1,6 +1,6 @@
-# Contributing to Mesh Memory
+# Contributing to Mesh Master
 
-Thank you for your interest in contributing to Mesh Memory! This project enhances MESH-AI with persistent memory, async processing, and enterprise-grade reliability.
+Thank you for your interest in contributing to Mesh Master! This project enhances MESH-AI with persistent memory, async processing, and enterprise-grade reliability.
 
 ## 🚀 Quick Start for Contributors
 

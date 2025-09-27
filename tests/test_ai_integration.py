@@ -4,11 +4,11 @@ from pathlib import Path
 import json
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / 'mesh-ai.py'
+MODULE_PATH = Path(__file__).resolve().parents[1] / 'mesh-master.py'
 
 
 def _exec_module_source(cfg=None):
-    """Execute mesh-ai.py in an isolated namespace and return important callables.
+    """Execute mesh-master.py in an isolated namespace and return important callables.
 
     cfg: optional dict to inject into the exec namespace as config values.
     """
@@ -18,7 +18,7 @@ def _exec_module_source(cfg=None):
     src_mod = src_mod.replace("@app.route", "@_no_op_route")
 
     ns = {}
-    ns['__name__'] = 'mesh_ai_test_module'
+    ns['__name__'] = 'mesh_master_test_module'
     ns['__file__'] = str(MODULE_PATH)
 
     def _no_op_route(*a, **k):
@@ -28,7 +28,7 @@ def _exec_module_source(cfg=None):
 
     ns['_no_op_route'] = _no_op_route
 
-    # Minimal fake modules to satisfy imports in mesh-ai.py
+    # Minimal fake modules to satisfy imports in mesh-master.py
     fake_meshtastic = types.ModuleType('meshtastic')
     fake_serial = types.ModuleType('meshtastic.serial_interface')
 

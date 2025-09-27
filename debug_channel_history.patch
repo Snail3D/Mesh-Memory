@@ -1,7 +1,7 @@
-diff --git a/mesh-ai.py b/mesh-ai.py
+diff --git a/mesh-master.py b/mesh-master.py
 index f6d9e0d..907ecbb 100644
---- a/mesh-ai.py
-+++ b/mesh-ai.py
+--- a/mesh-master.py
++++ b/mesh-master.py
 @@ -855,9 +855,11 @@ def build_ollama_history(sender_id=None, is_direct=False, channel_idx=None, threa
        # Channel messages for this channel - simple logic like the original
        for m in snapshot:

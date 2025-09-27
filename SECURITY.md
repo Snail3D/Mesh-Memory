@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-Currently supported versions of Mesh Memory:
+Currently supported versions of Mesh Master:
 
 | Version | Supported          |
 | ------- | ------------------ |
@@ -11,7 +11,7 @@ Currently supported versions of Mesh Memory:
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in Mesh Memory, please report it responsibly:
+If you discover a security vulnerability in Mesh Master, please report it responsibly:
 
 ### 🔒 Private Reporting
 - **DO NOT** create a public GitHub issue for security vulnerabilities
@@ -34,7 +34,7 @@ If you discover a security vulnerability in Mesh Memory, please report it respon
 - We appreciate responsible disclosure practices
 
 ### 🛡️ Security Considerations
-Mesh Memory handles:
+Mesh Master handles:
 - Local network communications
 - AI API endpoints  
 - Configuration files with potential credentials
@@ -44,7 +44,7 @@ Please be mindful of these areas when reporting vulnerabilities.
 
 ## Security Best Practices
 
-When using Mesh Memory:
+When using Mesh Master:
 - Keep dependencies updated
 - Use strong passwords/PINs for Home Assistant integration
 - Monitor access logs

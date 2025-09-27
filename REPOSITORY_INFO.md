@@ -1,13 +1,13 @@
-# Repository Information for "Mesh Memory"
+# Repository Information for "Mesh Master"
 
 ## Repository Name: 
-`mesh-memory`
+`mesh-master`
 
 ## Short Description:
-Enhanced MESH-AI fork with persistent memory, async processing, and enterprise-grade reliability for Meshtastic LoRa networks. Never lose conversational context again.
+Enhanced MESH-MASTER fork with persistent memory, async processing, and enterprise-grade reliability for Meshtastic LoRa networks. Never lose conversational context again.
 
 ## Full Description:
-MESH MEMORY transforms the original MESH-AI into a production-ready solution with persistent conversational memory, non-blocking async processing, and bulletproof reliability. Features include full chat history persistence across restarts, instant message handling during AI responses, single-instance enforcement, and optimized performance. Perfect for off-grid mesh networks requiring intelligent, context-aware AI assistance with enterprise-level stability.
+MESH MASTER transforms the original Mesh-AI into a production-ready solution with persistent conversational memory, non-blocking async processing, and bulletproof reliability. Features include full chat history persistence across restarts, instant message handling during AI responses, single-instance enforcement, and optimized performance. Perfect for off-grid mesh networks requiring intelligent, context-aware AI assistance with enterprise-level stability.
 
 ## Tags/Topics:
 - meshtastic
@@ -23,7 +23,7 @@ MESH MEMORY transforms the original MESH-AI into a production-ready solution wit
 - raspberry-pi
 - iot
 - offline
-- mesh-ai
+- mesh-master
 - python
 - flask
 
