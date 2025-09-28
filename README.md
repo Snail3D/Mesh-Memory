@@ -707,7 +707,11 @@ Your `config.json` file controls almost every aspect of MESH-MASTER. Below is an
   "max_message_log": 0,  // Set to 0 for unlimited history
   "meshtastic_knowledge_file": "data/meshtastic_knowledge.txt",
   "meshtastic_kb_max_context_chars": 3200,
-  "meshtastic_kb_cache_ttl": 600
+  "meshtastic_kb_cache_ttl": 600,
+  "offline_wiki_enabled": true,
+  "offline_wiki_dir": "data/offline_wiki",
+  "offline_wiki_summary_chars": 400,
+  "offline_wiki_context_chars": 40000
 
 }
 
@@ -749,6 +753,12 @@ Mesh Master can optionally relay queries to Home Assistant's Conversation servic
     - `/motd` - Display Message of the Day
     - `/ai`, `/bot`, `/query`, `/data` - AI conversation commands
     - `/reset` - Clear conversation history for channel or DM
+    - `/web <search>` - DM-only DuckDuckGo lookup (`crawl20` etc. for scoped site crawls)
+    - `/wiki <topic>` - DM-only live Wikipedia summary with cached context
+    - `/offline wiki <topic>` - DM-only offline encyclopedia query (requires local data set)
+    - `/save [topic]` - DM-only save of the current conversation window for later recall (auto names when topic omitted)
+    - `/recall <topic>` - DM-only recall of a saved conversation (type `/exit` to leave the loaded context)
+    - `/exit` - Leave any active context window (saved or MeshTastic deep-dive)
     
   - **Fun Trivia Commands**:
     - `/bible` - WEB/RVR1909 verse with per-user reading progress (`/bible` resumes where you left off; `/bible John 3:16-17` jumps to a passage, nav via `<1,2>`) 📜
@@ -780,6 +790,14 @@ Mesh Master can optionally relay queries to Home Assistant's Conversation servic
       ]
     }
     ```
+- **Offline Wiki Dataset (optional):**
+    1. Place an `index.json` file and article JSON files inside `data/offline_wiki/`.
+       - Each index entry maps a lowercase key to a relative JSON file containing `title`, `content`, and optional `summary`/`source` fields.
+    2. Use `/offline wiki <topic>` in a DM to load ~40K characters of context for later conversations (only a ~400 character summary is sent back).
+    3. Quickly seed the library with `python scripts/update_offline_wiki.py "Topic One" "Topic Two"` (or pass `--topics-file topics.txt`). The tool hits Wikipedia, writes the JSON files, and keeps `index.json` up to date.
+    4. Adjust the optional config flags (`offline_wiki_enabled`, `offline_wiki_dir`, `offline_wiki_summary_chars`, `offline_wiki_context_chars`) if you store the data elsewhere or want different limits.
+    5. Run `/reset` if you want to drop the cached encyclopedia context from your conversation history.
+    6. Once populated, saved conversations can be recalled with `/recall <topic>` (or natural phrases like “remember when we were talking about…”); exit the session with `/exit`.
   - The WebUI Dashboard (accessible at [http://localhost:5000/dashboard](http://localhost:5000/dashboard)) displays messages and node status.
   
 - **AI Provider Settings:**  

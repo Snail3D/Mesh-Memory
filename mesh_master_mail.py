@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,10 +15,14 @@ LockType = threading.Lock
 class MailStore:
     """Persist mailbox messages to a JSON file with simple helpers."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, limit: int = 10):
         self._path = path
         self._lock: LockType = threading.Lock()
         self._data: Dict[str, List[dict]] = {}
+        try:
+            self._limit = max(1, int(limit))
+        except Exception:
+            self._limit = 10
         self._load()
 
     def _mailbox_key(self, mailbox: str) -> str:
@@ -80,6 +85,7 @@ class MailStore:
         entry = dict(message)
         entry.setdefault("mailbox", mailbox_name)
         entry.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+        entry.setdefault("id", str(uuid.uuid4()))
         key = self._mailbox_key(mailbox_name)
         with self._lock:
             messages = self._data.get(key)
@@ -91,6 +97,10 @@ class MailStore:
                 self._data[key] = messages
                 created = True
             messages.append(entry)
+            if self._limit and len(messages) > self._limit:
+                excess = len(messages) - self._limit
+                if excess > 0:
+                    del messages[:excess]
             self._persist()
             return len(messages), created, dict(entry)
 

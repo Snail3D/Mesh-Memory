@@ -13,6 +13,9 @@ Commands
 │   └─ (no aliases)
 ├─ /aivibe
 │   └─ (no aliases)
+├─ /apology
+│   ├─ /apologize [langs: en]
+│   └─ /sorrynote [langs: en]
 ├─ /bible
 │   ├─ /bibel [langs: de]
 │   ├─ /bibelvers [langs: de]
@@ -46,6 +49,8 @@ Commands
 │   └─ /seguridadbarco [langs: es]
 ├─ /bot
 │   └─ (no aliases)
+├─ /breakup
+│   └─ /breakupnote [langs: en]
 ├─ /c
 │   └─ (no aliases)
 ├─ /changemotd
@@ -86,6 +91,8 @@ Commands
 │   └─ (no aliases)
 ├─ /coinflip
 │   └─ (no aliases)
+├─ /congrats
+│   └─ /celebrate [langs: en]
 ├─ /data
 │   └─ (no aliases)
 ├─ /disastertrivia
@@ -105,6 +112,8 @@ Commands
 │   ├─ /faktelpaso [langs: pl, uk]
 │   └─ /hechoelpaso [langs: es]
 ├─ /emailhelp
+│   └─ (no aliases)
+├─ /exit
 │   └─ (no aliases)
 ├─ /emergency
 │   ├─ /dharaura [langs: sw]
@@ -134,6 +143,9 @@ Commands
 │   ├─ /huracan [langs: es]
 │   ├─ /huracanes [langs: es]
 │   └─ /hurricaneprep [langs: en]
+├─ /hype
+│   ├─ /hypeme [langs: en]
+│   └─ /pumpup [langs: en]
 ├─ /jokes
 │   ├─ /bromas [langs: es]
 │   ├─ /chistes [langs: es]
@@ -177,6 +189,9 @@ Commands
 │   ├─ /ujumbe_wa_siku [langs: sw]
 │   ├─ /wiadomosc [langs: pl]
 │   └─ /wiadomoscdnia [langs: pl]
+├─ /offline
+│   ├─ /offlinewiki [langs: en]
+│   └─ /wikioffline [langs: en]
 ├─ /navigationtrainer
 │   ├─ /navegacion [langs: es]
 │   ├─ /navtrainer [langs: en]
@@ -185,6 +200,12 @@ Commands
 │   └─ (no aliases)
 ├─ /query
 │   └─ (no aliases)
+├─ /recall
+│   ├─ /recal [langs: en]
+│   └─ /remember [langs: en]
+├─ /quitjob
+│   ├─ /resign [langs: en]
+│   └─ /resignation [langs: en]
 ├─ /quizbattle
 │   └─ (no aliases)
 ├─ /radioprocedurestrainer
@@ -203,6 +224,11 @@ Commands
 │   └─ /zuruecksetzen [langs: de]
 ├─ /rps
 │   └─ (no aliases)
+├─ /save
+│   └─ /store [langs: en]
+├─ /sayno
+│   ├─ /decline [langs: en]
+│   └─ /politeno [langs: en]
 ├─ /showprompt
 │   ├─ /afficherprompt [langs: fr]
 │   ├─ /chakantishi [langs: zh]
@@ -256,6 +282,8 @@ Commands
 │   └─ /woodland [langs: en]
 ├─ /test
 │   └─ (no aliases)
+├─ /thankyou
+│   └─ /thanks [langs: en]
 ├─ /tornadotrainer
 │   ├─ /entrenadortornado [langs: es]
 │   ├─ /tornado [langs: es]
@@ -297,6 +325,9 @@ Commands
 │   └─ (no aliases)
 ├─ /wordle
 │   └─ (no aliases)
+├─ /write
+│   ├─ /compose [langs: en]
+│   └─ /draft [langs: en]
 └─ /yomomma
     ├─ /momma [langs: en]
     ├─ /mommajoke [langs: en]

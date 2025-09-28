@@ -120,11 +120,15 @@ def test_parse_and_send_direct():
     # Simulate a direct message and ensure a response string (or dict) is returned
     resp = parse_incoming_text('Hello test', sender_id=42, is_direct=True, channel_idx=None)
     # parse_incoming_text may return None for non-AI commands; ensure it doesn't crash
-    assert resp is None or isinstance(resp, (str, dict))
+    assert resp is None or isinstance(resp, (str, dict)) or hasattr(resp, "text")
 
     # Test that send_to_ollama returns the mocked response without raising
     out = send_to_ollama('Unit test message', sender_id=42, is_direct=True, channel_idx=None)
-    assert out in (None, 'MOCKED_AI_REPLY') or (isinstance(out, str))
+    assert (
+        out in (None, 'MOCKED_AI_REPLY')
+        or isinstance(out, str)
+        or hasattr(out, "text")
+    )
 
 
 def test_reset_behavior():

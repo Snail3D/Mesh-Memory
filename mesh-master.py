@@ -24,14 +24,17 @@ import re
 import random
 import subprocess
 import math
-from typing import Optional, Set, Dict, Any, List, Tuple
+import textwrap
+import uuid
+from typing import Optional, Set, Dict, Any, List, Tuple, Union
 from dataclasses import dataclass, field
 from meshtastic_facts import MESHTASTIC_ALERT_FACTS
 from unidecode import unidecode   # Added unidecode import for Ollama text normalization
 from google.protobuf.message import DecodeError
 import queue  # For async message processing
+import itertools
 import atexit
-from mesh_master import GameManager, MailManager, PendingReply
+from mesh_master import GameManager, MailManager, PendingReply, OfflineWikiStore
 # Make sure DEBUG_ENABLED exists before any logger/filter classes use it
 # -----------------------------
 # Global Debug & Noise Patterns
@@ -233,6 +236,11 @@ def clean_log(message, emoji="📝", show_always=False, rate_limit=True):
     elif not CLEAN_LOGS and not DEBUG_ENABLED:
         # Fall back to simple logging without emojis if clean_logs is disabled
         smooth_print(f"[Info] {message}")
+
+
+def _cmd_reply(cmd: Optional[str], message: str) -> PendingReply:
+    reason = f"{cmd} command" if cmd else "command reply"
+    return PendingReply(str(message), reason)
 
 def ai_log(message, provider="AI"):
     """Specialized logging for AI interactions with provider-specific emojis"""
@@ -848,6 +856,12 @@ PENDING_ADMIN_REQUESTS: Dict[str, Dict[str, Any]] = {}
 PENDING_WIPE_REQUESTS: Dict[str, Dict[str, Any]] = {}
 PENDING_BIBLE_NAV: Dict[str, Dict[str, Any]] = {}
 PENDING_POSITION_CONFIRM: Dict[str, Dict[str, Any]] = {}
+PENDING_WRITE_REQUESTS: Dict[str, Dict[str, Any]] = {}
+PENDING_SAVE_WIZARDS: Dict[str, Dict[str, Any]] = {}
+PENDING_VIBE_SELECTIONS: Dict[str, Dict[str, Any]] = {}
+
+SAVE_WIZARD_TIMEOUT = 5 * 60
+VIBE_MENU_TIMEOUT = 3 * 60
 BIBLE_NAV_LOCK = threading.Lock()
 
 ANTISPAM_LOCK = threading.Lock()
@@ -857,6 +871,56 @@ ANTISPAM_THRESHOLD = 25
 ANTISPAM_SHORT_TIMEOUT = 10 * 60
 ANTISPAM_LONG_TIMEOUT = 24 * 60 * 60
 ANTISPAM_ESCALATION_WINDOW = 60 * 60  # 1 hour after release
+
+COOLDOWN_LOCK = threading.Lock()
+COOLDOWN_STATE: Dict[str, Dict[str, Any]] = {}
+COOLDOWN_ENABLED = bool(config.get("cooldown_enabled", True))
+try:
+    COOLDOWN_WINDOW_SECONDS = int(config.get("cooldown_window_seconds", 5 * 60))
+except (ValueError, TypeError):
+    COOLDOWN_WINDOW_SECONDS = 5 * 60
+COOLDOWN_WINDOW_SECONDS = max(30, COOLDOWN_WINDOW_SECONDS)
+try:
+    COOLDOWN_THRESHOLD_BASE = int(config.get("cooldown_threshold", 5))
+except (ValueError, TypeError):
+    COOLDOWN_THRESHOLD_BASE = 5
+COOLDOWN_THRESHOLD_BASE = max(1, COOLDOWN_THRESHOLD_BASE)
+try:
+    COOLDOWN_THRESHOLD_NEW = int(config.get("cooldown_threshold_new", max(1, COOLDOWN_THRESHOLD_BASE - 2)))
+except (ValueError, TypeError):
+    COOLDOWN_THRESHOLD_NEW = max(1, COOLDOWN_THRESHOLD_BASE - 2)
+COOLDOWN_THRESHOLD_NEW = max(1, COOLDOWN_THRESHOLD_NEW)
+try:
+    COOLDOWN_NEW_NODE_HOURS = float(config.get("cooldown_new_node_hours", 24.0))
+except (ValueError, TypeError):
+    COOLDOWN_NEW_NODE_HOURS = 24.0
+COOLDOWN_NEW_NODE_HOURS = max(0.0, COOLDOWN_NEW_NODE_HOURS)
+COOLDOWN_NEW_NODE_SECONDS = COOLDOWN_NEW_NODE_HOURS * 3600.0
+COOLDOWN_ALLOWLIST: Set[str] = set()
+raw_cooldown_allow = config.get("cooldown_allowlist", [])
+if isinstance(raw_cooldown_allow, (list, tuple, set)):
+    for entry in raw_cooldown_allow:
+        if entry is None:
+            continue
+        COOLDOWN_ALLOWLIST.add(str(entry).strip().lower())
+elif isinstance(raw_cooldown_allow, str):
+    for part in raw_cooldown_allow.split(','):
+        part = part.strip()
+        if part:
+            COOLDOWN_ALLOWLIST.add(part.lower())
+COOLDOWN_THRESHOLD = COOLDOWN_THRESHOLD_BASE
+COOLDOWN_MESSAGES = [
+    "🚦 Mesh speed limit reached—take a breather for a few minutes!",
+    "🧊 Cooling fans engaged. Give the mesh a sec to chill, friend!",
+    "🍋 Too much zest! Let’s squeeze the pauses between messages for a bit.",
+    "🛜 Buffering your enthusiasm. Hang tight before the next dispatch!",
+    "🧵 Thread’s smoking—step back and let it cool down for a moment.",
+    "🥤 Sip break! Hydrate while the radios catch their breath.",
+    "🔧 Wrench check! Pause a few to keep the mesh from rattling apart.",
+    "🎛️ Dial back the chatter a notch so everyone stays loud and clear.",
+]
+
+NODE_FIRST_SEEN: Dict[str, float] = {}
 
 BIBLE_AUTOSCROLL_PENDING: Dict[str, Dict[str, Any]] = {}
 BIBLE_AUTOSCROLL_STATE: Dict[str, Dict[str, Any]] = {}
@@ -877,6 +941,25 @@ for key, value in _raw_channel_names.items():
     except (TypeError, ValueError):
         continue
     CHANNEL_NAME_MAP[idx] = str(value)
+
+
+OFFLINE_WIKI_ENABLED = bool(config.get("offline_wiki_enabled", True))
+_offline_dir = config.get("offline_wiki_dir", "data/offline_wiki")
+OFFLINE_WIKI_DIR = Path(_offline_dir) if _offline_dir else Path("data/offline_wiki")
+_offline_index = config.get("offline_wiki_index")
+OFFLINE_WIKI_INDEX = Path(_offline_index) if _offline_index else OFFLINE_WIKI_DIR / "index.json"
+try:
+    OFFLINE_WIKI_SUMMARY_LIMIT = max(200, int(config.get("offline_wiki_summary_chars", 400)))
+except (TypeError, ValueError):
+    OFFLINE_WIKI_SUMMARY_LIMIT = 400
+try:
+    OFFLINE_WIKI_CONTEXT_LIMIT = max(2000, int(config.get("offline_wiki_context_chars", 40000)))
+except (TypeError, ValueError):
+    OFFLINE_WIKI_CONTEXT_LIMIT = 40000
+OFFLINE_WIKI_STORE = OfflineWikiStore(OFFLINE_WIKI_INDEX, base_dir=OFFLINE_WIKI_DIR) if OFFLINE_WIKI_ENABLED else None
+if OFFLINE_WIKI_STORE and not OFFLINE_WIKI_STORE.is_ready():
+    err = OFFLINE_WIKI_STORE.error_message() or f"Offline wiki index has no entries ({OFFLINE_WIKI_INDEX})."
+    clean_log(err, "⚠️", show_always=True, rate_limit=False)
 
 
 def _channel_display_name(ch_idx: Optional[int]) -> str:
@@ -930,13 +1013,34 @@ def _clear_bible_nav(sender_key: Optional[str]) -> None:
         BIBLE_AUTOSCROLL_STATE.pop(sender_key, None)
 
 
+def _stop_bible_autoscroll(sender_key: Optional[str]) -> bool:
+    if not sender_key:
+        return False
+    stopped = False
+    with BIBLE_AUTOSCROLL_LOCK:
+        state = BIBLE_AUTOSCROLL_STATE.get(sender_key)
+        if state:
+            stop_event = state.get('stop_event')
+            if stop_event and not stop_event.is_set():
+                stop_event.set()
+            BIBLE_AUTOSCROLL_STATE.pop(sender_key, None)
+            stopped = True
+        pending = BIBLE_AUTOSCROLL_PENDING.pop(sender_key, None)
+        if pending:
+            stop_event = pending.get('stop_event')
+            if stop_event and not stop_event.is_set():
+                stop_event.set()
+            stopped = True
+    return stopped
+
+
 def _prepare_bible_autoscroll(sender_key: Optional[str], is_direct: bool, channel_idx: Optional[int]):
     if not sender_key:
         return PendingReply("📖 Auto-scroll isn't available right now.", "/bible autoscroll")
     lang = (PENDING_BIBLE_NAV.get(sender_key, {}).get('language') or LANGUAGE_FALLBACK)
     if not is_direct:
         return PendingReply(
-            translate(lang, 'bible_autoscroll_dm_only', "📖 Auto-scroll works only in direct messages."),
+            translate(lang, 'bible_autoscroll_dm_only', "AutoScroll is only available in DM mode"),
             "/bible autoscroll",
         )
     if sender_key not in PENDING_BIBLE_NAV:
@@ -945,12 +1049,26 @@ def _prepare_bible_autoscroll(sender_key: Optional[str], is_direct: bool, channe
             "/bible autoscroll",
         )
     with BIBLE_AUTOSCROLL_LOCK:
+        existing = BIBLE_AUTOSCROLL_STATE.get(sender_key)
+        if existing and existing.get('stop_event'):
+            existing['stop_event'].set()
+            BIBLE_AUTOSCROLL_STATE.pop(sender_key, None)
+            return PendingReply(
+                translate(lang, 'bible_autoscroll_stop', "⏹️ Auto-scroll paused. Reply 22 later to resume."),
+                "/bible autoscroll",
+            )
+        stop_event = threading.Event()
         BIBLE_AUTOSCROLL_PENDING[sender_key] = {
             'channel_idx': channel_idx,
             'requested_at': time.time(),
+            'stop_event': stop_event,
+        }
+        BIBLE_AUTOSCROLL_STATE[sender_key] = {
+            'running': True,
+            'stop_event': stop_event,
         }
     return PendingReply(
-        translate(lang, 'bible_autoscroll_stop', "⏹️ Auto-scroll paused. Reply 22 later to resume."),
+        translate(lang, 'bible_autoscroll_start', "📖 Auto-scroll activated. Next verses every 12 seconds (30 total). Use /stop to pause early."),
         "/bible autoscroll",
     )
 
@@ -959,8 +1077,75 @@ def _process_bible_autoscroll_request(sender_key: Optional[str], sender_node: Op
     if not sender_key:
         return
     with BIBLE_AUTOSCROLL_LOCK:
-        BIBLE_AUTOSCROLL_PENDING.pop(sender_key, None)
-        BIBLE_AUTOSCROLL_STATE.pop(sender_key, None)
+        request = BIBLE_AUTOSCROLL_PENDING.pop(sender_key, None)
+        state = BIBLE_AUTOSCROLL_STATE.get(sender_key)
+    if not request or not state:
+        return
+    stop_event = request.get('stop_event') or state.get('stop_event')
+    with BIBLE_NAV_LOCK:
+        nav_info = dict(PENDING_BIBLE_NAV.get(sender_key) or {})
+    if not nav_info or not interface_ref or not sender_node:
+        with BIBLE_AUTOSCROLL_LOCK:
+            BIBLE_AUTOSCROLL_STATE.pop(sender_key, None)
+        return
+
+    def worker():
+        try:
+            _run_bible_autoscroll(sender_key, sender_node, interface_ref, nav_info, stop_event, request.get('channel_idx'))
+        finally:
+            with BIBLE_AUTOSCROLL_LOCK:
+                BIBLE_AUTOSCROLL_STATE.pop(sender_key, None)
+
+    thread = threading.Thread(target=worker, name=f"BibleAutoScroll-{sender_key}", daemon=True)
+    with BIBLE_AUTOSCROLL_LOCK:
+        state['thread'] = thread
+    thread.start()
+
+
+def _run_bible_autoscroll(sender_key: str, sender_node: str, interface_ref, nav_info: Dict[str, Any], stop_event: Optional[threading.Event], channel_idx: Optional[int]) -> None:
+    lang = nav_info.get('language') or LANGUAGE_FALLBACK
+    local_state = dict(nav_info)
+    total_sent = 0
+    time.sleep(1)
+    for _ in range(BIBLE_AUTOSCROLL_MAX_CHUNKS):
+        if stop_event and stop_event.is_set():
+            break
+        next_state = _shift_bible_position(local_state, True)
+        if not next_state:
+            break
+        book, chapter, start, end, lang_used, include_header = next_state
+        rendered = _render_bible_passage(book, chapter, start, end, lang_used, include_header=include_header)
+        if not rendered:
+            break
+        text, info = rendered
+        info['span'] = local_state.get('span', end - start)
+        message = _format_bible_nav_message(text)
+        try:
+            send_direct_chunks(interface_ref, message, sender_node, chunk_delay=None)
+        except Exception as exc:
+            clean_log(f"Bible auto-scroll failed: {exc}", "⚠️", show_always=True, rate_limit=False)
+            break
+        local_state.update(info)
+        try:
+            _update_bible_progress(sender_key, info['book'], info['chapter'], info['verse_start'], info['language'], info.get('span', end - start))
+        except Exception:
+            pass
+        with BIBLE_NAV_LOCK:
+            PENDING_BIBLE_NAV[sender_key] = dict(local_state)
+        total_sent += 1
+        if stop_event and stop_event.wait(BIBLE_AUTOSCROLL_INTERVAL):
+            break
+    finished = not (stop_event and stop_event.is_set())
+    if finished:
+        try:
+            send_direct_chunks(interface_ref, translate(lang, 'bible_autoscroll_finished', "📖 Auto-scroll paused after the set of verses. Reply 22 to continue."), sender_node, chunk_delay=None)
+        except Exception:
+            pass
+    else:
+        try:
+            send_direct_chunks(interface_ref, translate(lang, 'bible_autoscroll_stop', "⏹️ Auto-scroll paused. Reply 22 later to resume."), sender_node, chunk_delay=None)
+        except Exception:
+            pass
 
 MESHTASTIC_KB_FILE = config.get("meshtastic_knowledge_file", "data/meshtastic_knowledge.txt")
 try:
@@ -991,6 +1176,22 @@ LOCATION_HISTORY_LOCK = threading.Lock()
 LOCATION_HISTORY_RETENTION = 24 * 3600
 
 
+SAVED_CONTEXT_FILE = Path(config.get("saved_context_file", "data/saved_contexts.json"))
+SAVED_CONTEXT_LOCK = threading.Lock()
+SAVED_CONTEXTS: Dict[str, List[Dict[str, Any]]] = {}
+SAVED_CONTEXT_MAX_CHARS = max(2000, int(config.get("saved_context_max_chars", 12000)))
+SAVED_CONTEXT_SUMMARY_CHARS = max(120, int(config.get("saved_context_summary_chars", 280)))
+SAVED_CONTEXT_SUMMARY_LINES = max(1, int(config.get("saved_context_summary_lines", 4)))
+SAVED_CONTEXT_LIST_LIMIT = max(3, int(config.get("saved_context_list_limit", 20)))
+SAVED_CONTEXT_MAX_PER_USER = max(5, int(config.get("saved_context_max_per_user", 20)))
+SAVED_CONTEXT_TITLE_MAX = max(10, int(config.get("saved_context_title_max", 60)))
+CONTEXT_SESSION_TIMEOUT_SECONDS = max(300, int(config.get("context_session_timeout_seconds", 7200)))
+CONTEXT_SESSION_LOCK = threading.Lock()
+CONTEXT_SESSIONS: Dict[str, Dict[str, Any]] = {}
+PENDING_RECALL_SELECTIONS: Dict[str, Dict[str, Any]] = {}
+PENDING_DELETE_SELECTIONS: Dict[str, Dict[str, Any]] = {}
+
+
 WEATHER_REPORT_FILE = config.get("weather_report_file", "data/weather_reports.json")
 WEATHER_REPORT_LOCK = threading.Lock()
 WEATHER_REPORTS: List[Dict[str, Any]] = []
@@ -998,6 +1199,60 @@ WEATHER_REPORT_MAX_ENTRIES = int(config.get("weather_report_max_entries", 100))
 WEATHER_REPORT_RETENTION = int(config.get("weather_report_retention_seconds", 24 * 3600))
 WEATHER_REPORT_RECENT_WINDOW = int(config.get("weather_report_recent_window", 2 * 3600))
 PENDING_WEATHER_REPORTS: Dict[str, Dict[str, Any]] = {}
+
+
+try:
+    WEB_SEARCH_MAX_RESULTS = max(1, int(config.get("web_search_max_results", 3)))
+except (TypeError, ValueError):
+    WEB_SEARCH_MAX_RESULTS = 3
+
+try:
+    WEB_SEARCH_TIMEOUT = max(3, int(config.get("web_search_timeout", 10)))
+except (TypeError, ValueError):
+    WEB_SEARCH_TIMEOUT = 10
+
+try:
+    WEB_SEARCH_CONTEXT_MAX = max(1, int(config.get("web_search_context_max", 3)))
+except (TypeError, ValueError):
+    WEB_SEARCH_CONTEXT_MAX = 3
+
+WEB_SEARCH_USER_AGENT = str(config.get(
+    "web_search_user_agent",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+))
+
+try:
+    WEB_CRAWL_MAX_PAGES = max(1, int(config.get("web_crawl_max_pages", 100)))
+except (TypeError, ValueError):
+    WEB_CRAWL_MAX_PAGES = 100
+
+try:
+    WEB_CRAWL_MAX_LIMIT = max(WEB_CRAWL_MAX_PAGES, int(config.get("web_crawl_max_limit", 150)))
+except (TypeError, ValueError):
+    WEB_CRAWL_MAX_LIMIT = max(WEB_CRAWL_MAX_PAGES, 150)
+
+WEB_CONTEXT_LOCK = threading.Lock()
+WEB_SEARCH_CONTEXT: Dict[str, deque[str]] = {}
+
+CONTEXT_TRUNCATION_LOCK = threading.Lock()
+CONTEXT_TRUNCATED_SENDERS: Set[str] = set()
+CONTEXT_TRUNCATION_NOTICES: Dict[str, float] = {}
+CONTEXT_TRUNCATION_COOLDOWN = 600  # seconds between user notices
+CONTEXT_TRUNCATION_NOTICE = (
+    "⚠️ Heads-up: I trimmed our chat history to stay within the model limit. "
+    "Use `/reset` if you'd like a fresh start."
+)
+
+DIRECT_URL_RE = re.compile(
+    r"^(?:https?://)?"  # optional scheme
+    r"(?:www\.)?"      # optional www
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"  # first label
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+"  # one or more dot-separated labels
+    r"(?:[/#?].*)?"  # optional path/query/fragment
+    r"$",
+    re.IGNORECASE,
+)
 
 
 
@@ -1050,6 +1305,686 @@ def _public_base_url() -> str:
     except Exception:
         host_part = "localhost"
     return f"http://{host_part}:{SERVER_PORT}"
+
+
+def _store_web_context(sender_key: Optional[str], formatted: str, *, context: Optional[str] = None) -> None:
+    if not sender_key or not formatted:
+        return
+    payload = context if context else formatted
+    if context:
+        payload = f"{formatted}\n\nDetails:\n{context}"
+    with WEB_CONTEXT_LOCK:
+        dq = WEB_SEARCH_CONTEXT.get(sender_key)
+        if dq is None or dq.maxlen != WEB_SEARCH_CONTEXT_MAX:
+            dq = deque(maxlen=WEB_SEARCH_CONTEXT_MAX)
+            WEB_SEARCH_CONTEXT[sender_key] = dq
+        dq.append(payload)
+
+
+def _get_web_context(sender_key: Optional[str]) -> List[str]:
+    if not sender_key:
+        return []
+    with WEB_CONTEXT_LOCK:
+        dq = WEB_SEARCH_CONTEXT.get(sender_key)
+        if not dq:
+            return []
+        return list(dq)
+
+
+def _clear_web_context(sender_key: Optional[str]) -> None:
+    if not sender_key:
+        return
+    with WEB_CONTEXT_LOCK:
+        WEB_SEARCH_CONTEXT.pop(sender_key, None)
+
+
+_DDG_HTML_TITLE_RE = re.compile(r'<a rel="nofollow" class="result__a" href="(.*?)">(.*?)</a>', re.S)
+_DDG_HTML_SNIPPET_RE = re.compile(r'<a class="result__snippet"[^>]*>(.*?)</a>', re.S)
+
+
+def _strip_html_tags(raw: str) -> str:
+    if not raw:
+        return ""
+    cleaned = re.sub(r"<script[^>]*?>.*?</script>", "", raw, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"<style[^>]*?>.*?</style>", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<[^>]+>", "", cleaned)
+    return html.unescape(text).strip()
+
+
+def _extract_direct_url(query: str) -> Optional[str]:
+    if not query:
+        return None
+    cleaned = query.strip().strip('"')
+    if not cleaned:
+        return None
+    tokens = cleaned.split()
+    candidate = cleaned if len(tokens) == 1 else tokens[0]
+    candidate = candidate.strip()
+    if candidate.startswith("/") and not candidate.startswith("//"):
+        # handle accidental leading slash like "/www.example.com"
+        candidate = candidate.lstrip("/")
+    if not DIRECT_URL_RE.match(candidate):
+        return None
+    if not candidate.startswith(("http://", "https://")):
+        candidate = f"https://{candidate}"
+    return candidate
+
+
+def _fetch_url_preview(url: str, *, timeout: Optional[int] = None) -> List[Dict[str, str]]:
+    headers = {
+        "User-Agent": WEB_SEARCH_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    try:
+        response = requests.get(url, timeout=timeout or WEB_SEARCH_TIMEOUT, headers=headers, allow_redirects=True)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError("offline") from exc
+    except Exception as exc:
+        raise RuntimeError(f"web fetch failed: {exc}") from exc
+
+    final_url = response.url or url
+    content_type = response.headers.get("Content-Type", "").lower()
+    text = ""
+    if "text" in content_type or content_type == "":
+        text = response.text
+    elif "json" in content_type:
+        try:
+            text = json.dumps(response.json(), indent=2)
+        except Exception:
+            text = response.text
+    else:
+        return [{
+            "title": final_url,
+            "url": final_url,
+            "snippet": f"Content type {content_type} fetched successfully.",
+        }]
+
+    title_match = re.search(r"<title>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
+    title = _strip_html_tags(title_match.group(1)) if title_match else final_url
+
+    body_text = _strip_html_tags(text)
+    snippet = " ".join(body_text.split())
+    if len(snippet) > 360:
+        snippet = snippet[:357].rstrip() + "…"
+    if not snippet:
+        snippet = "(No preview text available.)"
+
+    return [{
+        "title": title or final_url,
+        "url": final_url,
+        "snippet": snippet,
+    }]
+
+
+def _normalize_ddg_url(raw_url: str) -> str:
+    if not raw_url:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(raw_url)
+    except Exception:
+        return raw_url
+
+    host = (parsed.netloc or "").lower()
+    path = parsed.path or ""
+
+    if host.endswith("duckduckgo.com"):
+        if path.startswith("/l/"):
+            try:
+                qs = urllib.parse.parse_qs(parsed.query)
+                uddg = qs.get("uddg")
+                if uddg:
+                    return urllib.parse.unquote(uddg[0])
+            except Exception:
+                pass
+        # Sponsored / tracking results we should ignore
+        if path.startswith("/y.js") or path.startswith("/lite/duckduckgo.js"):
+            return ""
+        if not path.startswith("/l/"):
+            return ""
+    return raw_url
+
+
+def _duckduckgo_html_fallback(query: str, max_results: int) -> List[Dict[str, str]]:
+    """Scrape the DuckDuckGo lite HTML endpoint as a fallback."""
+    try:
+        response = requests.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": query},
+            headers={
+                "User-Agent": WEB_SEARCH_USER_AGENT,
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=WEB_SEARCH_TIMEOUT,
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError("offline") from exc
+    except Exception as exc:
+        raise RuntimeError(f"web search failed: {exc}") from exc
+
+    text = response.text
+    titles = _DDG_HTML_TITLE_RE.findall(text)
+    snippets = _DDG_HTML_SNIPPET_RE.findall(text)
+    results: List[Dict[str, str]] = []
+
+    for idx, (url, title_html) in enumerate(titles):
+        title_clean = _strip_html_tags(title_html)
+        if not title_clean:
+            continue
+        normalized_url = _normalize_ddg_url(html.unescape(url.strip()))
+        if not normalized_url:
+            continue
+        snippet_html = snippets[idx] if idx < len(snippets) else ""
+        snippet_clean = _strip_html_tags(snippet_html)
+        if len(snippet_clean) > 220:
+            snippet_clean = snippet_clean[:217].rstrip() + "…"
+        results.append({
+            "title": title_clean,
+            "url": normalized_url,
+            "snippet": snippet_clean,
+        })
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def _web_search_duckduckgo(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS) -> List[Dict[str, str]]:
+    params = {
+        "q": query,
+        "format": "json",
+        "no_redirect": 1,
+        "no_html": 1,
+        "skip_disambig": 1,
+    }
+    api_exception: Optional[Exception] = None
+    results: List[Dict[str, str]] = []
+
+    try:
+        response = requests.get(
+            "https://api.duckduckgo.com/",
+            params=params,
+            timeout=WEB_SEARCH_TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        def add_result(title: Optional[str], url: Optional[str], snippet: Optional[str]) -> None:
+            if not url or not title:
+                return
+            title_clean = title.strip()
+            if not title_clean:
+                return
+            snippet_clean = (snippet or "").strip()
+            for existing in results:
+                if existing.get("url") == url:
+                    return
+            results.append({
+                "title": title_clean,
+                "url": url.strip(),
+                "snippet": snippet_clean,
+            })
+
+        add_result(data.get("Heading") or data.get("AbstractText"), data.get("AbstractURL"), data.get("AbstractText"))
+
+        for item in data.get("Results", []) or []:
+            add_result(item.get("Text"), item.get("FirstURL"), item.get("Text"))
+
+        def extract_topics(topics) -> None:
+            for topic in topics or []:
+                if not isinstance(topic, dict):
+                    continue
+                if topic.get("Topics"):
+                    extract_topics(topic.get("Topics"))
+                    continue
+                add_result(topic.get("Text"), topic.get("FirstURL"), topic.get("Text"))
+
+        extract_topics(data.get("RelatedTopics"))
+    except requests.exceptions.RequestException as exc:
+        api_exception = exc
+    except Exception as exc:
+        raise RuntimeError(f"web search failed: {exc}") from exc
+
+    if results:
+        return results[:max_results]
+
+    try:
+        fallback_results = _duckduckgo_html_fallback(query, max_results)
+    except RuntimeError as fallback_exc:
+        if str(fallback_exc) == "offline":
+            root_exc = api_exception if api_exception is not None else fallback_exc
+            raise RuntimeError("offline") from root_exc
+        raise
+
+    if fallback_results:
+        return fallback_results[:max_results]
+
+    if api_exception is not None:
+        raise RuntimeError("offline") from api_exception
+
+    return []
+
+
+def _format_web_results(query: str, results: List[Dict[str, str]]) -> str:
+    if not results:
+        return f"🔍 No web results found for “{query}”."
+
+    lines = [f"🔍 Web results for “{query}”:" ]
+    for idx, item in enumerate(results, 1):
+        title = item.get("title") or "Untitled"
+        url = item.get("url") or ""
+        snippet = (item.get("snippet") or "").replace("\n", " ").strip()
+        if len(snippet) > 200:
+            snippet = snippet[:197].rstrip() + "…"
+        host = ""
+        if url:
+            try:
+                parsed = urllib.parse.urlparse(url)
+                host = parsed.netloc
+            except Exception:
+                host = ""
+        heading = f"{idx}. {title}"
+        if host:
+            heading += f" [{host}]"
+        lines.append(heading)
+        if snippet:
+            lines.append(f"   {snippet}")
+    return "\n".join(lines)
+
+
+def _context_from_results(query: str, results: List[Dict[str, str]]) -> str:
+    if not results:
+        return f"No additional context for {query}."
+    lines = [f"Source: {query}"]
+    for idx, item in enumerate(results, 1):
+        title = item.get("title") or "Untitled"
+        url = item.get("url") or ""
+        snippet = (item.get("snippet") or "").strip()
+        lines.append(f"[{idx}] {title}")
+        if url:
+            lines.append(f"URL: {url}")
+        if snippet:
+            detail = snippet if len(snippet) <= 800 else snippet[:797].rstrip() + "…"
+            lines.append(detail)
+    return "\n".join(lines)
+
+
+def _crawl_website(start_url: str, max_pages: int = WEB_CRAWL_MAX_PAGES) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], Optional[Dict[str, str]]]:
+    headers = {
+        "User-Agent": WEB_SEARCH_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    normalized_start = _extract_direct_url(start_url) or start_url
+    parsed_start = urllib.parse.urlparse(normalized_start)
+    base_host = parsed_start.netloc.lower()
+    if not base_host:
+        raise RuntimeError("crawl requires a valid domain")
+
+    max_pages = max(1, min(max_pages, WEB_CRAWL_MAX_LIMIT))
+    queue_urls: deque[str] = deque([normalized_start])
+    seen: Set[str] = set()
+    pages: List[Dict[str, str]] = []
+    email_pattern = re.compile(r'[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}', re.IGNORECASE)
+    phone_pattern = re.compile(r'(?:\+\d{1,3}\s*)?(?:\(\d{2,4}\)|\d{2,4})[\s.-]?\d{3}[\s.-]?\d{4}', re.IGNORECASE)
+    contact_records: List[Dict[str, str]] = []
+    seen_contacts: Set[Tuple[str, str]] = set()
+    contact_page_info: Optional[Dict[str, str]] = None
+
+    def _within_scope(netloc: str) -> bool:
+        netloc = netloc.lower()
+        return netloc == base_host or netloc.endswith('.' + base_host)
+
+    while queue_urls and len(pages) < max_pages:
+        current = queue_urls.popleft()
+        if current in seen:
+            continue
+        seen.add(current)
+        try:
+            response = requests.get(current, headers=headers, timeout=WEB_SEARCH_TIMEOUT, allow_redirects=True)
+            response.raise_for_status()
+        except requests.exceptions.RequestException as exc:
+            if not pages:
+                raise RuntimeError("offline") from exc
+            clean_log(f"Crawl skipped {current}: {exc}", "⚠️", show_always=False)
+            continue
+        except Exception as exc:
+            clean_log(f"Crawl error fetching {current}: {exc}", "⚠️", show_always=False)
+            continue
+
+        final_url = response.url or current
+        parsed_final = urllib.parse.urlparse(final_url)
+        if not _within_scope(parsed_final.netloc):
+            continue
+
+        html_text = response.text
+        title_match = re.search(r"<title>(.*?)</title>", html_text, re.IGNORECASE | re.DOTALL)
+        title = _strip_html_tags(title_match.group(1)) if title_match else final_url
+        body_text = _strip_html_tags(html_text)
+        snippet = " ".join(body_text.split())
+        if len(snippet) > 360:
+            snippet = snippet[:357].rstrip() + "…"
+        url_lower = final_url.lower()
+        title_lower = title.lower()
+        is_contact_page = any(keyword in url_lower for keyword in ("/contact", "contact-", "contact?", "contacto")) or "contact" in title_lower or "contacto" in title_lower
+        if is_contact_page and not contact_page_info:
+            contact_page_info = {
+                "url": final_url,
+                "title": title,
+                "snippet": snippet,
+            }
+        emails_found = email_pattern.findall(body_text)
+        phones_found = phone_pattern.findall(body_text)
+        for email in emails_found:
+            contact_key = ("email", email.lower())
+            if contact_key in seen_contacts:
+                continue
+            seen_contacts.add(contact_key)
+            contact_records.append({
+                "type": "Email",
+                "value": email.strip(),
+                "source": final_url,
+                "title": title,
+            })
+        for phone in phones_found:
+            normalized_phone = re.sub(r"\s+", " ", phone.strip())
+            contact_key = ("phone", normalized_phone)
+            if contact_key in seen_contacts:
+                continue
+            seen_contacts.add(contact_key)
+            contact_records.append({
+                "type": "Phone",
+                "value": normalized_phone,
+                "source": final_url,
+                "title": title,
+            })
+
+        pages.append({
+            "url": final_url,
+            "title": title,
+            "snippet": snippet,
+            "is_contact": is_contact_page,
+        })
+
+        if len(pages) >= max_pages:
+            break
+
+        link_candidates = re.findall(r'href=["\'](.*?)["\']', html_text, re.IGNORECASE)
+        for href in link_candidates:
+            href = html.unescape(href.strip())
+            if not href or href.startswith('#'):
+                continue
+            if href.lower().startswith('mailto:'):
+                email = href.split(':', 1)[1].strip()
+                if email:
+                    contact_key = ("email", email.lower())
+                    if contact_key not in seen_contacts:
+                        seen_contacts.add(contact_key)
+                        contact_records.append({
+                            "type": "Email",
+                            "value": email,
+                            "source": final_url,
+                            "title": title,
+                        })
+                continue
+            if href.lower().startswith('javascript:'):
+                continue
+            joined = urllib.parse.urljoin(final_url, href)
+            parsed_joined = urllib.parse.urlparse(joined)
+            if parsed_joined.scheme not in {"http", "https"}:
+                continue
+            if not _within_scope(parsed_joined.netloc):
+                continue
+            if joined not in seen and joined not in queue_urls:
+                if 'contact' in joined.lower() or 'contacto' in joined.lower():
+                    queue_urls.appendleft(joined)
+                else:
+                    queue_urls.append(joined)
+
+    return pages, contact_records, contact_page_info
+
+
+def _format_crawl_results(start_url: str, pages: List[Dict[str, str]], contacts: List[Dict[str, str]], contact_page: Optional[Dict[str, str]]) -> str:
+    if not pages:
+        return f"🕸️ Crawl of {start_url} returned no pages."
+
+    parsed = urllib.parse.urlparse(start_url)
+    host = parsed.netloc or start_url
+    total_pages = len(pages)
+
+    summary_line = f"🕸️ Crawl {host} — {total_pages} page{'s' if total_pages != 1 else ''} scanned."
+
+    if contact_page:
+        contact_parsed = urllib.parse.urlparse(contact_page.get("url", ""))
+        contact_path = contact_parsed.path or "/"
+        if contact_parsed.query:
+            contact_path += f"?{contact_parsed.query}"
+        summary_line += f" Contact page: {contact_path}."
+    else:
+        summary_line += " Contact page not found."
+
+    contact_summary: str
+    if contacts:
+        contact_page_url = contact_page.get("url") if contact_page else None
+        ordered_contacts = sorted(
+            contacts,
+            key=lambda c: 0 if contact_page_url and c.get("source") == contact_page_url else 1,
+        )
+        contact_values: List[str] = []
+        seen_values: Set[str] = set()
+        for contact in ordered_contacts:
+            value = (contact.get("value") or "").strip()
+            if not value:
+                continue
+            if value.lower() in seen_values:
+                continue
+            seen_values.add(value.lower())
+            label = contact.get("type") or "Contact"
+            contact_values.append(f"{label}: {value}")
+            if len("; ".join(contact_values)) > 200:
+                break
+        if contact_values:
+            contact_summary = "📇 Contacts: " + "; ".join(contact_values)
+        else:
+            contact_summary = "📇 Contacts: (found but filtered)"
+    else:
+        contact_summary = "📇 Contacts: none detected"
+
+    message = f"{summary_line}\n{contact_summary}".strip()
+    if len(message) > 400:
+        message = message[:397].rstrip() + "…"
+    return message
+
+
+def _context_from_crawl(start_url: str, pages: List[Dict[str, str]], contacts: List[Dict[str, str]], contact_page: Optional[Dict[str, str]]) -> str:
+    if not pages and not contacts:
+        return f"No crawl context gathered for {start_url}."
+    lines = [f"Crawl context for {start_url}"]
+    for idx, page in enumerate(pages, 1):
+        title = page.get("title") or "(untitled)"
+        url = page.get("url") or ""
+        snippet = page.get("snippet") or ""
+        lines.append(f"[{idx}] {title}")
+        if url:
+            lines.append(f"URL: {url}")
+        if snippet:
+            detail = snippet if len(snippet) <= 1000 else snippet[:997].rstrip() + "…"
+            lines.append(detail)
+    if contacts:
+        lines.append("Contacts:")
+        for contact in contacts:
+            ctype = contact.get("type") or "Contact"
+            value = contact.get("value") or ""
+            source = contact.get("source") or ""
+            title = contact.get("title") or ""
+            line = f"- {ctype}: {value}"
+            if title:
+                line += f" ({title})"
+            if source:
+                line += f" <{source}>"
+            lines.append(line)
+    if contact_page:
+        lines.append("Contact page detail:")
+        if contact_page.get("url"):
+            lines.append(contact_page["url"])
+        snippet = contact_page.get("snippet")
+        if snippet:
+            lines.append(snippet)
+    return "\n".join(lines)
+
+
+try:
+    WIKI_MAX_CHARS = max(20000, int(config.get("wiki_max_chars", 160000)))
+except (TypeError, ValueError):
+    WIKI_MAX_CHARS = 160000
+
+try:
+    WIKI_SUMMARY_CHAR_LIMIT = max(200, int(config.get("wiki_summary_char_limit", 400)))
+except (TypeError, ValueError):
+    WIKI_SUMMARY_CHAR_LIMIT = 400
+
+
+def _fetch_wikipedia_article(topic: str, max_chars: int = WIKI_MAX_CHARS) -> Dict[str, str]:
+    headers = {
+        "User-Agent": WEB_SEARCH_USER_AGENT,
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    params = {
+        "action": "query",
+        "prop": "extracts|info",
+        "explaintext": 1,
+        "exsectionformat": "plain",
+        "exlimit": 1,
+        "exchars": max_chars,
+        "redirects": 1,
+        "inprop": "url",
+        "format": "json",
+        "formatversion": 2,
+        "titles": topic,
+    }
+    try:
+        response = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params=params,
+            headers=headers,
+            timeout=max(WEB_SEARCH_TIMEOUT, 15),
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError("offline") from exc
+    except Exception as exc:
+        raise RuntimeError(f"wiki failed: {exc}") from exc
+
+    data = response.json()
+    pages = (data.get("query", {}).get("pages") or [])
+    if not pages:
+        raise RuntimeError("wiki_missing")
+    page = pages[0]
+    if page.get("missing"):
+        raise RuntimeError("wiki_missing")
+
+    title = page.get("title") or topic
+    extract = (page.get("extract") or "").strip()
+    if not extract:
+        summary_resp = None
+        try:
+            summary_resp = requests.get(
+                f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title.replace(' ', '_'))}",
+                headers=headers,
+                timeout=max(WEB_SEARCH_TIMEOUT, 15),
+            )
+            summary_resp.raise_for_status()
+            summary_data = summary_resp.json()
+            extract = (summary_data.get("extract") or "").strip()
+        except requests.exceptions.RequestException:
+            raise RuntimeError("wiki_missing")
+        except Exception:
+            raise RuntimeError("wiki_missing")
+
+    if not extract:
+        raise RuntimeError("wiki_missing")
+
+    if len(extract) > max_chars:
+        extract = extract[:max_chars].rstrip()
+
+    summary = extract.split('\n', 1)[0].strip()
+    if not summary:
+        summary = extract[:WIKI_SUMMARY_CHAR_LIMIT].strip()
+
+    canonical_url = page.get("fullurl") or page.get("canonicalurl")
+    if not canonical_url:
+        canonical_url = f"https://en.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
+
+    return {
+        "title": title,
+        "summary": summary,
+        "extract": extract,
+        "url": canonical_url,
+    }
+
+
+def _format_wiki_summary(article: Dict[str, str]) -> str:
+    title = article.get("title") or "Wikipedia"
+    summary = article.get("summary") or "No summary available."
+    summary = summary.replace('\n', ' ')
+    if len(summary) > WIKI_SUMMARY_CHAR_LIMIT:
+        summary = summary[: WIKI_SUMMARY_CHAR_LIMIT - 1].rstrip() + "…"
+    return f"📚 Wikipedia: {title} — {summary}"
+
+
+def _format_wiki_context(article: Dict[str, str]) -> str:
+    lines = [
+        f"Wikipedia article: {article.get('title')}",
+        article.get("url", ""),
+        article.get("extract", ""),
+    ]
+    return "\n".join(line for line in lines if line).strip()
+
+
+def _fetch_drudge_headlines(max_items: int = 5) -> List[Dict[str, str]]:
+    headers = {
+        "User-Agent": WEB_SEARCH_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    try:
+        response = requests.get("https://www.drudgereport.com/", headers=headers, timeout=WEB_SEARCH_TIMEOUT)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError("offline") from exc
+    except Exception as exc:
+        raise RuntimeError(f"drudge fetch failed: {exc}") from exc
+
+    html_text = response.text
+    # Drudge uses uppercase text frequently; capture headline anchors
+    anchor_re = re.compile(r'<a[^>]+href="(.*?)"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+    headlines: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+
+    for match in anchor_re.finditer(html_text):
+        url, label_html = match.groups()
+        title = _strip_html_tags(label_html)
+        title = " ".join(title.split())
+        if not title or len(title) < 4:
+            continue
+        if title.lower().startswith("advertisement"):
+            continue
+        norm_url = url.strip()
+        if norm_url.lower().startswith("javascript:"):
+            continue
+        if not norm_url.startswith("http"):
+            norm_url = urllib.parse.urljoin("https://www.drudgereport.com/", norm_url)
+        key = title.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        headlines.append({"title": title, "url": norm_url})
+        if len(headlines) >= max_items:
+            break
+
+    return headlines
 
 
 
@@ -1186,6 +2121,7 @@ SYSTEM_PROMPT = config.get("system_prompt", "You are a helpful assistant respond
 OLLAMA_URL = config.get("ollama_url", "http://localhost:11434/api/generate")
 OLLAMA_MODEL = config.get("ollama_model", "llama3.2:1b")
 OLLAMA_TIMEOUT = config.get("ollama_timeout", 120)
+OLLAMA_STREAM = bool(config.get("ollama_stream", True))
 # Max characters of conversation history to include in prompts for Ollama
 try:
     OLLAMA_CONTEXT_CHARS = int(config.get("ollama_context_chars", 4000))
@@ -1218,6 +2154,81 @@ except (ValueError, TypeError):
 MAIL_SEARCH_NUM_CTX = max(1024, min(MAIL_SEARCH_NUM_CTX, OLLAMA_NUM_CTX))
 
 try:
+    MAILBOX_MAX_MESSAGES = int(config.get("mailbox_max_messages", 10))
+except (ValueError, TypeError):
+    MAILBOX_MAX_MESSAGES = 10
+MAILBOX_MAX_MESSAGES = max(1, MAILBOX_MAX_MESSAGES)
+
+MAIL_SECURITY_FILE = config.get("mail_security_file", "data/mail_security.json")
+try:
+    MAIL_FOLLOW_UP_DELAY = float(config.get("mail_follow_up_delay", 10.0))
+except (ValueError, TypeError):
+    MAIL_FOLLOW_UP_DELAY = 10.0
+MAIL_FOLLOW_UP_DELAY = max(0.0, MAIL_FOLLOW_UP_DELAY)
+
+MAIL_NOTIFY_ENABLED = bool(config.get("mail_notify_enabled", True))
+try:
+    MAIL_NOTIFY_REMINDER_HOURS = float(config.get("mail_notify_reminder_hours", 3.0))
+except (ValueError, TypeError):
+    MAIL_NOTIFY_REMINDER_HOURS = 3.0
+MAIL_NOTIFY_REMINDER_HOURS = max(0.1, MAIL_NOTIFY_REMINDER_HOURS)
+try:
+    MAIL_NOTIFY_EXPIRY_HOURS = float(config.get("mail_notify_expiry_hours", 72.0))
+except (ValueError, TypeError):
+    MAIL_NOTIFY_EXPIRY_HOURS = 72.0
+MAIL_NOTIFY_EXPIRY_HOURS = max(MAIL_NOTIFY_REMINDER_HOURS, MAIL_NOTIFY_EXPIRY_HOURS)
+try:
+    MAIL_NOTIFY_MAX_REMINDERS = int(config.get(
+        "mail_notify_max_reminders",
+        max(1, int(MAIL_NOTIFY_EXPIRY_HOURS // MAIL_NOTIFY_REMINDER_HOURS)),
+    ))
+except (ValueError, TypeError):
+    MAIL_NOTIFY_MAX_REMINDERS = max(1, int(MAIL_NOTIFY_EXPIRY_HOURS // MAIL_NOTIFY_REMINDER_HOURS))
+MAIL_NOTIFY_MAX_REMINDERS = max(1, MAIL_NOTIFY_MAX_REMINDERS)
+MAIL_NOTIFY_INCLUDE_SELF = bool(config.get("mail_notify_include_self", False))
+MAIL_NOTIFY_HEARTBEAT_ONLY = bool(config.get("mail_notify_heartbeat_only", True))
+
+MAIL_NOTIFY_REMINDER_SECONDS = MAIL_NOTIFY_REMINDER_HOURS * 3600.0
+MAIL_NOTIFY_EXPIRY_SECONDS = MAIL_NOTIFY_EXPIRY_HOURS * 3600.0
+
+try:
+    NOTIFY_ACTIVE_START_HOUR = int(config.get("notify_active_start_hour", 9))
+except (ValueError, TypeError):
+    NOTIFY_ACTIVE_START_HOUR = 9
+try:
+    NOTIFY_ACTIVE_END_HOUR = int(config.get("notify_active_end_hour", 20))
+except (ValueError, TypeError):
+    NOTIFY_ACTIVE_END_HOUR = 20
+NOTIFY_ACTIVE_START_HOUR = max(0, min(23, NOTIFY_ACTIVE_START_HOUR))
+NOTIFY_ACTIVE_END_HOUR = max(0, min(23, NOTIFY_ACTIVE_END_HOUR))
+
+
+def _within_notification_window(ts: Optional[datetime] = None) -> bool:
+    ts = ts or datetime.now()
+    start = NOTIFY_ACTIVE_START_HOUR % 24
+    end = NOTIFY_ACTIVE_END_HOUR % 24
+    hour = ts.hour + ts.minute / 60.0
+    if start == end:
+        return True  # no quiet period configured
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
+try:
+    OLLAMA_NUM_THREAD = int(config.get("ollama_num_thread", 0))
+except (ValueError, TypeError):
+    OLLAMA_NUM_THREAD = 0
+
+if OLLAMA_NUM_THREAD <= 0:
+    cpu_count = os.cpu_count() or 1
+    if cpu_count >= 4:
+        OLLAMA_NUM_THREAD = max(2, cpu_count // 2)
+    else:
+        OLLAMA_NUM_THREAD = cpu_count
+
+OLLAMA_LOW_VRAM = bool(config.get("ollama_low_vram", True))
+
+try:
     SEND_RATE_WINDOW_SECONDS = max(1, int(config.get("send_rate_window_seconds", 5)))
 except (TypeError, ValueError):
     SEND_RATE_WINDOW_SECONDS = 5
@@ -1248,6 +2259,7 @@ def check_send_rate_limit() -> bool:
 
 MAIL_MANAGER = MailManager(
     store_path="mesh_mailboxes.json",
+    security_path=MAIL_SECURITY_FILE,
     clean_log=clean_log,
     ai_log=ai_log,
     ollama_url=OLLAMA_URL or None,
@@ -1255,6 +2267,14 @@ MAIL_MANAGER = MailManager(
     search_timeout=MAIL_SEARCH_TIMEOUT,
     search_num_ctx=MAIL_SEARCH_NUM_CTX,
     search_max_messages=MAIL_SEARCH_MAX_MESSAGES,
+    message_limit=MAILBOX_MAX_MESSAGES,
+    follow_up_delay=MAIL_FOLLOW_UP_DELAY,
+    notify_enabled=MAIL_NOTIFY_ENABLED,
+    reminder_interval_seconds=MAIL_NOTIFY_REMINDER_SECONDS,
+    reminder_expiry_seconds=MAIL_NOTIFY_EXPIRY_SECONDS,
+    reminder_max_count=MAIL_NOTIFY_MAX_REMINDERS,
+    include_self_notifications=MAIL_NOTIFY_INCLUDE_SELF,
+    heartbeat_only=MAIL_NOTIFY_HEARTBEAT_ONLY,
 )
 
 GAME_MANAGER = GameManager(
@@ -1505,11 +2525,13 @@ def build_system_prompt_for_sender(sender_id: Any) -> str:
     segments = [base]
     persona_id: Optional[str] = None
     prompt_override: Optional[str] = None
+    web_context: List[str] = []
     if sender_id is not None:
         sender_key = _safe_sender_key(sender_id)
         prefs = _get_user_ai_preferences(sender_key)
         persona_id = prefs.get("personality_id")
         prompt_override = prefs.get("prompt_override")
+        web_context = _get_web_context(sender_key)
     else:
         persona_id = _default_personality_id()
     if persona_id and persona_id in AI_PERSONALITY_MAP:
@@ -1518,6 +2540,8 @@ def build_system_prompt_for_sender(sender_id: Any) -> str:
             segments.append(persona_prompt)
     if prompt_override:
         segments.append(prompt_override)
+    if web_context:
+        segments.append("Recent web findings:\n" + "\n".join(web_context))
     joined = "\n\n".join(part for part in segments if part)
     return joined or base
 
@@ -1553,39 +2577,87 @@ def _format_personality_summary(sender_key: Optional[str]) -> str:
         lines.append("Custom prompt: active.")
     else:
         lines.append("Custom prompt: none.")
-    lines.append("Commands: set <name> | prompt <text> | prompt clear | reset")
-    lines.append("Browse vibes with /changevibe.")
+    lines.append("Commands: /vibe prompt <text> | /vibe prompt clear | /vibe reset")
+    lines.append("Send /vibe in a DM to pick a new vibe.")
     return "\n".join(lines)
 
+def _start_vibe_menu(sender_key: Optional[str]) -> PendingReply:
+    if not sender_key:
+        return PendingReply("⚠️ I couldn't identify your DM session. Try again in a moment.", "/vibe menu")
 
-PERSONALITY_PAGE_SIZE = 5
+    prefs = _get_user_ai_preferences(sender_key)
+    current = prefs.get("personality_id")
+    persona_current = AI_PERSONALITY_MAP.get(current, {}) if current else None
+    current_name = persona_current.get("name") if persona_current else "Default"
+    current_emoji = persona_current.get("emoji") if persona_current else "🧠"
+    lines = [f"{current_emoji} Current vibe: {current_name}", ""]
+    lines.append("🎛️ Pick a vibe:")
 
-
-def _format_personality_list(current_id: Optional[str], page: int = 1) -> str:
-    total = len(AI_PERSONALITY_ORDER)
-    if total == 0:
-        return "No vibes configured."
-    max_page = max(1, (total + PERSONALITY_PAGE_SIZE - 1) // PERSONALITY_PAGE_SIZE)
-    page = max(1, min(page, max_page))
-    start = (page - 1) * PERSONALITY_PAGE_SIZE
-    end = start + PERSONALITY_PAGE_SIZE
-
-    entries: List[str] = []
-    for persona_id in AI_PERSONALITY_ORDER[start:end]:
+    mapping: List[str] = []
+    for idx, persona_id in enumerate(AI_PERSONALITY_ORDER, 1):
         persona = AI_PERSONALITY_MAP.get(persona_id, {})
         name = persona.get("name") or persona_id
         emoji = persona.get("emoji") or "🧠"
-        highlight = "⭐" if persona_id == current_id else ""
-        entries.append(f"{emoji} {name}{highlight}")
+        description = persona.get("description") or ""
+        marker = " (current)" if persona_id == current else ""
+        summary = textwrap.shorten(description, width=70, placeholder="…") if description else ""
+        label = f"{idx}. {emoji} {name}{marker}"
+        if summary:
+            label = f"{label} — {summary}"
+        lines.append(label)
+        mapping.append(persona_id)
 
-    lines: List[str] = [f"Vibes {page}/{max_page}: {', '.join(entries)}"]
-    lines.append("Set with `/aipersonality set <name>`.")
-    if max_page > 1:
-        if page < max_page:
-            lines.append(f"More: `/changevibe {page + 1}`")
-        else:
-            lines.append("Back to start: `/changevibe 1`")
-    return "\n".join(lines)
+    lines.append("Reply with the number to switch vibes, or X to cancel.")
+    lines.append("Extras: /vibe prompt <text>, /vibe prompt clear, /vibe reset.")
+
+    PENDING_VIBE_SELECTIONS[sender_key] = {
+        'ids': mapping,
+        'created': _now(),
+    }
+    return PendingReply("\n".join(lines), "/vibe menu")
+
+
+def _handle_pending_vibe_selection(sender_key: str, text: str) -> Optional[PendingReply]:
+    pending = PENDING_VIBE_SELECTIONS.get(sender_key)
+    if not pending:
+        return None
+    if (_now() - pending.get('created', 0.0)) > VIBE_MENU_TIMEOUT:
+        PENDING_VIBE_SELECTIONS.pop(sender_key, None)
+        return PendingReply("⏱️ Vibe menu expired. Send `/vibe` to open it again.", "/vibe menu")
+
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+
+    lower = cleaned.lower()
+    if lower in {'x', 'cancel', 'exit'}:
+        PENDING_VIBE_SELECTIONS.pop(sender_key, None)
+        return PendingReply("👍 No vibe changes made.", "/vibe menu")
+
+    if not cleaned.isdigit():
+        PENDING_VIBE_SELECTIONS.pop(sender_key, None)
+        return None
+
+    choice = int(cleaned)
+    ids = pending.get('ids', [])
+    if choice < 1 or choice > len(ids):
+        PENDING_VIBE_SELECTIONS.pop(sender_key, None)
+        return PendingReply("That number isn't available. Send `/vibe` again to pick from the list.", "/vibe menu")
+
+    persona_id = ids[choice - 1]
+    if not _set_user_personality(sender_key, persona_id):
+        PENDING_VIBE_SELECTIONS.pop(sender_key, None)
+        return PendingReply("⚠️ Couldn't apply that vibe. Try again in a moment.", "/vibe menu")
+
+    PENDING_VIBE_SELECTIONS.pop(sender_key, None)
+    persona = AI_PERSONALITY_MAP.get(persona_id, {})
+    emoji = persona.get("emoji") or "🧠"
+    name = persona.get("name") or persona_id
+    description = persona.get("description") or ""
+    lines = [f"{emoji} Vibe set to {name} ({persona_id})."]
+    if description:
+        lines.append(description)
+    return PendingReply("\n".join(lines), "/vibe menu")
 
 
 HOME_ASSISTANT_URL = config.get("home_assistant_url", "")
@@ -1602,6 +2674,35 @@ MAX_CHUNK_SIZE = config.get("chunk_size", 200)
 MAX_CHUNKS = 5
 CHUNK_DELAY = config.get("chunk_buffer_seconds", config.get("chunk_delay", 4))
 MAX_RESPONSE_LENGTH = MAX_CHUNK_SIZE * MAX_CHUNKS
+
+
+@dataclass
+class StreamingResult:
+    """Represents an Ollama response that was streamed out as it was generated."""
+
+    text: str
+    sent_chunks: int = 0
+    truncated: bool = False
+
+    @property
+    def already_sent(self) -> bool:
+        return self.sent_chunks > 0
+
+
+def _normalize_ai_response(resp) -> Tuple[Optional[str], Optional[PendingReply], bool]:
+    """Return response text, pending reply object, and whether it was already sent via streaming."""
+
+    if resp is None:
+        return None, None, False
+    if isinstance(resp, PendingReply):
+        text = resp.text if resp.text is not None else ""
+        return text, resp, False
+    if isinstance(resp, StreamingResult):
+        return resp.text or "", None, resp.already_sent
+    if isinstance(resp, str):
+        return resp, None, False
+    # Fallback string conversion for unexpected types
+    return str(resp), None, False
 LOCAL_LOCATION_STRING = config.get("local_location_string", "Unknown Location")
 AI_NODE_NAME = config.get("ai_node_name", "AI-Bot")
 FORCE_NODE_NUM = config.get("force_node_num", None)
@@ -2045,6 +3146,214 @@ def _get_chapter_length(book: str, chapter: int, preferred_language: str = 'en')
     return len(chapters[chapter - 1]), lang or preferred_language
 
 
+def _resolve_book_chapters(book: str, preferred_language: str = 'en') -> Tuple[Optional[str], List[List[str]]]:
+    books, lang = _get_books_and_language(book, preferred_language)
+    if not books or book not in books:
+        books, lang = _get_books_and_language(book, 'en')
+        if not books or book not in books:
+            return None, []
+    chapters = books.get(book) or []
+    return (lang or preferred_language), chapters
+
+
+def _format_bible_nav_message(text: str) -> str:
+    """Append the navigation hint without forcing a new chunk."""
+    if not text:
+        return text
+
+    suffix_newline = "\n<1,2>"
+    if len(text) + len(suffix_newline) <= MAX_CHUNK_SIZE:
+        return f"{text}{suffix_newline}"
+
+    suffix_inline = " <1,2>"
+    if len(text) + len(suffix_inline) <= MAX_CHUNK_SIZE:
+        return f"{text}{suffix_inline}"
+
+    return text
+
+
+def _render_bible_passage(
+    book: str,
+    chapter: int,
+    verse_start: int,
+    verse_end: int,
+    preferred_language: str,
+    *,
+    include_header: bool = True,
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    lang_used, chapters = _resolve_book_chapters(book, preferred_language)
+    if not chapters or chapter < 1 or chapter > len(chapters):
+        return None
+
+    verses = chapters[chapter - 1] or []
+    if not verses:
+        return None
+
+    total_verses = len(verses)
+    verse_start = max(1, min(verse_start, total_verses))
+    verse_end = max(verse_start, min(verse_end, total_verses))
+
+    selected_lines: List[str] = []
+    if include_header:
+        header = f"{_display_book_name(book, lang_used)} {chapter}:{verse_start}" if verse_start == verse_end else f"{_display_book_name(book, lang_used)} {chapter}:{verse_start}-{verse_end}"
+        selected_lines.append(header)
+
+    for idx in range(verse_start - 1, verse_end):
+        verse_text = verses[idx].strip()
+        selected_lines.append(f"{idx + 1}. {verse_text}")
+
+    text = "\n".join(selected_lines)
+    info = {
+        "book": book,
+        "chapter": chapter,
+        "verse_start": verse_start,
+        "verse_end": verse_end,
+        "language": lang_used,
+    }
+    return text, info
+
+
+def _random_bible_verse(preferred_language: str) -> Optional[Dict[str, Any]]:
+    order = _get_book_order()
+    if not order:
+        return None
+    book = random.choice(order)
+    lang_used, chapters = _resolve_book_chapters(book, preferred_language)
+    if not chapters:
+        return None
+    chapter_idx = random.randrange(len(chapters))
+    verses = chapters[chapter_idx] or []
+    if not verses:
+        return None
+    verse_idx = random.randrange(len(verses))
+    text, info = _render_bible_passage(
+        book,
+        chapter_idx + 1,
+        verse_idx + 1,
+        verse_idx + 1,
+        lang_used,
+        include_header=True,
+    ) or (None, None)
+    if not text or not info:
+        return None
+    info['span'] = 0
+    return {'text': text, **info}
+
+
+def _shift_bible_position(state: Dict[str, Any], forward: bool) -> Optional[Tuple[str, int, int, int, str, bool]]:
+    book = state.get('book')
+    if not book:
+        return None
+    chapter = max(1, int(state.get('chapter', 1)))
+    verse_start = max(1, int(state.get('verse_start', 1)))
+    verse_end = max(verse_start, int(state.get('verse_end', verse_start)))
+    language = state.get('language') or LANGUAGE_FALLBACK
+    span = int(state.get('span', verse_end - verse_start))
+    chunk = span if span > 0 else (verse_end - verse_start + 1)
+    if chunk <= 0:
+        chunk = 1
+
+    lang_used, chapters = _resolve_book_chapters(book, language)
+    if not chapters:
+        return None
+
+    if forward:
+        chapter_idx = chapter - 1
+        start = verse_end + 1
+        while True:
+            if chapter_idx >= len(chapters):
+                next_book = _next_book(book)
+                if not next_book:
+                    return None
+                book = next_book
+                lang_used, chapters = _resolve_book_chapters(book, lang_used or language)
+                if not chapters:
+                    return None
+                chapter_idx = 0
+                start = 1
+            verses = chapters[chapter_idx] or []
+            chapter_len = len(verses)
+            if chapter_len == 0:
+                chapter_idx += 1
+                start = 1
+                continue
+            if start <= chapter_len:
+                break
+            start -= chapter_len
+            chapter_idx += 1
+        end = min(start + chunk - 1, len(chapters[chapter_idx]))
+        include_header = (start == 1)
+        return (book, chapter_idx + 1, start, end, lang_used or language, include_header)
+
+    # backward navigation
+    chapter_idx = chapter - 1
+    end = verse_start - 1
+    remaining = chunk
+    while True:
+        if chapter_idx < 0:
+            prev_book = _prev_book(book)
+            if not prev_book:
+                return None
+            book = prev_book
+            lang_used, chapters = _resolve_book_chapters(book, lang_used or language)
+            if not chapters:
+                return None
+            chapter_idx = len(chapters) - 1
+            end = len(chapters[chapter_idx])
+        verses = chapters[chapter_idx] or []
+        chapter_len = len(verses)
+        if chapter_len == 0:
+            chapter_idx -= 1
+            end = 0
+            continue
+        if end <= 0 or end > chapter_len:
+            end = chapter_len
+        take = min(remaining, end)
+        start = end - take + 1
+        remaining -= take
+        if remaining <= 0:
+            include_header = (start == 1)
+            return (book, chapter_idx + 1, start, end, lang_used or language, include_header)
+        chapter_idx -= 1
+        end = 0
+
+
+def _handle_bible_navigation(sender_key: Optional[str], forward: bool, *, is_direct: bool, channel_idx: Optional[int]) -> Optional[PendingReply]:
+    if not sender_key:
+        return PendingReply("📖 Use /bible first so I know where you are reading.", "/bible navigation")
+    with BIBLE_NAV_LOCK:
+        state = PENDING_BIBLE_NAV.get(sender_key)
+    if not state:
+        return PendingReply("📖 Use /bible first so I know where you are reading.", "/bible navigation")
+
+    next_state = _shift_bible_position(state, forward)
+    if not next_state:
+        message = "📖 That's the end of what I have." if forward else "📖 You're already at the beginning."
+        return PendingReply(message, "/bible navigation")
+
+    next_book, next_chapter, next_start, next_end, lang_used, include_header = next_state
+    rendered = _render_bible_passage(
+        next_book,
+        next_chapter,
+        next_start,
+        next_end,
+        lang_used,
+        include_header=include_header,
+    )
+    if not rendered:
+        return PendingReply("📖 Couldn't load that passage right now.", "/bible navigation")
+
+    text, info = rendered
+    info['book'] = next_book
+    info['span'] = state.get('span', next_end - next_start)
+    _set_bible_nav(sender_key, info, is_direct=is_direct, channel_idx=channel_idx)
+    try:
+        _update_bible_progress(sender_key, next_book, next_chapter, next_start, info['language'], info.get('span', next_end - next_start))
+    except Exception:
+        pass
+    return PendingReply(_format_bible_nav_message(text), "/bible navigation")
+
+
 def _next_book(book: str) -> Optional[str]:
     order = _get_book_order()
     if book not in order:
@@ -2292,6 +3601,64 @@ def _antispam_format_time(until_ts: float, *, include_date: bool = False) -> str
     return dt.strftime("%H:%M")
 
 
+def _cooldown_register(sender_key: Optional[str], sender_node, interface_ref) -> None:
+    if not COOLDOWN_ENABLED or not sender_key or interface_ref is None:
+        return
+    normalized_key = sender_key.strip().lower()
+    if normalized_key in COOLDOWN_ALLOWLIST:
+        return
+    now = time.time()
+    message_to_send: Optional[str] = None
+    with COOLDOWN_LOCK:
+        state = COOLDOWN_STATE.get(sender_key)
+        if not state:
+            state = {
+                'history': deque(),
+                'warned': False,
+                'warned_at': 0.0,
+            }
+            COOLDOWN_STATE[sender_key] = state
+        history: deque = state['history']
+        window_start = now - COOLDOWN_WINDOW_SECONDS
+        while history and history[0] < window_start:
+            history.popleft()
+        history.append(now)
+
+        warned = state.get('warned', False)
+        threshold = COOLDOWN_THRESHOLD
+        first_seen = NODE_FIRST_SEEN.get(sender_key)
+        if first_seen is not None and (now - first_seen) <= COOLDOWN_NEW_NODE_SECONDS:
+            threshold = min(threshold, COOLDOWN_THRESHOLD_NEW)
+        if len(history) > threshold:
+            if (not warned) or (now - state.get('warned_at', 0.0) >= COOLDOWN_WINDOW_SECONDS):
+                state['warned'] = True
+                state['warned_at'] = now
+                message_to_send = random.choice(COOLDOWN_MESSAGES)
+        else:
+            if warned and len(history) <= COOLDOWN_THRESHOLD:
+                state['warned'] = False
+
+    if message_to_send:
+        try:
+            send_direct_chunks(interface_ref, message_to_send, sender_node)
+            clean_log(f"Cooldown notice sent to {sender_key}", "❄️")
+        except Exception as exc:
+            clean_log(f"Cooldown notice failed for {sender_key}: {exc}", "⚠️", show_always=False)
+
+
+def _log_high_cost(sender_id: Any, label: str, detail: Optional[str] = None) -> None:
+    try:
+        sender_key = _safe_sender_key(sender_id)
+    except Exception:
+        sender_key = str(sender_id)
+    fragment = f" for {sender_key}" if sender_key else ""
+    if detail:
+        detail = textwrap.shorten(str(detail), width=80, placeholder="…")
+        clean_log(f"High-cost {label}{fragment}: {detail}", "💸", show_always=False)
+    else:
+        clean_log(f"High-cost {label}{fragment}", "💸", show_always=False)
+
+
 def _kb_tokenize(text: str) -> List[str]:
     stripped = unidecode(text.lower())
     return re.findall(r"[a-z0-9]+", stripped)
@@ -2451,9 +3818,40 @@ def _format_meshtastic_context(chunks: List[Dict[str, Any]]) -> str:
     return "\n\n".join(lines)
 
 COMMAND_ALIASES: Dict[str, Dict[str, Any]] = {
+    "/compose": {"canonical": "/write", "languages": ["en"]},
+    "/offline": {"canonical": "/offline", "languages": ["en"]},
+    "/draft": {"canonical": "/write", "languages": ["en"]},
+    "/hypeme": {"canonical": "/hype", "languages": ["en"]},
+    "/pumpup": {"canonical": "/hype", "languages": ["en"]},
+    "/decline": {"canonical": "/sayno", "languages": ["en"]},
+    "/politeno": {"canonical": "/sayno", "languages": ["en"]},
+    "/apologize": {"canonical": "/apology", "languages": ["en"]},
+    "/sorrynote": {"canonical": "/apology", "languages": ["en"]},
+    "/breakupnote": {"canonical": "/breakup", "languages": ["en"]},
+    "/resign": {"canonical": "/quitjob", "languages": ["en"]},
+    "/resignation": {"canonical": "/quitjob", "languages": ["en"]},
+    "/celebrate": {"canonical": "/congrats", "languages": ["en"]},
+    "/thanks": {"canonical": "/thankyou", "languages": ["en"]},
     "/momma": {"canonical": "/yomomma", "languages": ["en"]},
     "/mommajoke": {"canonical": "/yomomma", "languages": ["en"]},
     "/yomommajoke": {"canonical": "/yomomma", "languages": ["en"]},
+    "/websearch": {"canonical": "/web", "languages": ["en"]},
+    "/search": {"canonical": "/web", "languages": ["en"]},
+    "/math": {"canonical": "/mathquiz", "languages": ["en"]},
+    "/mathtrivia": {"canonical": "/mathquiz", "languages": ["en"]},
+    "/electric": {"canonical": "/electricalquiz", "languages": ["en"]},
+    "/electrical": {"canonical": "/electricalquiz", "languages": ["en"]},
+    "/electricaltraining": {"canonical": "/electricaltrainer", "languages": ["en"]},
+    "/wikipedia": {"canonical": "/wiki", "languages": ["en", "es"]},
+    "/buscar": {"canonical": "/web", "languages": ["es"]},
+    "/recherche": {"canonical": "/web", "languages": ["fr"]},
+    "/suche": {"canonical": "/web", "languages": ["de"]},
+    "/recal": {"canonical": "/recall", "languages": ["en"]},
+    "/remember": {"canonical": "/recall", "languages": ["en"]},
+    "/store": {"canonical": "/save", "languages": ["en"]},
+    "/offlinewiki": {"canonical": "/offline", "languages": ["en"]},
+    "/wikioffline": {"canonical": "/offline", "languages": ["en"]},
+    "/drudgereport": {"canonical": "/drudge", "languages": ["en"]},
     "/elp": {"canonical": "/elpaso", "languages": ["en"]},
     "/elpasofact": {"canonical": "/elpaso", "languages": ["en"]},
     "/elpasofacts": {"canonical": "/elpaso", "languages": ["en"]},
@@ -2570,6 +3968,12 @@ COMMAND_ALIASES: Dict[str, Dict[str, Any]] = {
     "/bienestar": {"canonical": "/wellnesstrainer", "languages": ["es"]},
     "/mascotas": {"canonical": "/wellnesstrainer", "languages": ["es"]},
     "/bienestaremergencia": {"canonical": "/wellnesstrainer", "languages": ["es"]},
+    "/matematicas": {"canonical": "/mathquiz", "languages": ["es"]},
+    "/matemáticas": {"canonical": "/mathquiz", "languages": ["es"]},
+    "/quizmatematico": {"canonical": "/mathquiz", "languages": ["es"]},
+    "/electricidad": {"canonical": "/electricalquiz", "languages": ["es"]},
+    "/triviaelectrica": {"canonical": "/electricalquiz", "languages": ["es"]},
+    "/entrenadorelectrico": {"canonical": "/electricaltrainer", "languages": ["es"]},
 
     # French
     "/aide": {"canonical": "/help", "languages": ["fr"]},
@@ -2690,10 +4094,16 @@ BUILTIN_COMMANDS = {
     "/test",
     "/help",
     "/menu",
+    "/offline",
+    "/write",
     "/m",
     "/c",
     "/meshtastic",
     "/wipe",
+    "/save",
+    "/recall",
+    "/stop",
+    "/exit",
     "/aipersonality",
     "/biblehelp",
     "/jokes",
@@ -2708,8 +4118,10 @@ BUILTIN_COMMANDS = {
     "/bingo",
     "/quizbattle",
     "/morse",
-    "/aivibe",
-    "/choosevibe",
+    "/mathquiz",
+    "/electricalquiz",
+    "/vibe",
+    "/chathistory",
     "/aisettings",
     "/emailhelp",
     "/bibletrivia",
@@ -2737,12 +4149,23 @@ BUILTIN_COMMANDS = {
     "/navigationtrainer",
     "/boatingtrainer",
     "/wellnesstrainer",
+    "/electricaltrainer",
     "/changemotd",
     "/changeprompt",
     "/showprompt",
     "/printprompt",
     "/reset",
     "/sms",
+    "/web",
+    "/drudge",
+    "/wiki",
+    "/hype",
+    "/sayno",
+    "/apology",
+    "/breakup",
+    "/quitjob",
+    "/congrats",
+    "/thankyou",
 }
 
 FUZZY_COMMAND_MATCH_THRESHOLD = 0.6
@@ -2767,6 +4190,26 @@ def _preferred_menu_language(language: Optional[str]) -> str:
     return LANGUAGE_FALLBACK
 
 
+LANGUAGE_DISPLAY_NAMES = {
+    "en": "English",
+    "es": "Spanish",
+    "fr": "French",
+    "de": "German",
+    "sw": "Swahili",
+    "pl": "Polish",
+    "uk": "Ukrainian",
+    "hr": "Croatian",
+    "zh": "Chinese",
+}
+
+
+def _language_display_name(language: Optional[str]) -> str:
+    if not language:
+        return LANGUAGE_DISPLAY_NAMES.get(LANGUAGE_FALLBACK, "English")
+    lang = _normalize_language_code(language)
+    return LANGUAGE_DISPLAY_NAMES.get(lang, lang.capitalize())
+
+
 MENU_DEFINITIONS = {
     "menu": {
         "title": {"en": "Main Menu", "es": "Menú principal"},
@@ -2774,11 +4217,15 @@ MENU_DEFINITIONS = {
             {
                 "items": [
                     {"text": {"en": "Mail: /mail • /checkmail • /wipe", "es": "Correo: /mail • /checkmail • /wipe"}},
-                    {"text": {"en": "Games: /games • /adventure", "es": "Juegos: /games • /adventure"}},
+                    {"text": {"en": "Games: /games • /adventure • /mathquiz", "es": "Juegos: /games • /adventure • /mathquiz"}},
+                    {"text": {"en": "DIY quiz: /electricalquiz", "es": "Quiz DIY: /electricalquiz"}},
+                    {"text": {"en": "Write: /write", "es": "Redacción: /write"}},
+                    {"text": {"en": "Web search: /web <query>", "es": "Búsqueda web: /web <consulta>"}},
                     {"text": {"en": "Quick info: /help • /biblehelp • /meshtastic • /weather", "es": "Info rápida: /help • /biblehelp • /meshtastic • /weather"}},
-                    {"text": {"en": "AI vibe: /aivibe • change with /changevibe", "es": "Tono IA: /aivibe • cambia con /changevibe"}},
+                    {"text": {"en": "AI vibe controls: /vibe", "es": "Control de tono IA: /vibe"}},
                     {"text": {"en": "Ops: /motd • /meshinfo", "es": "Operaciones: /motd • /meshinfo"}},
                     {"text": {"en": "Safety: /survival • /emergency", "es": "Seguridad: /survival • /emergency"}},
+                    {"text": {"en": "Trainers: /electricaltrainer • /wellnesstrainer", "es": "Entrenadores: /electricaltrainer • /wellnesstrainer"}},
                     {"text": {"en": "Need a box? 📦 /emailhelp", "es": "¿Necesitas buzón? 📦 /emailhelp"}},
                 ]
             }
@@ -2791,6 +4238,22 @@ MENU_DEFINITIONS = {
                 "items": [
                     {"text": {"en": "/chucknorris • /blond • /yomomma", "es": "/chucknorris • /blond • /yomomma"}},
                     {"text": {"en": "More laughs: /funfact <topic>", "es": "Más risas: /funfact <tema>"}},
+                ]
+            }
+        ],
+    },
+    "write": {
+        "title": {"en": "Write Helper", "es": "Asistente de redacción"},
+        "sections": [
+            {
+                "items": [
+                    {"command": "/hype <topic>", "description": {"en": "Celebrate something with high-energy praise.", "es": "Celebra algo con ánimo y entusiasmo."}},
+                    {"command": "/sayno", "description": {"en": "Wizard prompts for who to decline and crafts a gracious no.", "es": "Un asistente pide destinatario y redacta un no amable."}},
+                    {"command": "/apology <name>", "description": {"en": "Draft a sincere apology with accountability.", "es": "Redacta una disculpa sincera con responsabilidad."}},
+                    {"command": "/breakup <name>", "description": {"en": "Compose a compassionate yet clear breakup note.", "es": "Redacta un mensaje de ruptura claro y compasivo."}},
+                    {"command": "/quitjob <team>", "description": {"en": "Write a respectful resignation message.", "es": "Escribe una renuncia respetuosa."}},
+                    {"command": "/congrats <win>", "description": {"en": "Send a celebratory shout-out for someone’s win.", "es": "Envía una felicitación por un logro."}},
+                    {"command": "/thankyou <person>", "description": {"en": "Craft a warm thank-you note with specifics.", "es": "Crea una nota de agradecimiento cercana."}},
                 ]
             }
         ],
@@ -2834,6 +4297,99 @@ MENU_DEFINITIONS = {
         ],
     },
 }
+
+WRITE_FLOW_TIMEOUT = 600
+
+WRITE_FLOW_CONFIG = {
+    "hype": {
+        "system": "You are an energetic hype-writer for an off-grid community. Respond in {language_name}. Keep it to three lively sentences max and finish with an uplifting emoji.",
+        "user_template": "Create a short hype message about: {subject}. Highlight why it matters to the mesh community and keep it upbeat but sincere.",
+    },
+    "sayno": {
+        "system": "You help craft gracious declines that protect relationships. Respond in {language_name}. Use two to three warm sentences, show appreciation, offer a gentle boundary, and end on goodwill.",
+        "user_template": "Draft a polite refusal to this request or person: {subject}.",
+        "wizard_prompt": {
+            "en": "Who do you need to gently say no to? You can include a short reason.",
+            "es": "¿A quién necesitas decirle que no de forma amable? Puedes incluir una breve razón.",
+        },
+        "wizard_tag": "/sayno wizard",
+    },
+    "apology": {
+        "system": "You craft sincere, accountable apologies. Respond in {language_name}. Use two to four sentences, acknowledge responsibility, express empathy, and outline a small next step.",
+        "user_template": "Write a heartfelt apology to: {subject}. Include a brief acknowledgment of the impact and a step toward making things right.",
+    },
+    "breakup": {
+        "system": "You write compassionate breakup notes. Respond in {language_name}. Use up to four sentences, be clear yet kind, honor the connection, and provide hopeful closure.",
+        "user_template": "Compose a respectful breakup message for: {subject}. Keep it empathetic and firm, focused on personal growth and respect.",
+    },
+    "quitjob": {
+        "system": "You write professional resignation messages. Respond in {language_name}. Use two to three sentences, show gratitude, state the resignation clearly, and offer a smooth hand-off.",
+        "user_template": "Draft a courteous resignation note addressed to: {subject}. Mention appreciation and offer brief transition help.",
+    },
+    "congrats": {
+        "system": "You celebrate others with genuine enthusiasm. Respond in {language_name}. Keep it to three sentences, highlight the win, and include a supportive call-to-action.",
+        "user_template": "Write a celebratory congratulations message for: {subject}. Mention why the achievement matters and cheer them on.",
+    },
+    "thankyou": {
+        "system": "You craft warm thank-you notes that include specifics. Respond in {language_name}. Use two to three sentences, cite the helpful action, and share the positive impact.",
+        "user_template": "Compose a concise thank-you message for: {subject}. Include what they did and how it helped.",
+    },
+}
+
+WRITE_COMMAND_FLOWS = {
+    "/hype": "hype",
+    "/sayno": "sayno",
+    "/apology": "apology",
+    "/breakup": "breakup",
+    "/quitjob": "quitjob",
+    "/congrats": "congrats",
+    "/thankyou": "thankyou",
+}
+
+
+def _start_write_wizard(flow: str, lang: str) -> PendingReply:
+    config = WRITE_FLOW_CONFIG.get(flow, {})
+    prompt_map = config.get("wizard_prompt", {}) if isinstance(config, dict) else {}
+    prompt = prompt_map.get(lang) or prompt_map.get("en") or "Who should we write about?"
+    tag = config.get("wizard_tag") if isinstance(config, dict) else None
+    if not tag:
+        tag = f"/{flow} wizard"
+    return PendingReply(prompt, tag)
+
+
+def _generate_write_response(
+    flow: str,
+    subject: str,
+    language: Optional[str],
+    sender_id=None,
+    is_direct: bool = False,
+    channel_idx=None,
+    thread_root_ts=None,
+):
+    config = WRITE_FLOW_CONFIG.get(flow)
+    if not config:
+        return None
+    subject = (subject or "").strip()
+    if not subject:
+        return None
+    subject = subject.replace("\n", " ").strip()
+    if len(subject) > 240:
+        subject = subject[:240].rsplit(" ", 1)[0] or subject[:240]
+    language_name = _language_display_name(language)
+    system_template = config.get("system") or "You are a helpful writing assistant. Respond in {language_name}."
+    system_prompt = system_template.format(language_name=language_name)
+    user_template = config.get("user_template") or "Write a short message about: {subject}."
+    user_message = user_template.format(subject=subject)
+    _log_high_cost(sender_id, "writer", subject[:80])
+    return send_to_ollama(
+        user_message,
+        sender_id=sender_id,
+        is_direct=is_direct,
+        channel_idx=channel_idx,
+        thread_root_ts=thread_root_ts,
+        system_prompt=system_prompt,
+        use_history=False,
+    )
 
 
 SURVIVAL_GUIDES = {
@@ -2967,12 +4523,16 @@ TRIVIA_CATEGORY_TITLES = {
     "bible": {"en": "Bible Trivia", "es": "Trivia Bíblica"},
     "disaster": {"en": "Disaster Prep Trivia", "es": "Trivia de preparación"},
     "general": {"en": "General Trivia", "es": "Trivia general"},
+    "math": {"en": "Math Quiz", "es": "Quiz de matemáticas"},
+    "electrical": {"en": "Electrical DIY Quiz", "es": "Quiz eléctrico DIY"},
 }
 
 TRIVIA_CATEGORY_EMOJI = {
     "bible": "📖",
     "disaster": "🛡️",
     "general": "🧠",
+    "math": "➗",
+    "electrical": "⚡",
 }
 
 TRIVIA_STRINGS = {
@@ -3542,6 +5102,195 @@ TRIVIA_BANK: Dict[str, List[Dict[str, Any]]] = {
             },
         },
     ],
+    "math": [
+        {
+            "id": "m1",
+            "question": {
+                "en": "What is 12 × 7?",
+                "es": "¿Cuánto es 12 × 7?",
+            },
+            "answers": ["84", "ochenta y cuatro"],
+            "answer_display": {"en": "84", "es": "84"},
+            "choices": {
+                "en": ["72", "84", "96", "86"],
+                "es": ["72", "84", "96", "86"],
+            },
+            "explanation": {
+                "en": "Twelve times seven equals eighty-four.",
+                "es": "Doce por siete es igual a ochenta y cuatro.",
+            },
+        },
+        {
+            "id": "m2",
+            "question": {
+                "en": "Solve for x: 3x + 9 = 24.",
+                "es": "Resuelve x: 3x + 9 = 24.",
+            },
+            "answers": ["5", "x=5", "cinco"],
+            "answer_display": {"en": "x = 5", "es": "x = 5"},
+            "choices": {
+                "en": ["3", "4", "5", "6"],
+                "es": ["3", "4", "5", "6"],
+            },
+            "explanation": {
+                "en": "Subtract 9 to get 3x = 15, then divide by 3.",
+                "es": "Resta 9 para obtener 3x = 15 y divide entre 3.",
+            },
+        },
+        {
+            "id": "m3",
+            "question": {
+                "en": "What is 45% written as a decimal?",
+                "es": "¿Cómo se escribe 45% como decimal?",
+            },
+            "answers": ["0.45", ".45"],
+            "answer_display": {"en": "0.45", "es": "0.45"},
+            "choices": {
+                "en": ["0.045", "0.45", "4.5", "0.54"],
+                "es": ["0.045", "0.45", "4.5", "0.54"],
+            },
+            "explanation": {
+                "en": "Move the percent two decimal places left: 45% = 0.45.",
+                "es": "Desplaza el porcentaje dos lugares a la izquierda: 45% = 0.45.",
+            },
+        },
+        {
+            "id": "m4",
+            "question": {
+                "en": "What is the area of a rectangle measuring 8 meters by 5 meters?",
+                "es": "¿Cuál es el área de un rectángulo de 8 metros por 5 metros?",
+            },
+            "answers": ["40", "40 square meters", "40 m2", "40 metros cuadrados"],
+            "answer_display": {"en": "40 square meters", "es": "40 metros cuadrados"},
+            "choices": {
+                "en": ["30 square meters", "35 square meters", "40 square meters", "45 square meters"],
+                "es": ["30 metros cuadrados", "35 metros cuadrados", "40 metros cuadrados", "45 metros cuadrados"],
+            },
+            "explanation": {
+                "en": "Area of a rectangle is length times width: 8 × 5 = 40.",
+                "es": "El área de un rectángulo es largo por ancho: 8 × 5 = 40.",
+            },
+        },
+        {
+            "id": "m5",
+            "question": {
+                "en": "What is the square root of 144?",
+                "es": "¿Cuál es la raíz cuadrada de 144?",
+            },
+            "answers": ["12", "doce"],
+            "answer_display": {"en": "12", "es": "12"},
+            "choices": {
+                "en": ["10", "11", "12", "14"],
+                "es": ["10", "11", "12", "14"],
+            },
+            "explanation": {
+                "en": "12 × 12 = 144.",
+                "es": "12 × 12 = 144.",
+            },
+        },
+    ],
+    "electrical": [
+        {
+            "id": "e1",
+            "question": {
+                "en": "In North American residential wiring, which color is typically used for the equipment ground conductor?",
+                "es": "En el cableado residencial norteamericano, ¿qué color se usa normalmente para el conductor de tierra?",
+            },
+            "answers": ["green", "bare", "bare copper", "verde", "cobre desnudo"],
+            "answer_display": {"en": "Green or bare copper", "es": "Verde o cobre desnudo"},
+            "choices": {
+                "en": ["Green or bare copper", "White", "Black", "Red"],
+                "es": ["Verde o cobre desnudo", "Blanco", "Negro", "Rojo"],
+            },
+            "explanation": {
+                "en": "Ground conductors are green or bare copper under NEC standards.",
+                "es": "Los conductores de tierra son verdes o de cobre desnudo según el NEC.",
+            },
+        },
+        {
+            "id": "e2",
+            "question": {
+                "en": "Before measuring resistance with a multimeter, what must you do to the circuit?",
+                "es": "Antes de medir resistencia con un multímetro, ¿qué debes hacer con el circuito?",
+            },
+            "answers": [
+                "power off",
+                "de-energize",
+                "disconnect power",
+                "turn off power",
+                "remove power",
+                "apagar",
+                "desenergizar",
+                "desconectar la energía",
+            ],
+            "answer_display": {"en": "Turn off and isolate the circuit", "es": "Apagar y aislar el circuito"},
+            "choices": {
+                "en": ["Turn off and isolate the circuit", "Switch meter to AC volts", "Increase the fuse size", "Connect to mains power"],
+                "es": ["Apagar y aislar el circuito", "Cambiar el multímetro a voltios AC", "Aumentar el fusible", "Conectar a la red"],
+            },
+            "explanation": {
+                "en": "Resistance is measured on de-energized circuits to avoid damaging the meter and for safety.",
+                "es": "La resistencia se mide en circuitos desenergizados para evitar dañar el multímetro y por seguridad.",
+            },
+        },
+        {
+            "id": "e3",
+            "question": {
+                "en": "What is the maximum breaker or fuse size allowed for a 14 AWG copper branch circuit under the NEC?",
+                "es": "¿Cuál es el tamaño máximo de interruptor o fusible permitido para un circuito derivado de cobre AWG 14 según el NEC?",
+            },
+            "answers": ["15 amp", "15 amps", "15a", "quince amperios", "15 amperios"],
+            "answer_display": {"en": "15 amps", "es": "15 amperios"},
+            "choices": {
+                "en": ["15 amps", "20 amps", "25 amps", "30 amps"],
+                "es": ["15 amperios", "20 amperios", "25 amperios", "30 amperios"],
+            },
+            "explanation": {
+                "en": "NEC Table 310 limits 14 AWG copper branch circuits to 15 amps.",
+                "es": "La tabla 310 del NEC limita los circuitos de cobre AWG 14 a 15 amperios.",
+            },
+        },
+        {
+            "id": "e4",
+            "question": {
+                "en": "When testing a standard household outlet in North America, what voltage should you expect between hot and neutral?",
+                "es": "Al probar un tomacorriente residencial en Norteamérica, ¿qué voltaje debes esperar entre fase y neutro?",
+            },
+            "answers": ["120", "120v", "120 volts", "aproximadamente 120", "120 voltios"],
+            "answer_display": {"en": "About 120 volts", "es": "Aproximadamente 120 voltios"},
+            "choices": {
+                "en": ["About 120 volts", "About 90 volts", "About 208 volts", "About 240 volts"],
+                "es": ["Aproximadamente 120 voltios", "Aproximadamente 90 voltios", "Aproximadamente 208 voltios", "Aproximadamente 240 voltios"],
+            },
+            "explanation": {
+                "en": "North American receptacles deliver roughly 120 VAC between hot and neutral.",
+                "es": "Los tomacorrientes norteamericanos proporcionan alrededor de 120 VCA entre fase y neutro.",
+            },
+        },
+        {
+            "id": "e5",
+            "question": {
+                "en": "Which tool lets you safely verify that a conductor is de-energized before touching it?",
+                "es": "¿Qué herramienta te permite verificar de forma segura que un conductor está desenergizado antes de tocarlo?",
+            },
+            "answers": [
+                "non-contact voltage tester",
+                "voltage sniffer",
+                "tic tracer",
+                "probador de voltaje sin contacto",
+                "busca tensión sin contacto",
+            ],
+            "answer_display": {"en": "A non-contact voltage tester", "es": "Un detector de voltaje sin contacto"},
+            "choices": {
+                "en": ["A non-contact voltage tester", "A soldering iron", "A wire stripper", "A cable tie"],
+                "es": ["Un detector de voltaje sin contacto", "Un cautín", "Un pelacables", "Una brida"],
+            },
+            "explanation": {
+                "en": "A non-contact tester detects live voltage without touching exposed conductors.",
+                "es": "Un detector sin contacto identifica tensión sin tocar conductores expuestos.",
+            },
+        },
+    ],
 }
 
 TRIVIA_LOOKUP: Dict[str, Dict[str, Dict[str, Any]]] = {
@@ -4103,6 +5852,36 @@ TRAINER_CONTENT: Dict[str, Dict[str, Any]] = {
         ],
         "challenge": {"en": "⭐ Host a 30-minute blackout simulation: run devices off battery and note any comfort gaps to fix.", "es": "⭐ Organiza un simulacro de apagón de 30 minutos: usa solo baterías y anota carencias de comodidad por resolver."},
     },
+    "electricaltrainer": {
+        "title": {"en": "⚡ Electrical DIY Safety Trainer", "es": "⚡ Entrenador de seguridad eléctrica DIY"},
+        "sections": [
+            {
+                "title": {"en": "🔌 Home wiring basics", "es": "🔌 Conceptos básicos del cableado"},
+                "bullets": [
+                    {"en": "Identify conductors: hot=black/red, neutral=white, ground=green or bare.", "es": "Identifica los conductores: fase=negro/rojo, neutro=blanco, tierra=verde o cobre desnudo."},
+                    {"en": "Always kill power at the breaker and verify before touching conductors.", "es": "Siempre corta la energía en el interruptor principal y verifica antes de tocar conductores."},
+                    {"en": "Match breaker size to wire gauge (ex: 14 AWG → 15A, 12 AWG → 20A).", "es": "Empareja el calibre del cable con el interruptor (ej.: AWG 14 → 15A, AWG 12 → 20A)."}
+                ],
+            },
+            {
+                "title": {"en": "🧪 Multimeter fundamentals", "es": "🧪 Fundamentos del multímetro"},
+                "bullets": [
+                    {"en": "Inspect leads for cracks and confirm the meter fuse before measuring.", "es": "Revisa los cables por grietas y confirma el fusible del multímetro antes de medir."},
+                    {"en": "Measure voltage first, then switch to resistance only after power is disconnected.", "es": "Mide voltaje primero y cambia a resistencia solo después de desconectar la energía."},
+                    {"en": "Use one hand when probing live panels and stand on an insulated surface.", "es": "Usa una sola mano al medir paneles energizados y párate sobre una superficie aislada."}
+                ],
+            },
+            {
+                "title": {"en": "🛠️ DIY inspection checklist", "es": "🛠️ Lista de inspección DIY"},
+                "bullets": [
+                    {"en": "Check outlets for tight blade tension and replace cracked receptacle faces.", "es": "Verifica que los tomacorrientes sujeten firmemente las clavijas y reemplaza las placas agrietadas."},
+                    {"en": "Test GFCI/AFCI devices monthly and log the date on the panel cover.", "es": "Prueba los dispositivos GFCI/AFCI mensualmente y anota la fecha en la tapa del panel."},
+                    {"en": "Label breaker circuits clearly so future troubleshooting is fast and safe.", "es": "Etiqueta claramente los circuitos del panel para agilizar futuras reparaciones de forma segura."}
+                ],
+            },
+        ],
+        "challenge": {"en": "⭐ Map every outlet/light to its breaker and note the amperage in your field notebook.", "es": "⭐ Mapea cada tomacorriente/lámpara a su interruptor y anota el amperaje en tu cuaderno."},
+    },
 }
 
 
@@ -4114,6 +5893,7 @@ TRAINER_COMMAND_MAP = {
     "/navigationtrainer": "navigationtrainer",
     "/boatingtrainer": "boatingtrainer",
     "/wellnesstrainer": "wellnesstrainer",
+    "/electricaltrainer": "electricaltrainer",
 }
 
 
@@ -4228,6 +6008,7 @@ LANGUAGE_STRINGS = {
         "unknown_intro": "I didn't recognize `{original}` as a command.",
         "suggestion_intro": "Maybe you meant: {suggestions}.",
         "try_help": "Try `/help` for the full list.",
+        "web_offline": "🌐 Offline mode only. Web search unavailable.",
     },
     "es": {
         "alias_note": "Interpretando {original} como {canonical} (alias).",
@@ -4235,6 +6016,7 @@ LANGUAGE_STRINGS = {
         "unknown_intro": "No reconocí `{original}` como un comando.",
         "suggestion_intro": "Quizá quisiste decir: {suggestions}.",
         "try_help": "Prueba `/help` para ver la lista completa.",
+        "web_offline": "🌐 Solo modo fuera de línea. La búsqueda web no está disponible.",
     },
     "fr": {
         "alias_note": "Interprétation de {original} comme {canonical} (alias).",
@@ -4325,7 +6107,7 @@ LANGUAGE_RESPONSES = {
         "antispam_timeout_long": "🚫 Actividad repetida detectada. Acceso bloqueado por 24 horas. Podrás volver a usar el bot el {time}. Después de este bloqueo, los límites vuelven a empezar.",
         "antispam_log_short": "Usuario {node} en pausa 10m (hasta {time}).",
         "antispam_log_long": "Usuario {node} bloqueado 24h (hasta {time}).",
-        "bible_autoscroll_dm_only": "📖 El auto-scroll sólo funciona en mensajes directos.",
+        "bible_autoscroll_dm_only": "AutoScroll solo está disponible en modo DM.",
         "bible_autoscroll_need_nav": "📖 Usa primero /biblia y luego responde 22 para activar el auto-scroll.",
         "bible_autoscroll_start": "📖 Auto-scroll activado. Próximos versículos cada 12 segundos (30 total).",
         "bible_autoscroll_stop": "⏹️ Auto-scroll en pausa. Responde 22 para retomarlo.",
@@ -4772,42 +6554,73 @@ def process_responses_worker():
             processing_time = time.time() - start_time
             
             if resp:
-                pending = resp if isinstance(resp, PendingReply) else None
-                response_text = pending.text if pending else resp
+                response_text, pending, already_sent = _normalize_ai_response(resp)
+                truncation_notice = False
 
-                target_name = get_node_shortname(sender_node) or str(sender_node)
-                summary = _truncate_for_log(response_text)
-                clean_log(f"Ollama → {target_name} ({processing_time:.1f}s): {summary}", "🦙", show_always=True, rate_limit=False)
+                if response_text:
+                    target_name = get_node_shortname(sender_node) or str(sender_node)
+                    summary = _truncate_for_log(response_text)
+                    clean_log(
+                        f"Ollama → {target_name} ({processing_time:.1f}s): {summary}",
+                        "🦙",
+                        show_always=True,
+                        rate_limit=False,
+                    )
 
-                # Reduced collision delay for async processing
-                if pending:
-                    _command_delay(pending.reason, delay=pending.pre_send_delay)
-                else:
-                    time.sleep(1)
-
-                # Log reply and mark AI status accurately (non-AI responses keep delay + logging)
-                ai_force = FORCE_NODE_NUM if FORCE_NODE_NUM is not None else None
-                log_message(
-                    AI_NODE_NAME,
-                    response_text,
-                    reply_to=thread_root_ts,
-                    direct=is_direct,
-                    channel_idx=(None if is_direct else ch_idx),
-                    force_node=ai_force,
-                    is_ai=(pending is None),
-                )
-
-                # Send the response via mesh
-                chunk_delay = pending.chunk_delay if pending else None
-                if interface_ref and response_text:
-                    if is_direct:
-                        send_direct_chunks(interface_ref, response_text, sender_node, chunk_delay=chunk_delay)
+                    # Reduced collision delay for async processing
+                    if pending:
+                        _command_delay(pending.reason, delay=pending.pre_send_delay)
                     else:
-                        send_broadcast_chunks(interface_ref, response_text, ch_idx, chunk_delay=chunk_delay)
+                        time.sleep(1)
+
+                    # Log reply and mark AI status accurately (non-AI responses keep delay + logging)
+                    ai_force = FORCE_NODE_NUM if FORCE_NODE_NUM is not None else None
+                    log_message(
+                        AI_NODE_NAME,
+                        response_text,
+                        reply_to=thread_root_ts,
+                        direct=is_direct,
+                        channel_idx=(None if is_direct else ch_idx),
+                        force_node=ai_force,
+                        is_ai=(pending is None),
+                    )
+
+                    # Send the response via mesh unless it was already streamed out
+                    chunk_delay = pending.chunk_delay if pending else None
+                    if interface_ref and response_text and not already_sent:
+                        if is_direct:
+                            send_direct_chunks(interface_ref, response_text, sender_node, chunk_delay=chunk_delay)
+                        else:
+                            send_broadcast_chunks(interface_ref, response_text, ch_idx, chunk_delay=chunk_delay)
+
+                    if pending and pending.follow_up_text and interface_ref:
+                        _schedule_follow_up_message(
+                            interface_ref,
+                            pending.follow_up_text,
+                            delay=pending.follow_up_delay,
+                            is_direct=is_direct,
+                            sender_node=sender_node,
+                            channel_idx=ch_idx,
+                        )
 
                 sender_key = _safe_sender_key(sender_node)
+                if is_direct and sender_key:
+                    with CONTEXT_TRUNCATION_LOCK:
+                        if sender_key in CONTEXT_TRUNCATED_SENDERS:
+                            last_notice = CONTEXT_TRUNCATION_NOTICES.get(sender_key, 0.0)
+                            now_ts = time.time()
+                            if now_ts - last_notice > CONTEXT_TRUNCATION_COOLDOWN:
+                                truncation_notice = True
+                                CONTEXT_TRUNCATION_NOTICES[sender_key] = now_ts
+                            CONTEXT_TRUNCATED_SENDERS.discard(sender_key)
                 _antispam_after_response(sender_key, sender_node, interface_ref)
                 _process_bible_autoscroll_request(sender_key, sender_node, interface_ref)
+
+                if truncation_notice and interface_ref:
+                    try:
+                        send_direct_chunks(interface_ref, CONTEXT_TRUNCATION_NOTICE, sender_node)
+                    except Exception as notice_exc:
+                        clean_log(f"Context notice failed: {notice_exc}", "⚠️", show_always=False)
                 
                 try:
                     globals()['last_ai_response_time'] = _now()
@@ -4981,6 +6794,658 @@ def _collect_recent_locations(exclude_key: Optional[str] = None, limit: Optional
         })
 
     return results
+
+
+def _normalize_context_key(value: Optional[str]) -> str:
+    return " ".join(unidecode(str(value or "")).lower().split())
+
+
+def _ensure_saved_contexts_loaded() -> None:
+    global SAVED_CONTEXTS
+    with SAVED_CONTEXT_LOCK:
+        if SAVED_CONTEXTS:
+            return
+    raw = safe_load_json(str(SAVED_CONTEXT_FILE), {"users": {}})
+    contexts: Dict[str, List[Dict[str, Any]]] = {}
+    if isinstance(raw, dict):
+        users = raw.get("users") or {}
+        if isinstance(users, dict):
+            for key, entries in users.items():
+                key_str = str(key)
+                bucket: List[Dict[str, Any]] = []
+                if isinstance(entries, list):
+                    for entry in entries:
+                        if isinstance(entry, dict):
+                            bucket.append(dict(entry))
+                contexts[key_str] = bucket
+    with SAVED_CONTEXT_LOCK:
+        SAVED_CONTEXTS = contexts
+
+
+def _persist_saved_contexts() -> None:
+    with SAVED_CONTEXT_LOCK:
+        payload = {"users": SAVED_CONTEXTS}
+    try:
+        SAVED_CONTEXT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    write_atomic(str(SAVED_CONTEXT_FILE), json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def _get_saved_contexts_for_user(sender_key: Optional[str]) -> List[Dict[str, Any]]:
+    if not sender_key:
+        return []
+    _ensure_saved_contexts_loaded()
+    with SAVED_CONTEXT_LOCK:
+        entries = SAVED_CONTEXTS.get(sender_key, [])
+        return [dict(entry) for entry in entries]
+
+
+def _set_saved_contexts_for_user(sender_key: str, entries: List[Dict[str, Any]]) -> None:
+    _ensure_saved_contexts_loaded()
+    with SAVED_CONTEXT_LOCK:
+        SAVED_CONTEXTS[sender_key] = [dict(entry) for entry in entries]
+    _persist_saved_contexts()
+
+
+def _set_context_session(sender_key: str, session: Dict[str, Any]) -> None:
+    session = dict(session)
+    session['created_at'] = session.get('created_at', _now())
+    session['last_used'] = _now()
+    session['expires_at'] = session.get('expires_at', _now() + CONTEXT_SESSION_TIMEOUT_SECONDS)
+    session['language'] = session.get('language') or LANGUAGE_FALLBACK
+    with CONTEXT_SESSION_LOCK:
+        CONTEXT_SESSIONS[sender_key] = session
+
+
+def _get_context_session(sender_key: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    if not sender_key:
+        return None, None
+    with CONTEXT_SESSION_LOCK:
+        session = CONTEXT_SESSIONS.get(sender_key)
+        if not session:
+            return None, None
+        expires_at = session.get('expires_at', 0)
+        if expires_at and expires_at < _now():
+            CONTEXT_SESSIONS.pop(sender_key, None)
+            language = session.get('language') or LANGUAGE_FALLBACK
+            title = session.get('title') or "your context window"
+            notice = translate(language, 'context_session_expired', f"⚠️ Context window '{title}' expired. Resuming regular chat.", title=title)
+            return None, notice
+        session['last_used'] = _now()
+        CONTEXT_SESSIONS[sender_key] = session
+        return dict(session), None
+
+
+def _clear_context_session(sender_key: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not sender_key:
+        return None
+    with CONTEXT_SESSION_LOCK:
+        return CONTEXT_SESSIONS.pop(sender_key, None)
+
+
+def _collect_dm_history_entries(sender_id: Any, max_messages: int = 200) -> List[Dict[str, Any]]:
+    with messages_lock:
+        snapshot = [m for m in messages if m.get('direct') is True]
+    entries: List[Dict[str, Any]] = []
+    for m in snapshot:
+        node_id = m.get('node_id')
+        if same_node_id(node_id, sender_id) or m.get('is_ai'):
+            entries.append(m)
+    if max_messages and len(entries) > max_messages:
+        entries = entries[-max_messages:]
+    return entries
+
+
+def _format_conversation_lines(entries: List[Dict[str, Any]], max_chars: int) -> Tuple[str, List[str]]:
+    if not entries:
+        return "", []
+    collected: List[str] = []
+    total = 0
+    for m in reversed(entries):
+        text = str(m.get('message', '')).strip()
+        if not text:
+            continue
+        node_id = m.get('node_id')
+        try:
+            speaker = get_node_shortname(node_id)
+        except Exception:
+            speaker = m.get('node') or ('AI' if m.get('is_ai') else 'User')
+        speaker = speaker or ('AI' if m.get('is_ai') else 'User')
+        line = f"{speaker}: {text}"
+        total += len(line) + 1
+        collected.append(line)
+        if total >= max_chars:
+            break
+    collected.reverse()
+    conversation = "\n".join(collected)
+    return conversation, collected
+
+
+def _auto_conversation_title(sender_id: Any, entries: List[Dict[str, Any]]) -> str:
+    fallback = "Saved Conversation"
+    for m in reversed(entries):
+        if m.get('is_ai'):
+            continue
+        node_id = m.get('node_id')
+        if not same_node_id(node_id, sender_id):
+            continue
+        text = str(m.get('message', '')).strip()
+        if not text:
+            continue
+        try:
+            intent = _detect_memory_intent(text)
+        except Exception:
+            intent = None
+        if intent and intent[0] == "save":
+            continue
+        cleaned = re.sub(r"[\s]+", " ", text)
+        cleaned = cleaned.strip(" ",)
+        cleaned = cleaned.strip('"')
+        if cleaned:
+            if cleaned.startswith('/') and len(cleaned.split()) > 1:
+                cleaned = cleaned.split(None, 1)[1]
+            cleaned = cleaned.strip()
+        if cleaned:
+            shortened = textwrap.shorten(cleaned, width=60, placeholder="…")
+            return shortened.title()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return f"Saved Conversation {timestamp}"
+
+
+def _ensure_unique_context_title(sender_key: str, desired: str) -> str:
+    contexts = _get_saved_contexts_for_user(sender_key)
+    existing = {str(c.get('title', '')).lower() for c in contexts}
+    base = desired.strip() or "Saved Conversation"
+    candidate = base
+    counter = 2
+    while candidate.lower() in existing:
+        candidate = f"{base} ({counter})"
+        counter += 1
+    return candidate
+
+
+def _build_search_blob(*parts: str) -> str:
+    combined = " ".join(part for part in parts if part)
+    return _normalize_context_key(combined)[:6000]
+
+
+def _extract_tags(text: str) -> List[str]:
+    tags: List[str] = []
+    for token in text.split():
+        if token.startswith('#') and len(token) > 1:
+            cleaned = token.rstrip('.,;!?:')
+            if cleaned not in tags:
+                tags.append(cleaned)
+    return tags
+
+
+def _create_saved_context_entry(
+    title: str,
+    conversation: str,
+    lines: List[str],
+    auto_title: bool,
+    *,
+    tags: Optional[List[str]] = None,
+    attribution: Optional[str] = None,
+) -> Dict[str, Any]:
+    created = _now()
+    summary_candidates: List[str] = []
+    if lines:
+        for line in reversed(lines):
+            message_text = ""
+            if ": " in line:
+                message_text = line.split(": ", 1)[1].strip()
+            elif "\t" in line:
+                message_text = line.split("\t", 1)[1].strip()
+            skip = False
+            if message_text:
+                try:
+                    intent = _detect_memory_intent(message_text)
+                except Exception:
+                    intent = None
+                if intent and intent[0] == "save":
+                    skip = True
+            if skip:
+                continue
+            summary_candidates.append(line)
+            if len(summary_candidates) >= SAVED_CONTEXT_SUMMARY_LINES:
+                break
+        summary_candidates.reverse()
+    summary_source = " ".join(summary_candidates) if summary_candidates else conversation.replace("\n", " ")
+    summary = textwrap.shorten(summary_source, width=SAVED_CONTEXT_SUMMARY_CHARS, placeholder="…") if summary_source else "(no summary)"
+    search_blob = _build_search_blob(title, summary, conversation)
+    tags = tags or []
+    return {
+        "id": str(uuid.uuid4()),
+        "title": title,
+        "auto_title": auto_title,
+        "summary": summary,
+        "context": conversation,
+        "search_blob": search_blob,
+        "search_key": _normalize_context_key(title),
+        "lines": len(lines),
+        "created_at": created,
+        "updated_at": created,
+        "tags": tags,
+        "attribution": attribution,
+        "saved_at_human": _format_timestamp_local(created),
+    }
+
+
+def _save_conversation_for_user(
+    sender_id: Any,
+    sender_key: str,
+    requested_title: Optional[str],
+    lang: str,
+    auto_title: bool = False,
+) -> Optional[PendingReply]:
+    entries = _collect_dm_history_entries(sender_id, max_messages=400)
+    if not entries:
+        return PendingReply("ℹ️ I don't have any recent DM messages to save.", "/save command")
+    conversation, lines = _format_conversation_lines(entries, SAVED_CONTEXT_MAX_CHARS)
+    if not conversation:
+        return PendingReply("ℹ️ Nothing to save yet. Send a few messages first.", "/save command")
+    title = (requested_title or "").strip()
+    if not title:
+        return PendingReply("📝 Give this chat a name using `/save <title>` first.", "/save command")
+    if len(title) > SAVED_CONTEXT_TITLE_MAX:
+        return PendingReply(
+            f"⚠️ Title too long. Keep it under {SAVED_CONTEXT_TITLE_MAX} characters.",
+            "/save command",
+        )
+    title = _ensure_unique_context_title(sender_key, title)
+    entry = _create_saved_context_entry(title, conversation, lines, auto_title)
+    contexts = _get_saved_contexts_for_user(sender_key)
+    contexts.append(entry)
+    if len(contexts) > SAVED_CONTEXT_MAX_PER_USER:
+        contexts.sort(key=lambda item: item.get('updated_at', item.get('created_at', 0)))
+        removed = contexts[:-SAVED_CONTEXT_MAX_PER_USER]
+        contexts = contexts[-SAVED_CONTEXT_MAX_PER_USER:]
+    else:
+        removed = []
+    _set_saved_contexts_for_user(sender_key, contexts)
+    removal_note = ""
+    if removed:
+        removal_note = "\n(Oldest saved chat removed to make space.)"
+    confirmation = [
+        f"📝 Stored this conversation as '{title}'.",
+        "Browse your saves with `/chathistory`.",
+    ]
+    if entry.get('summary'):
+        confirmation.append(f"Summary: {entry['summary']}")
+    message = "\n".join(confirmation) + removal_note
+    return PendingReply(message, "/save command")
+
+
+def _find_saved_context_by_id(sender_key: str, entry_id: str) -> Optional[Dict[str, Any]]:
+    contexts = _get_saved_contexts_for_user(sender_key)
+    for entry in contexts:
+        if entry.get('id') == entry_id:
+            return entry
+    return None
+
+
+def _touch_saved_context(sender_key: str, entry_id: str) -> None:
+    contexts = _get_saved_contexts_for_user(sender_key)
+    updated = False
+    now_ts = _now()
+    for entry in contexts:
+        if entry.get('id') == entry_id:
+            entry['updated_at'] = now_ts
+            updated = True
+            break
+    if updated:
+        _set_saved_contexts_for_user(sender_key, contexts)
+
+
+def _find_saved_context_matches(sender_key: str, query: str, limit: int = 5) -> List[Tuple[Dict[str, Any], float]]:
+    contexts = _get_saved_contexts_for_user(sender_key)
+    if not contexts:
+        return []
+    normalized_query = _normalize_context_key(query)
+    if not normalized_query:
+        return []
+    scores: List[Tuple[Dict[str, Any], float]] = []
+    for entry in contexts:
+        title_key = entry.get('search_key') or _normalize_context_key(entry.get('title'))
+        blob = entry.get('search_blob') or title_key
+        score_title = difflib.SequenceMatcher(None, normalized_query, title_key).ratio()
+        score_blob = difflib.SequenceMatcher(None, normalized_query, blob).ratio()
+        if normalized_query in title_key:
+            score_title = max(score_title, 0.99)
+        if normalized_query in blob:
+            score_blob = max(score_blob, 0.99)
+        score = max(score_title, score_blob)
+        scores.append((entry, score))
+    scores.sort(key=lambda item: item[1], reverse=True)
+    if limit:
+        scores = scores[:limit]
+    return scores
+
+
+def _format_saved_context_list(sender_key: str) -> str:
+    contexts = _get_saved_contexts_for_user(sender_key)
+    if not contexts:
+        return "ℹ️ You haven't saved any conversations yet. Use `/save` in a DM to store one."
+    contexts_sorted = sorted(contexts, key=lambda x: x.get('updated_at', x.get('created_at', 0)), reverse=True)
+    lines = ["Saved conversations:"]
+    for idx, entry in enumerate(contexts_sorted[:SAVED_CONTEXT_LIST_LIMIT], 1):
+        title = entry.get('title') or f"Conversation {idx}"
+        saved_ts = entry.get('updated_at', entry.get('created_at', 0))
+        saved_str = _format_timestamp_local(saved_ts)
+        summary = entry.get('summary') or "(no summary)"
+        lines.append(f"{idx}. {title} — saved {saved_str}. {summary}")
+    if len(contexts_sorted) > SAVED_CONTEXT_LIST_LIMIT:
+        lines.append(f"…and {len(contexts_sorted) - SAVED_CONTEXT_LIST_LIMIT} more. Use `/chathistory` or `/recall <topic>` to explore.")
+    return "\n".join(lines)
+
+
+def _start_chathistory_menu(sender_key: Optional[str]) -> PendingReply:
+    if not sender_key:
+        return PendingReply("⚠️ I couldn't identify your DM session. Try again in a moment.", "/chathistory list")
+
+    contexts = _get_saved_contexts_for_user(sender_key)
+    if not contexts:
+        return PendingReply("ℹ️ You haven't saved any conversations yet. Use `/save <title>` to store one.", "/chathistory list")
+
+    contexts_sorted = sorted(contexts, key=lambda x: x.get('updated_at', x.get('created_at', 0)), reverse=True)
+    displayed = contexts_sorted[:SAVED_CONTEXT_LIST_LIMIT]
+
+    lines = ["📚 Saved chats (most recent first):"]
+    id_list: List[str] = []
+    for idx, entry in enumerate(displayed, 1):
+        title = entry.get('title') or f"Conversation {idx}"
+        saved_ts = entry.get('updated_at', entry.get('created_at', 0))
+        saved_str = _format_timestamp_local(saved_ts)
+        lines.append(f"{idx}. {title} — saved {saved_str}")
+        id_list.append(entry.get('id'))
+
+    if len(contexts_sorted) > len(displayed):
+        lines.append(f"…oldest chats are automatically pruned after {SAVED_CONTEXT_MAX_PER_USER} saves.")
+
+    lines.append("Reply with the number to recall a chat, or X to cancel.")
+
+    PENDING_RECALL_SELECTIONS[sender_key] = {
+        'mode': 'choose',
+        'ids': id_list,
+        'created': _now(),
+    }
+    return PendingReply("\n".join(lines), "/chathistory list")
+
+
+def _activate_saved_context_session(sender_id: Any, sender_key: str, entry: Dict[str, Any]) -> PendingReply:
+    context = entry.get('context') or ""
+    if not context:
+        return PendingReply("⚠️ That saved conversation has no content.", "/recall command")
+    title = entry.get('title') or "Saved Conversation"
+    summary = entry.get('summary') or ""
+    attribution = entry.get('attribution') or "Saved from a previous DM conversation."
+    tags = entry.get('tags') or []
+    tags_line = f"Tags: {' '.join(tags)}" if tags else ""
+    saved_context_header = f"Saved conversation '{title}' context" if not entry.get('auto_title') else f"Saved conversation context"
+    saved_on = entry.get('saved_at_human') or _format_timestamp_local(entry.get('created_at', _now()))
+    context_block = f"{saved_context_header} (saved {saved_on})\n{context}\n\nAttribution: {attribution}"
+    if tags_line:
+        context_block += f"\n{tags_line}"
+    prompt_addendum = (
+        f"You are resuming the saved conversation titled '{title}'. "
+        "Use the provided context as prior discussion so replies stay consistent. "
+        "If the user changes topics entirely, handle it normally after acknowledging the switch."
+    )
+    session = {
+        'type': 'saved',
+        'title': title,
+        'summary': summary,
+        'context': context_block,
+        'prompt_addendum': prompt_addendum,
+        'use_history': False,
+    }
+    _set_context_session(sender_key, session)
+    _touch_saved_context(sender_key, entry.get('id', ''))
+    lines = [
+        f"📂 Loaded conversation '{title}'.",
+        "Type /exit to leave this context window.",
+    ]
+    if summary:
+        lines.append(f"Summary: {summary}")
+    if tags_line:
+        lines.append(tags_line)
+    return PendingReply("\n".join(lines), "/recall command")
+
+
+def _start_recall_selection(sender_key: str, matches: List[Tuple[Dict[str, Any], float]], confirm_only: bool = False) -> PendingReply:
+    now_ts = _now()
+    if not matches:
+        return PendingReply("⚠️ I couldn't find a saved conversation matching that request.", "/recall command")
+    top_entry = matches[0][0]
+    if confirm_only or len(matches) == 1:
+        PENDING_RECALL_SELECTIONS[sender_key] = {
+            'mode': 'confirm',
+            'ids': [top_entry.get('id')],
+            'created': now_ts,
+        }
+        title = top_entry.get('title') or 'conversation'
+        summary = top_entry.get('summary') or ''
+        lines = [
+            f"I found a saved conversation called '{title}'.",
+            "Load it now? Reply Y or N.",
+        ]
+        if summary:
+            lines.append(f"Summary: {summary}")
+        return PendingReply("\n".join(lines), "/recall confirm")
+
+    ids: List[str] = []
+    display_lines = ["I found several saved conversations:"]
+    for idx, (entry, score) in enumerate(matches[:SAVED_CONTEXT_LIST_LIMIT], 1):
+        ids.append(entry.get('id'))
+        title = entry.get('title') or f"Conversation {idx}"
+        summary = entry.get('summary') or ''
+        display_lines.append(f"{idx}. {title} — {summary}")
+    display_lines.append("Reply with the number to load, or N to cancel.")
+    PENDING_RECALL_SELECTIONS[sender_key] = {
+        'mode': 'choose',
+        'ids': ids,
+        'created': now_ts,
+    }
+    return PendingReply("\n".join(display_lines), "/recall select")
+
+
+def _handle_pending_recall_response(
+    sender_id: Any,
+    sender_key: str,
+    text: str,
+) -> Optional[PendingReply]:
+    pending = PENDING_RECALL_SELECTIONS.get(sender_key)
+    if not pending:
+        return None
+    if (_now() - pending.get('created', 0)) > 600:
+        PENDING_RECALL_SELECTIONS.pop(sender_key, None)
+        return PendingReply("⏱️ That recall prompt expired. Try again with `/recall <topic>`.", "/recall select")
+    cleaned = text.strip().lower()
+    mode = pending.get('mode')
+    if mode == 'choose':
+        if cleaned in {'n', 'no', 'cancel', 'exit', 'x'}:
+            PENDING_RECALL_SELECTIONS.pop(sender_key, None)
+            return PendingReply("Okay, no conversation loaded.", "/recall select")
+        try:
+            index = int(cleaned)
+        except ValueError:
+            return PendingReply("Please reply with the number from the list or N to cancel.", "/recall select")
+        if index < 1 or index > len(pending.get('ids', [])):
+            return PendingReply("That number isn't on the list. Try again or reply N to cancel.", "/recall select")
+        entry_id = pending['ids'][index - 1]
+        entry = _find_saved_context_by_id(sender_key, entry_id)
+        PENDING_RECALL_SELECTIONS.pop(sender_key, None)
+        if not entry:
+            return PendingReply("⚠️ I couldn't load that conversation. It may have been removed.", "/recall command")
+        return _activate_saved_context_session(sender_id, sender_key, entry)
+    else:  # confirm
+        if cleaned in {'y', 'yes'}:
+            entry_id = (pending.get('ids') or [None])[0]
+            entry = _find_saved_context_by_id(sender_key, entry_id)
+            PENDING_RECALL_SELECTIONS.pop(sender_key, None)
+            if not entry:
+                return PendingReply("⚠️ That conversation is no longer available.", "/recall command")
+            return _activate_saved_context_session(sender_id, sender_key, entry)
+        if cleaned in {'n', 'no', 'cancel', 'exit'}:
+            PENDING_RECALL_SELECTIONS.pop(sender_key, None)
+        return PendingReply("No problem—conversation not loaded.", "/recall confirm")
+    return PendingReply("Please reply Y to load it or N to cancel.", "/recall confirm")
+
+
+def _handle_pending_save_response(sender_id: Any, sender_key: str, text: str) -> Optional[PendingReply]:
+    state = PENDING_SAVE_WIZARDS.get(sender_key)
+    if not state:
+        return None
+    if (_now() - state.get('created', 0.0)) > SAVE_WIZARD_TIMEOUT:
+        PENDING_SAVE_WIZARDS.pop(sender_key, None)
+        return PendingReply("⏱️ Save prompt expired. Run `/save` again when you're ready.", "/save wizard")
+
+    cleaned = text.strip()
+    if not cleaned:
+        return PendingReply("📝 Please reply with a short title, or N to cancel.", "/save wizard")
+
+    lowered = cleaned.lower()
+    if lowered in {'n', 'no', 'cancel', 'exit'}:
+        PENDING_SAVE_WIZARDS.pop(sender_key, None)
+        return PendingReply("👍 Not saving this chat.", "/save wizard")
+
+    cleaned = cleaned.strip()
+    if cleaned.startswith(('"', "'")) and cleaned.endswith(('"', "'")) and len(cleaned) >= 2:
+        cleaned = cleaned[1:-1].strip()
+    if not cleaned:
+        return PendingReply("📝 Please reply with a short title, or N to cancel.", "/save wizard")
+    if len(cleaned) > SAVED_CONTEXT_TITLE_MAX:
+        return PendingReply(
+            f"⚠️ Title too long. Keep it under {SAVED_CONTEXT_TITLE_MAX} characters.",
+            "/save wizard",
+        )
+
+    lang = state.get('language', LANGUAGE_FALLBACK)
+    origin_id = state.get('sender_id', sender_id)
+    PENDING_SAVE_WIZARDS.pop(sender_key, None)
+    return _save_conversation_for_user(origin_id, sender_key, cleaned, lang, auto_title=False)
+
+
+def _handle_exit_session(sender_key: Optional[str]) -> PendingReply:
+    session = _clear_context_session(sender_key)
+    if session:
+        title = session.get('title') or "context session"
+        return PendingReply(f"✅ Closed the {title} context window. We're back to regular chat.", "/exit command")
+    return PendingReply("ℹ️ There's no saved context active right now.", "/exit command")
+
+def _detect_memory_intent(message: str) -> Optional[Tuple[str, Optional[str]]]:
+    if not message:
+        return None
+    lowered = message.lower().strip()
+    # Save intents with explicit topics
+    save_topic_prefixes = [
+        "remember this conversation about",
+        "save this conversation about",
+        "save conversation about",
+        "remember this about",
+    ]
+    for prefix in save_topic_prefixes:
+        if lowered.startswith(prefix):
+            topic = message[len(prefix):].strip().strip(" ?!.\"")
+            return ("save", topic or None)
+
+    recall_prefixes = [
+        "remember when we were talking about",
+        "remember when we talked about",
+        "remember our conversation about",
+        "remember the conversation about",
+        "remember our chat about",
+    ]
+    for prefix in recall_prefixes:
+        if lowered.startswith(prefix):
+            topic = message[len(prefix):].strip().strip(" ?!.\"")
+            return ("recall", topic or None)
+
+    save_simple_triggers = {
+        "remember this conversation",
+        "remember this",
+        "remember",
+        "save this conversation",
+        "save this",
+        "save",
+        "save this to memory",
+        "save this to your memory",
+        "save to memory",
+        "save this convo",
+        "remember this convo",
+    }
+    for trigger in save_simple_triggers:
+        if lowered == trigger or lowered.startswith(trigger + " ?"):
+            return ("save", None)
+
+    recall_question_triggers = {
+        "remember when we were talking",
+        "remember when we were chatting",
+        "remember our conversation",
+    }
+    for trigger in recall_question_triggers:
+        if lowered.startswith(trigger):
+            # Treated as recall request even if topic missing; user can clarify.
+            remainder = message[len(trigger):].strip().strip(" ?!.\"")
+            return ("recall", remainder or None)
+
+    return None
+
+
+def _maybe_handle_memory_intent(
+    sender_id: Any,
+    sender_key: Optional[str],
+    text: str,
+    lang: str,
+    check_only: bool = False,
+) -> Optional[Union[PendingReply, bool]]:
+    intent = _detect_memory_intent(text)
+    if not intent or not sender_key:
+        return None
+    action, topic = intent
+    if action == "save":
+        if topic:
+            if check_only:
+                return False
+            return _save_conversation_for_user(sender_id, sender_key, topic, lang, auto_title=False)
+        if check_only:
+            return False
+        PENDING_SAVE_WIZARDS[sender_key] = {
+            'created': _now(),
+            'sender_id': sender_id,
+            'language': lang,
+        }
+        return PendingReply(
+            "📝 What should I call this conversation? Reply with a short title (or N to cancel).",
+            "/save wizard",
+        )
+    if action == "recall":
+        contexts = _get_saved_contexts_for_user(sender_key)
+        if not contexts:
+            if check_only:
+                return False
+            return PendingReply("ℹ️ You haven't saved any conversations yet. Use `/save` first.", "memory recall")
+        if not topic:
+            if check_only:
+                return False
+            return _start_chathistory_menu(sender_key)
+        matches = _find_saved_context_matches(sender_key, topic, limit=5)
+        if not matches:
+            if check_only:
+                return False
+            return PendingReply("⚠️ I couldn't find a saved conversation that matches that. Try a different description or `/recall` to list entries.", "memory recall")
+        if check_only:
+            return False
+        # Prefer confirmation when the top match is strong.
+        confirm = False
+        if len(matches) == 1:
+            confirm = True
+        elif matches[0][1] >= 0.8 and (len(matches) == 1 or matches[0][1] - matches[1][1] >= 0.2):
+            confirm = True
+        return _start_recall_selection(sender_key, matches, confirm_only=confirm)
+    return None
 
 
 def _save_weather_reports_locked() -> None:
@@ -5253,24 +7718,11 @@ def _format_location_reply(sender_id: Any) -> Optional[str]:
         dilution,
     )
     url_to_show = current_entry.get("map_url")
-    lines: List[str] = []
-    lines.append(f"📍 {sn}: {lat_str}, {lon_str} (time: {tstr})")
-    if url_to_show:
-        lines.append(f"🔗 {url_to_show}")
     _snapshot_all_node_positions()
-    recent = _collect_recent_locations(exclude_key=sender_key, limit=5)
-    if recent:
-        lines.append("🌍 Other nodes (last 24h):")
-        for entry in recent:
-            quality = entry.get('quality', 'precise')
-            lines.append(
-                f"- {entry['shortname']}: {entry['lat_str']}, {entry['lon_str']} (time: {entry['time_str']}, {quality})"
-            )
-            if entry.get('map_url'):
-                lines.append(f"  🔗 {entry['map_url']}")
-    map_base = _public_base_url()
-    lines.append(f"🗺️ All recent: {map_base}/mesh_locations.kml")
-    return "\n".join(lines)
+    if url_to_show:
+        return f"📍 {sn}: {url_to_show}"
+    # Fallback if we somehow don't have a link yet
+    return f"📍 {sn}: location link unavailable"
 
 
 def _handle_position_confirmation(
@@ -5611,6 +8063,41 @@ def send_direct_chunks(interface, text, destinationId, chunk_delay: Optional[flo
     if sent_any:
         clean_log(f"Sent to {dest_display}", "📤")
 
+
+def _schedule_follow_up_message(
+    interface_ref,
+    text: str,
+    *,
+    delay: Optional[float],
+    is_direct: bool,
+    sender_node,
+    channel_idx,
+):
+    """Send a follow-up message after a delay without blocking the response worker."""
+
+    if not text or interface_ref is None:
+        return
+
+    try:
+        wait_seconds = float(delay if delay is not None else MAIL_FOLLOW_UP_DELAY)
+    except Exception:
+        wait_seconds = MAIL_FOLLOW_UP_DELAY
+    wait_seconds = max(0.0, wait_seconds)
+
+    def _worker():
+        try:
+            if wait_seconds:
+                time.sleep(wait_seconds)
+            if is_direct:
+                send_direct_chunks(interface_ref, text, sender_node)
+            else:
+                send_broadcast_chunks(interface_ref, text, channel_idx)
+        except Exception as exc:
+            clean_log(f"Follow-up send failed: {exc}", "⚠️", show_always=False)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 def _format_ai_error(provider: str, detail: str) -> str:
     message = (detail or "unknown issue").strip()
     if len(message) > 160:
@@ -5668,9 +8155,11 @@ def _process_wipe_confirmation(sender_id: Any, message: str, is_direct: bool, ch
         if not is_direct:
             return PendingReply("❌ Chat history wipe only works in direct messages.", "/wipe confirm")
         removed = _clear_direct_history(sender_id)
+        if sender_key:
+            _clear_context_session(sender_key)
         clean_log(f"Chat history wipe completed for {get_node_shortname(sender_id)}", "🧹")
         if removed > 0:
-            return PendingReply(f"🧹 Cleared {removed} messages from our DM history.", "/wipe confirm")
+            return PendingReply(f"🧹 Cleared {removed} messages from our DM history. Context reset — fresh slate!", "/wipe confirm")
         return PendingReply("🧹 There was no DM history to clear.", "/wipe confirm")
 
     if action == "personality":
@@ -5711,7 +8200,7 @@ def _process_wipe_confirmation(sender_id: Any, message: str, is_direct: bool, ch
 
     return PendingReply("Unknown wipe action. Try /wipe again.", "/wipe confirm")
 
-def build_ollama_history(sender_id=None, is_direct=False, channel_idx=None, thread_root_ts=None, max_chars=OLLAMA_CONTEXT_CHARS):
+def build_ollama_history(sender_id=None, is_direct=False, channel_idx=None, thread_root_ts=None, max_chars=OLLAMA_CONTEXT_CHARS) -> Tuple[str, bool]:
   """Build a short conversation history string for Ollama based on recent messages.
 
   - For direct messages: include recent direct exchanges between `sender_id` and the AI node.
@@ -5723,7 +8212,7 @@ def build_ollama_history(sender_id=None, is_direct=False, channel_idx=None, thre
     with messages_lock:
         snapshot = list(messages)
     if not snapshot:
-      return ""
+      return "", False
     # Collect candidate messages in chronological order
     candidates = []
     if is_direct:
@@ -5793,12 +8282,14 @@ def build_ollama_history(sender_id=None, is_direct=False, channel_idx=None, thre
     history = "\n".join(out_lines)
     
     # Final character limit check (backup safety)
+    truncated = False
     if len(history) > max_chars:
+      truncated = True
       history = history[-max_chars:]
-    return history
+    return history, truncated
   except Exception as e:
     dprint(f"build_ollama_history error: {e}")
-    return ""
+    return "", False
 
 
 def send_to_ollama(
@@ -5810,6 +8301,8 @@ def send_to_ollama(
     system_prompt: Optional[str] = None,
     *,
     use_history: bool = True,
+    extra_context: Optional[str] = None,
+    allow_streaming: bool = True,
 ):
     dprint(f"send_to_ollama: user_message='{user_message}' sender_id={sender_id} is_direct={is_direct} channel={channel_idx}")
     ai_log("Processing message...", "ollama")
@@ -5820,9 +8313,10 @@ def send_to_ollama(
 
     # Build optional conversation history
     history = ""
+    history_truncated = False
     if use_history and sender_id is not None:
         try:
-            history = build_ollama_history(
+            history, history_truncated = build_ollama_history(
                 sender_id=sender_id,
                 is_direct=is_direct,
                 channel_idx=channel_idx,
@@ -5830,11 +8324,24 @@ def send_to_ollama(
             )
         except Exception as e:
             dprint(f"Warning: failed building history for Ollama: {e}")
-            history = ""
+            history, history_truncated = "", False
+
+    if history_truncated and is_direct and sender_id is not None:
+        sender_key = _safe_sender_key(sender_id)
+        if sender_key:
+            with CONTEXT_TRUNCATION_LOCK:
+                CONTEXT_TRUNCATED_SENDERS.add(sender_key)
 
     # Compose final prompt: system prompt, optional context, then user message
-    if history:
-        combined_prompt = f"{effective_system_prompt}\nCONTEXT:\n{history}\n\nUSER: {user_message}\nASSISTANT:"
+    combined_history = history.strip() if history else ""
+    extra_block = extra_context.strip() if extra_context else ""
+    if extra_block:
+        if combined_history:
+            combined_history = f"{extra_block}\n\n{combined_history}"
+        else:
+            combined_history = extra_block
+    if combined_history:
+        combined_prompt = f"{effective_system_prompt}\nCONTEXT:\n{combined_history}\n\nUSER: {user_message}\nASSISTANT:"
     else:
         combined_prompt = f"{effective_system_prompt}\nUSER: {user_message}\nASSISTANT:"
     if DEBUG_ENABLED:
@@ -5844,10 +8351,12 @@ def send_to_ollama(
         prompt_preview = user_message[:50] + "..." if len(user_message) > 50 else user_message
         clean_log(f"Prompt: {prompt_preview}", "💭")
 
+    stream_flag = bool(OLLAMA_STREAM and allow_streaming)
+
     payload = {
         "prompt": combined_prompt,
         "model": OLLAMA_MODEL,
-        "stream": False,  # disable streaming responses
+        "stream": stream_flag,
         "options": {
             # Ask Ollama to allocate a larger context window if the model supports it
             "num_ctx": OLLAMA_NUM_CTX,
@@ -5857,9 +8366,103 @@ def send_to_ollama(
             "top_p": 0.9,         # Nucleus sampling for quality vs speed balance
             "top_k": 40,          # Limit vocabulary consideration for speed
             "repeat_penalty": 1.1, # Prevent repetition
-            "num_thread": 4,      # Use multiple CPU threads (adjust based on Pi)
+            "num_thread": OLLAMA_NUM_THREAD,
         },
     }
+
+    use_streaming = stream_flag
+
+    def _send_stream_chunk(chunk_text: str) -> bool:
+        if not chunk_text or not chunk_text.strip():
+            return False
+        if interface is None:
+            return False
+        try:
+            if is_direct and sender_id is not None:
+                send_direct_chunks(interface, chunk_text, sender_id, chunk_delay=0)
+                return True
+            if not is_direct and channel_idx is not None:
+                send_broadcast_chunks(interface, chunk_text, channel_idx, chunk_delay=0)
+                return True
+        except Exception as exc:
+            clean_log(f"Streaming send failed: {exc}", "⚠️", show_always=False)
+        return False
+
+    def _consume_stream(response: requests.Response):
+        nonlocal use_streaming
+        total_parts: List[str] = []
+        total_len = 0
+        buffer = ""
+        streamed_chunks = 0
+        truncated = False
+        stop_stream = False
+
+        def flush(force: bool = False):
+            nonlocal buffer, streamed_chunks
+            if not use_streaming:
+                return
+            while buffer and streamed_chunks < MAX_CHUNKS:
+                if not force and len(buffer) < MAX_CHUNK_SIZE:
+                    break
+                chunk_len = min(len(buffer), MAX_CHUNK_SIZE)
+                if not force and chunk_len < MAX_CHUNK_SIZE:
+                    break
+                chunk = buffer[:chunk_len]
+                if _send_stream_chunk(chunk):
+                    buffer = buffer[chunk_len:]
+                    streamed_chunks += 1
+                else:
+                    # Leave buffer intact so the normal chunk sender can handle it later
+                    break
+
+        try:
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if stop_stream:
+                    break
+                if not raw_line:
+                    continue
+                try:
+                    piece = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+
+                if piece.get("error"):
+                    message = _format_ai_error("Ollama", piece["error"])
+                    response.close()
+                    return StreamingResult(message)
+
+                fragment = piece.get("response") or ""
+                if fragment:
+                    allowed = MAX_RESPONSE_LENGTH - total_len
+                    if allowed <= 0:
+                        truncated = True
+                        stop_stream = True
+                    else:
+                        snippet = fragment[:allowed]
+                        total_parts.append(snippet)
+                        total_len += len(snippet)
+                        buffer += snippet
+                        if len(fragment) > allowed:
+                            truncated = True
+                            stop_stream = True
+                        flush()
+
+                if piece.get("done"):
+                    break
+
+        finally:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+        flush(force=True)
+        full_text = "".join(total_parts)
+        if not full_text:
+            full_text = _format_ai_error("Ollama", "no content returned")
+        clean_resp = full_text[:100] + "..." if len(full_text) > 100 else full_text
+        ai_log(f"Response: {clean_resp}", "ollama")
+        return StreamingResult(full_text[:MAX_RESPONSE_LENGTH], sent_chunks=streamed_chunks, truncated=truncated)
 
     try:
         try:
@@ -5872,7 +8475,12 @@ def send_to_ollama(
         while attempts < 2:
             attempts += 1
             try:
-                r = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT)
+                r = requests.post(
+                    OLLAMA_URL,
+                    json=payload,
+                    timeout=OLLAMA_TIMEOUT,
+                    stream=use_streaming,
+                )
                 break
             except Exception as e:
                 if attempts >= 2:
@@ -5880,6 +8488,9 @@ def send_to_ollama(
                 time.sleep(backoff)
                 backoff *= 1.7
         if r is not None and r.status_code == 200:
+            if use_streaming:
+                return _consume_stream(r)
+
             jr = r.json()
             dprint(f"Ollama raw => {jr}")
             # Extract clean response for logging
@@ -5950,6 +8561,20 @@ def send_to_home_assistant(user_message):
 def get_ai_response(prompt, sender_id=None, is_direct=False, channel_idx=None, thread_root_ts=None):
   """Return an AI response using the configured provider (Ollama by default)."""
   system_prompt = build_system_prompt_for_sender(sender_id)
+  extra_context = None
+  use_history = True
+  session_notice = None
+  sender_key = _safe_sender_key(sender_id) if sender_id is not None else None
+  if sender_key:
+    session, session_notice = _get_context_session(sender_key)
+  if session:
+    extra_context = session.get('context')
+    use_history = session.get('use_history', True)
+    override_prompt = session.get('system_prompt_override')
+    if override_prompt:
+      system_prompt = override_prompt
+    elif session.get('prompt_addendum'):
+      system_prompt = f"{system_prompt}\n\n{session['prompt_addendum']}"
   provider = AI_PROVIDER
   if provider == "home_assistant":
     return send_to_home_assistant(prompt)
@@ -5957,14 +8582,25 @@ def get_ai_response(prompt, sender_id=None, is_direct=False, channel_idx=None, t
   if provider not in {"ollama", "home_assistant"}:
     print(f"⚠️ Unknown AI provider '{provider}', defaulting to Ollama.")
 
-  return send_to_ollama(
+  _log_high_cost(sender_id, "ollama", prompt[:80])
+  response = send_to_ollama(
       prompt,
       sender_id=sender_id,
       is_direct=is_direct,
       channel_idx=channel_idx,
       thread_root_ts=thread_root_ts,
       system_prompt=system_prompt,
+      use_history=use_history,
+      extra_context=extra_context,
+      allow_streaming=(session_notice is None),
   )
+  if session_notice:
+    if isinstance(response, PendingReply):
+      response.text = f"{session_notice}\n\n{response.text}" if response.text else session_notice
+      return response
+    if isinstance(response, str):
+      return f"{session_notice}\n\n{response}" if response else session_notice
+  return response
 # -----------------------------
 # Helper: Validate/Strip PIN (for Home Assistant)
 # -----------------------------
@@ -6104,7 +8740,11 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
       return _cmd_reply(cmd, "Mailbox name cannot be empty.")
     rest = parts[1].strip() if len(parts) > 1 else ""
     sender_key = _safe_sender_key(sender_id)
-    reply = MAIL_MANAGER.handle_check(sender_key, mailbox, rest)
+    try:
+      sender_short = get_node_shortname(sender_id)
+    except Exception:
+      sender_short = str(sender_id)
+    reply = MAIL_MANAGER.handle_check(sender_key, sender_id, sender_short, mailbox, rest)
     return reply
 
   elif cmd == "/wipe":
@@ -6189,6 +8829,77 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     )
     return _cmd_reply(cmd, guide)
 
+  elif cmd == "/save":
+    if not is_direct:
+      return _cmd_reply(cmd, translate(lang, 'dm_only', "❌ This command can only be used in a direct message."))
+    sender_key = _safe_sender_key(sender_id)
+    if not sender_key:
+      return _cmd_reply(cmd, "⚠️ I couldn't identify your DM session. Try again in a moment.")
+    topic = full_text[len(cmd):].strip()
+    if topic.startswith(('"', "'")) and topic.endswith(('"', "'")) and len(topic) >= 2:
+      topic = topic[1:-1].strip()
+    if topic:
+      return _save_conversation_for_user(sender_id, sender_key, topic, lang, auto_title=False)
+    PENDING_SAVE_WIZARDS[sender_key] = {
+      'created': _now(),
+      'sender_id': sender_id,
+      'language': lang,
+    }
+    return PendingReply(
+      "📝 Name this conversation first. Reply with a short title (or N to cancel).",
+      "/save wizard",
+    )
+
+  elif cmd == "/chathistory":
+    if not is_direct:
+      return _cmd_reply(cmd, translate(lang, 'dm_only', "❌ This command can only be used in a direct message."))
+    sender_key = _safe_sender_key(sender_id)
+    if not sender_key:
+      return _cmd_reply(cmd, "⚠️ I couldn't identify your DM session. Try again in a moment.")
+    return _start_chathistory_menu(sender_key)
+
+  elif cmd == "/recall":
+    if not is_direct:
+      return _cmd_reply(cmd, translate(lang, 'dm_only', "❌ This command can only be used in a direct message."))
+    sender_key = _safe_sender_key(sender_id)
+    if not sender_key:
+      return _cmd_reply(cmd, "⚠️ I couldn't identify your DM session. Try again in a moment.")
+    contexts = _get_saved_contexts_for_user(sender_key)
+    if not contexts:
+      return _cmd_reply(cmd, "ℹ️ You haven't saved any conversations yet. Use `/save` first.")
+    topic = full_text[len(cmd):].strip()
+    if not topic:
+      return _start_chathistory_menu(sender_key)
+    matches = _find_saved_context_matches(sender_key, topic, limit=5)
+    if not matches or matches[0][1] < 0.35:
+      return _cmd_reply(cmd, "⚠️ I couldn't find a saved conversation matching that. Try a different description or `/recall` to list entries.")
+    top_entry, top_score = matches[0]
+    if top_score >= 0.85 or len(matches) == 1:
+      return _activate_saved_context_session(sender_id, sender_key, top_entry)
+    return _start_recall_selection(sender_key, matches)
+
+  elif cmd == "/stop":
+    if not is_direct:
+      return _cmd_reply(cmd, translate(lang, 'dm_only', "❌ This command can only be used in a direct message."))
+    sender_key = _safe_sender_key(sender_id)
+    if not sender_key:
+      return _cmd_reply(cmd, "⚠️ I couldn't identify your DM session. Try again in a moment.")
+    stopped = _stop_bible_autoscroll(sender_key)
+    if stopped:
+      return PendingReply(translate(lang, 'bible_autoscroll_stop', "⏹️ Auto-scroll paused. Reply 22 later to resume."), "/stop command")
+    with CONTEXT_SESSION_LOCK:
+      session = CONTEXT_SESSIONS.get(sender_key)
+    if session:
+      title = session.get('title') or "context window"
+      return PendingReply(f"ℹ️ Auto-scroll wasn't running. '{title}' is still active — use /exit to leave it.", "/stop command")
+    return PendingReply("ℹ️ There wasn't an active auto-scroll session.", "/stop command")
+
+  elif cmd == "/exit":
+    if not is_direct:
+      return _cmd_reply(cmd, translate(lang, 'dm_only', "❌ This command can only be used in a direct message."))
+    sender_key = _safe_sender_key(sender_id)
+    return _handle_exit_session(sender_key)
+
   elif cmd == "/meshtastic":
     if not _ensure_meshtastic_kb_loaded():
       return _cmd_reply(cmd, "MeshTastic field guide unavailable. Upload data and try again.")
@@ -6246,6 +8957,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     system_prompt = MESHTASTIC_KB_SYSTEM_PROMPT
     question_block = f"Question: {query}\nProvide a concise answer. Cite supporting excerpt numbers in square brackets."
     payload = f"{numbered_context}\n\n{question_block}"
+    _log_high_cost(sender_id, "meshtastic", query[:80])
     response = send_to_ollama(
       payload,
       sender_id=sender_id,
@@ -6254,10 +8966,24 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
       thread_root_ts=thread_root_ts,
       system_prompt=system_prompt,
       use_history=False,
+      extra_context=numbered_context,
     )
     if not response:
       return _cmd_reply(cmd, "MeshTastic lookup failed. Try later.")
-    return response
+    sender_key = _safe_sender_key(sender_id)
+    if sender_key:
+      session_payload = {
+        'type': 'meshtastic',
+        'title': 'MeshTastic knowledge session',
+        'summary': top_titles,
+        'context': numbered_context,
+        'system_prompt_override': MESHTASTIC_KB_SYSTEM_PROMPT,
+        'use_history': True,
+      }
+      _set_context_session(sender_key, session_payload)
+    preface = "⚙️ MeshTastic reference mode engaged. This will be a slow conversation—type /exit to leave this context window."
+    combined = f"{preface}\n\n{response}" if response else preface
+    return PendingReply(combined, "/meshtastic context")
 
   elif cmd == "/biblehelp":
     default_help = (
@@ -6268,85 +8994,28 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     help_text = translate(lang, 'bible_help', default_help)
     return _cmd_reply(cmd, help_text)
 
-  elif cmd == "/choosevibe":
+  elif cmd == "/vibe":
     sender_key = _safe_sender_key(sender_id)
-    current = None
-    if sender_key:
-      prefs = _get_user_ai_preferences(sender_key)
-      current = prefs.get("personality_id")
-    page_arg = full_text[len(cmd):].strip()
-    page = 1
-    if page_arg:
-      try:
-        page = int(page_arg)
-      except ValueError:
-        return _cmd_reply(cmd, "Use this by typing: /changevibe [page_number]")
-    listing = _format_personality_list(current, page)
-    return _cmd_reply(cmd, listing)
-
-  elif cmd == "/aivibe":
-    sender_key = _safe_sender_key(sender_id)
-    prefs = _get_user_ai_preferences(sender_key)
-    persona_id = prefs.get("personality_id")
-    persona = AI_PERSONALITY_MAP.get(persona_id or "", {}) if persona_id else {}
-    name = persona.get("name") or persona_id or "default"
-    emoji = persona.get("emoji") or "🧠"
-    summary = f"{emoji} Current vibe: {name}. Change with /changevibe."
-    return _cmd_reply(cmd, summary.strip())
-
-  elif cmd == "/aipersonality":
     if not is_direct:
-      return _cmd_reply(cmd, "❌ Personalities can only be managed in a direct message.")
-    sender_key = _safe_sender_key(sender_id) or str(sender_id)
-    prefs = _get_user_ai_preferences(sender_key)
+      summary = _format_personality_summary(sender_key)
+      return _cmd_reply(cmd, f"{summary}\n\nDM me with `/vibe` to change vibes.")
+    if not sender_key:
+      return _cmd_reply(cmd, "⚠️ I couldn't identify your DM session. Try again in a moment.")
+
     remainder = full_text[len(cmd):].strip()
     if not remainder:
-      summary = _format_personality_summary(sender_key)
-      return _cmd_reply(cmd, summary)
+      return _start_vibe_menu(sender_key)
+
     parts = remainder.split(None, 1)
     action = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
-    if arg.startswith(('"', "'")) and arg.endswith(('"', "'")) and len(arg) >= 2:
-      arg = arg[1:-1].strip()
 
-    if action in {"list", "ls", "showall"}:
-      page = 1
-      if arg:
-        try:
-          page = int(arg)
-        except ValueError:
-          return _cmd_reply(cmd, "Use this by typing: /aipersonality list [page_number]")
-      listing = _format_personality_list(prefs.get("personality_id"), page)
-      return _cmd_reply(cmd, listing)
-
-    if action in {"show", "status", "current"}:
-      summary = _format_personality_summary(sender_key)
-      return _cmd_reply(cmd, summary)
-
-    if action in {"set", "use", "choose"}:
-      if not arg:
-        return _cmd_reply(cmd, "Use this by typing: /aipersonality set <name>")
-      persona_id = _canonical_personality_id(arg)
-      if not persona_id:
-        suggestions = difflib.get_close_matches(arg.lower(), list(AI_PERSONALITY_LOOKUP.keys()), n=1, cutoff=0.6)
-        if suggestions:
-          hinted = AI_PERSONALITY_LOOKUP.get(suggestions[0], suggestions[0])
-          return _cmd_reply(cmd, f"❔ Unknown personality '{arg}'. Did you mean '{hinted}'?")
-        return _cmd_reply(cmd, f"❔ Unknown personality '{arg}'. Try /aipersonality list for options.")
-      _set_user_personality(sender_key, persona_id)
-      persona = AI_PERSONALITY_MAP.get(persona_id, {})
-      emoji = persona.get("emoji") or "🧠"
-      name = persona.get("name") or persona_id
-      description = persona.get("description") or ""
-      response_lines = [f"{emoji} Personality set to {name} ({persona_id})."]
-      if description:
-        response_lines.append(description)
-      response_lines.append("Tip: add extra guidance with /aipersonality prompt <text>.")
-      return _cmd_reply(cmd, "\n".join(response_lines))
+    if action in {"status", "show", "current"}:
+      return _cmd_reply(cmd, _format_personality_summary(sender_key))
 
     if action in {"prompt", "custom", "append"}:
       if not arg:
-        return _cmd_reply(cmd, "Use this by typing: /aipersonality prompt <extra instructions> | prompt clear")
+        return _cmd_reply(cmd, "Use this by typing: /vibe prompt <extra instructions> | /vibe prompt clear")
       lowered = arg.lower()
       if lowered in {"clear", "reset", "none", "remove"}:
         _set_user_prompt_override(sender_key, None)
@@ -6358,34 +9027,304 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
 
     if action in {"reset", "default", "restore"}:
       _reset_user_personality(sender_key)
-      fallback = _get_user_ai_preferences(sender_key)
-      persona_id = fallback.get("personality_id")
-      persona = AI_PERSONALITY_MAP.get(persona_id, {}) if persona_id else {}
+      return _cmd_reply(cmd, _format_personality_summary(sender_key))
+
+    if action in {"set", "use", "choose"}:
+      if not arg:
+        return _cmd_reply(cmd, "Use this by typing: /vibe set <name>")
+      persona_id = _canonical_personality_id(arg)
+      if not persona_id:
+        suggestions = difflib.get_close_matches(arg.lower(), list(AI_PERSONALITY_LOOKUP.keys()), n=1, cutoff=0.6)
+        if suggestions:
+          hinted = AI_PERSONALITY_LOOKUP.get(suggestions[0], suggestions[0])
+          return _cmd_reply(cmd, f"❔ Unknown vibe '{arg}'. Did you mean '{hinted}'?")
+        return _cmd_reply(cmd, f"❔ Unknown vibe '{arg}'. Send `/vibe` to browse the list.")
+      if not _set_user_personality(sender_key, persona_id):
+        return _cmd_reply(cmd, "⚠️ Couldn't apply that vibe. Try again in a moment.")
+      persona = AI_PERSONALITY_MAP.get(persona_id, {})
       emoji = persona.get("emoji") or "🧠"
-      name = persona.get("name") or (persona_id or "default mode")
-      lines = [f"{emoji} Reset complete. You're back to {name}."]
-      lines.append("Custom prompt cleared.")
+      name = persona.get("name") or persona_id
+      description = persona.get("description") or ""
+      lines = [f"{emoji} Vibe set to {name} ({persona_id})."]
+      if description:
+        lines.append(description)
       return _cmd_reply(cmd, "\n".join(lines))
 
-    return _cmd_reply(cmd, "🤔 Unknown option. Try /aipersonality, /aipersonality list, or /aipersonality help.")
+    return _cmd_reply(cmd, "Send `/vibe` to browse vibes, then reply with a number to switch. Extras: /vibe prompt <text>, /vibe prompt clear, /vibe reset.")
+
+  elif cmd in {"/aivibe", "/changevibe", "/choosevibe", "/aipersonality"}:
+    summary = _format_personality_summary(_safe_sender_key(sender_id))
+    return _cmd_reply(cmd, f"{summary}\n\nCommand renamed. Use `/vibe` for vibe controls.")
 
   elif cmd == "/help":
     built_in = [
       "/about", "/menu", "/mail", "/checkmail", "/emailhelp", "/wipe",
       "/query", "/test",
-      "/motd", "/meshinfo", "/bible", "/biblehelp", "/chucknorris", "/elpaso", "/blond", "/yomomma",
+      "/motd", "/meshinfo", "/bible", "/biblehelp", "/web", "/drudge", "/chucknorris", "/elpaso", "/blond", "/yomomma",
       "/games", "/hangman", "/wordle", "/wordladder", "/adventure", "/rps", "/coinflip", "/cipher", "/bingo", "/quizbattle", "/morse",
-      "/aivibe", "/changevibe", "/aipersonality", "/changemotd", "/changeprompt", "/showprompt", "/printprompt", "/reset"
+      "/vibe", "/chathistory", "/changemotd", "/changeprompt", "/showprompt", "/printprompt", "/reset"
     ]
     custom_cmds = [c.get("command") for c in commands_config.get("commands", [])]
     help_text = "Commands:\n" + ", ".join(built_in + custom_cmds)
-    help_text += "\nNote: /aipersonality, /aivibe, /changevibe, /changeprompt, /changemotd, /showprompt, and /printprompt are DM-only."
+    help_text += "\nNote: /vibe, /chathistory, /changeprompt, /changemotd, /showprompt, and /printprompt are DM-only."
     help_text += "\nBrowse highlights with /menu."
     return _cmd_reply(cmd, help_text)
 
   elif cmd == "/menu":
     menu_text = format_structured_menu("menu", lang)
     return _cmd_reply(cmd, menu_text)
+
+  elif cmd == "/offline":
+    if not is_direct:
+      msg = translate(lang, 'dm_only', "❌ This command can only be used in a direct message.")
+      return _cmd_reply(cmd, msg)
+    remainder = full_text[len(cmd):].strip()
+    if not remainder:
+      helper_lines = [
+        "Offline toolkit:",
+        "• wiki <topic> — load encyclopedia context without the internet.",
+      ]
+      return _cmd_reply(cmd, "\n".join(helper_lines))
+
+    parts = remainder.split(None, 1)
+    subcmd_raw = parts[0].lower()
+    argument = parts[1].strip() if len(parts) > 1 else ""
+
+    offline_aliases = {
+      "wiki": "wiki",
+      "wikipedia": "wiki",
+      "wifi": "wiki",
+    }
+    subcmd = offline_aliases.get(subcmd_raw)
+    if not subcmd:
+      # Try a gentle fuzzy match so typos like "wki" still guide the user.
+      suggestions = difflib.get_close_matches(subcmd_raw, offline_aliases.keys(), n=1, cutoff=0.7)
+      if suggestions:
+        subcmd = offline_aliases[suggestions[0]]
+      else:
+        return _cmd_reply(cmd, f"Offline toolkit commands:\n• wiki <topic> (you wrote '{subcmd_raw}')")
+
+    if subcmd == "wiki":
+      if not OFFLINE_WIKI_ENABLED or OFFLINE_WIKI_STORE is None:
+        return _cmd_reply(cmd, "📚 Offline wiki support is disabled on this node.")
+      if not OFFLINE_WIKI_STORE.is_ready():
+        error = OFFLINE_WIKI_STORE.error_message() or f"Install offline data at {OFFLINE_WIKI_INDEX}."
+        return _cmd_reply(cmd, f"📚 Offline wiki not ready: {error}")
+      if not argument:
+        return _cmd_reply(cmd, "Use this by typing: /offline wiki <topic>")
+
+      try:
+        article, suggestions = OFFLINE_WIKI_STORE.lookup(
+          argument,
+          summary_limit=OFFLINE_WIKI_SUMMARY_LIMIT,
+          context_limit=OFFLINE_WIKI_CONTEXT_LIMIT,
+        )
+      except Exception as exc:
+        clean_log(f"Offline wiki lookup error: {exc}", "⚠️", show_always=True, rate_limit=False)
+        return _cmd_reply(cmd, "⚠️ Offline wiki lookup failed. Try again later.")
+
+      if not article:
+        if suggestions:
+          suggestion_line = ", ".join(suggestions)
+          return _cmd_reply(cmd, f"📚 I couldn't find '{argument}'. Try: {suggestion_line}")
+        available = list(itertools.islice(OFFLINE_WIKI_STORE.available_topics(), 5))
+        if available:
+          catalog = ", ".join(available)
+          helper = (
+            f"📚 I couldn't find '{argument}' in the offline library."
+            f" Try one of the loaded topics: {catalog}."
+            f" Add more JSON articles under {OFFLINE_WIKI_DIR} to expand the catalog."
+          )
+          return _cmd_reply(cmd, helper)
+        error = OFFLINE_WIKI_STORE.error_message()
+        if error:
+          clean_log(error, "⚠️", show_always=True, rate_limit=False)
+        return _cmd_reply(cmd, f"📚 I couldn't find '{argument}' and the offline library is currently empty.")
+
+      lines = [f"📚 Offline Wiki: {article.title}"]
+      if article.summary:
+        lines.append(article.summary)
+      context_len = min(len(article.content), OFFLINE_WIKI_CONTEXT_LIMIT)
+      lines.append(f"Loaded about {context_len} chars of context. Ask follow-up questions or send /reset to clear.")
+      if article.source:
+        lines.append(f"Source: {article.source}")
+      formatted = "\n".join(lines)
+
+      sender_key = _safe_sender_key(sender_id)
+      if sender_key and article.content:
+        _store_web_context(sender_key, formatted, context=article.content)
+
+      origin = article.matched_alias if article.matched_alias else argument
+      clean_log(f"Offline wiki request '{origin}' → {article.title}", "📦", show_always=False)
+      return _cmd_reply(cmd, formatted)
+
+    return _cmd_reply(cmd, "Offline toolkit commands:\n• wiki <topic>")
+
+  elif cmd == "/web":
+    query = full_text[len(cmd):].strip()
+    if not is_direct:
+      return _cmd_reply(cmd, translate(lang, 'dm_only', "❌ This command can only be used in a direct message."))
+    if not query:
+      return _cmd_reply(cmd, "Use this by typing: /web <search terms>")
+
+    tokens = query.split()
+    crawl_flag = False
+    crawl_pages = WEB_CRAWL_MAX_PAGES
+    if tokens:
+      last_token = tokens[-1].lower()
+      crawl_match = re.match(r"crawl(\d+)?", last_token)
+      if crawl_match:
+        crawl_flag = True
+        tokens = tokens[:-1]
+        num_spec = crawl_match.group(1)
+        if num_spec:
+          try:
+            crawl_pages = max(1, min(int(num_spec), WEB_CRAWL_MAX_LIMIT))
+          except ValueError:
+            crawl_pages = WEB_CRAWL_MAX_PAGES
+    query_core = " ".join(tokens).strip() if crawl_flag else query
+    if crawl_flag and not query_core:
+      return _cmd_reply(cmd, "Provide a domain to crawl, e.g. `/web example.com crawl`.")
+
+    context_payload = None
+    try:
+      direct_url = _extract_direct_url(query_core)
+      if crawl_flag:
+        if not direct_url:
+          return _cmd_reply(cmd, "Crawl needs a single domain without extra words, e.g. `/web example.com crawl`.")
+        pages, contacts, contact_page = _crawl_website(direct_url, max_pages=crawl_pages)
+        formatted = _format_crawl_results(direct_url, pages, contacts, contact_page)
+        context_payload = None  # skip storing crawl context per user request
+        clean_log(f"Crawled {len(pages)} pages from '{direct_url}' (contacts: {len(contacts)})", "🕸️", show_always=False)
+      elif direct_url:
+        results = _fetch_url_preview(direct_url)
+        formatted = _format_web_results(direct_url, results)
+        context_payload = _context_from_results(direct_url, results)
+        clean_log(f"Direct web fetch '{direct_url}'", "🔗", show_always=False)
+      else:
+        results = _web_search_duckduckgo(query, WEB_SEARCH_MAX_RESULTS)
+        formatted = _format_web_results(query, results)
+        context_payload = _context_from_results(query, results)
+        clean_log(f"Web search '{query}' returned {len(results)} results", "🔍", show_always=False)
+    except RuntimeError as exc:
+      if str(exc) == "offline":
+        clean_log("Web search blocked: offline mode", "⚠️", show_always=True, rate_limit=False)
+        return _cmd_reply(cmd, translate(lang, 'web_offline', "🌐 Offline mode only. Web search unavailable."))
+      clean_log(f"Web search error: {exc}", "⚠️", show_always=True, rate_limit=False)
+      return _cmd_reply(cmd, "⚠️ Web search failed. Try again later.")
+    except Exception as exc:
+      clean_log(f"Web handler exception: {exc}", "⚠️", show_always=True, rate_limit=False)
+      return _cmd_reply(cmd, "⚠️ Something went wrong processing that request. Try again later.")
+    sender_key = _safe_sender_key(sender_id)
+    if context_payload and not crawl_flag:
+      _store_web_context(sender_key, formatted, context=context_payload)
+    return _cmd_reply(cmd, formatted)
+
+  elif cmd == "/drudge":
+    try:
+      headlines = _fetch_drudge_headlines()
+    except RuntimeError as exc:
+      if str(exc) == "offline":
+        clean_log("Drudge fetch blocked: offline mode", "⚠️", show_always=True, rate_limit=False)
+        return _cmd_reply(cmd, "🌐 Offline mode only. Unable to reach Drudge Report.")
+      clean_log(f"Drudge fetch error: {exc}", "⚠️", show_always=True, rate_limit=False)
+      return _cmd_reply(cmd, "⚠️ Couldn't load Drudge headlines right now. Try again later.")
+
+    if not headlines:
+      return _cmd_reply(cmd, "🗞️ No Drudge headlines found at the moment.")
+
+    lines = ["🗞️ Drudge Report (latest headlines):"]
+    for idx, item in enumerate(headlines, 1):
+      title = item.get("title") or "(untitled)"
+      lines.append(f"{idx}. {title}")
+    formatted = "\n".join(lines)
+    clean_log("Fetched Drudge Report headlines", "🗞️", show_always=False)
+    return _cmd_reply(cmd, formatted)
+
+  elif cmd == "/write":
+    write_menu = format_structured_menu("write", lang)
+    return _cmd_reply(cmd, write_menu)
+
+  elif cmd == "/wiki":
+    topic = full_text[len(cmd):].strip()
+    if not topic:
+      return _cmd_reply(cmd, "Use this by typing: /wiki <topic>")
+    if not is_direct:
+      return _cmd_reply(cmd, "❌ This command can only be used in a direct message.")
+    try:
+      article = _fetch_wikipedia_article(topic, max_chars=WIKI_MAX_CHARS)
+    except RuntimeError as exc:
+      reason = str(exc)
+      if reason == "offline":
+        return _cmd_reply(cmd, translate(lang, 'web_offline', "🌐 Offline mode only. Web search unavailable."))
+      if reason == "wiki_missing":
+        return _cmd_reply(cmd, "📚 I couldn't find that topic on Wikipedia.")
+      clean_log(f"Wiki fetch error: {exc}", "⚠️", show_always=True, rate_limit=False)
+      return _cmd_reply(cmd, "⚠️ Wikipedia lookup failed. Try again later.")
+    except Exception as exc:
+      clean_log(f"Wiki handler exception: {exc}", "⚠️", show_always=True, rate_limit=False)
+      return _cmd_reply(cmd, "⚠️ Something went wrong processing that request. Try again later.")
+
+    formatted = _format_wiki_summary(article)
+    clean_log(f"Wikipedia article '{article.get('title', topic)}' loaded", "📚", show_always=False)
+    sender_key = _safe_sender_key(sender_id)
+    if sender_key:
+      context_payload = _format_wiki_context(article)
+      _store_web_context(sender_key, formatted, context=context_payload)
+    if OFFLINE_WIKI_ENABLED and OFFLINE_WIKI_STORE is not None:
+      try:
+        OFFLINE_WIKI_STORE.store_article(
+          title=article.get('title', topic),
+          content=article.get('content', ''),
+          summary=article.get('summary'),
+          source=article.get('source'),
+          aliases=[topic],
+          overwrite=False,
+        )
+      except Exception as exc:
+        clean_log(f"Offline wiki store error: {exc}", "⚠️", show_always=True, rate_limit=False)
+    return _cmd_reply(cmd, formatted)
+
+  elif cmd in WRITE_COMMAND_FLOWS:
+    if not is_direct:
+      msg = translate(lang, 'dm_only', "❌ This command can only be used in a direct message.")
+      return _cmd_reply(cmd, msg)
+    flow = WRITE_COMMAND_FLOWS[cmd]
+    subject = full_text[len(cmd):].strip()
+    sender_key = _safe_sender_key(sender_id)
+    if flow == "sayno" and (not subject):
+      if not sender_key:
+        return _cmd_reply(cmd, "I need to know who I'm talking to first. Try again in a bit.")
+      PENDING_WRITE_REQUESTS[sender_key] = {
+        "flow": flow,
+        "created": _now(),
+        "language": lang,
+      }
+      return _start_write_wizard(flow, lang)
+    if not subject:
+      usage_map = {
+        "/hype": "Use this by typing: /hype <topic>",
+        "/apology": "Use this by typing: /apology <name or group>",
+        "/breakup": "Use this by typing: /breakup <name>",
+        "/quitjob": "Use this by typing: /quitjob <boss or team>",
+        "/congrats": "Use this by typing: /congrats <achievement>",
+        "/thankyou": "Use this by typing: /thankyou <person or team>",
+        "/sayno": "Use this by typing: /sayno <name or request>",
+      }
+      helper = usage_map.get(cmd, f"Use this by typing: {cmd} <subject>")
+      return _cmd_reply(cmd, helper)
+    response = _generate_write_response(
+      flow,
+      subject,
+      lang,
+      sender_id=sender_id,
+      is_direct=is_direct,
+      channel_idx=channel_idx,
+      thread_root_ts=thread_root_ts,
+    )
+    if response:
+      return response
+    return _cmd_reply(cmd, "⚠️ That prompt didn't go through. Try again in a moment.")
 
   elif cmd == "/motd":
     motd_msg = translate(lang, 'motd_current', "Current MOTD:\n{motd}", motd=motd_content)
@@ -6404,6 +9343,15 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
       "/bibletrivia": "bible",
       "/disastertrivia": "disaster",
       "/trivia": "general",
+    }[cmd]
+    args = full_text[len(cmd):].strip()
+    result = handle_trivia_command(cmd, category, args, sender_id, is_direct, channel_idx, lang)
+    return _cmd_reply(cmd, result)
+
+  elif cmd in ("/mathquiz", "/electricalquiz"):
+    category = {
+      "/mathquiz": "math",
+      "/electricalquiz": "electrical",
     }[cmd]
     args = full_text[len(cmd):].strip()
     result = handle_trivia_command(cmd, category, args, sender_id, is_direct, channel_idx, lang)
@@ -6467,7 +9415,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
           info['span'] = span
           info['book'] = book_name
           _set_bible_nav(sender_key, info, is_direct=is_direct, channel_idx=channel_idx)
-          response_text = f"{text}\n<1,2>"
+          response_text = _format_bible_nav_message(text)
           state_for_shift = {
             'book': book_name,
             'chapter': info['chapter'],
@@ -6489,7 +9437,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
         sender_key = _safe_sender_key(sender_id)
         if sender_key:
           _set_bible_nav(sender_key, verse_info, is_direct=is_direct, channel_idx=channel_idx)
-        response_text = f"{text}\n<1,2>"
+        response_text = _format_bible_nav_message(text)
         return PendingReply(response_text, "/bible command")
       return _cmd_reply(cmd, translate(lang, 'bible_missing', "📜 Scripture library unavailable right now."))
 
@@ -6541,7 +9489,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
         info['book'] = book_name
         info['span'] = info.get('verse_end', verse_end) - info.get('verse_start', verse_start)
         _set_bible_nav(sender_key, info, is_direct=is_direct, channel_idx=channel_idx)
-      response_text = f"{text}\n<1,2>"
+      response_text = _format_bible_nav_message(text)
       return PendingReply(response_text, "/bible command")
     ref_label = f"{chapter}:{verse_start}" if verse_start == verse_end else f"{chapter}:{verse_start}-{verse_end}"
     display = _display_book_name(book_name, lang)
@@ -6669,6 +9617,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
       save_archive()
     if cleared > 0:
       if is_direct:
+        _clear_web_context(_safe_sender_key(sender_id))
         return _cmd_reply(cmd, "I seemed to have had a robot brain fart.., I guess we're starting fresh")
       else:
         return _cmd_reply(cmd, "🧵 Thread/channel context cleared. Starting fresh.")
@@ -6778,12 +9727,47 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
         return PendingReply("\n".join(lines), "/weather wizard")
       else:
         PENDING_WEATHER_REPORTS.pop(sender_key, None)
+  if is_direct and sender_key and sender_key in PENDING_WRITE_REQUESTS and not text.startswith("/"):
+    if check_only:
+      return False
+    state = PENDING_WRITE_REQUESTS.get(sender_key) or {}
+    flow = state.get('flow')
+    if not flow:
+      PENDING_WRITE_REQUESTS.pop(sender_key, None)
+      return PendingReply("Let's start over—run the command again when you're ready.", "/write wizard")
+    created = state.get('created', 0.0)
+    if (_now() - created) > WRITE_FLOW_TIMEOUT:
+      PENDING_WRITE_REQUESTS.pop(sender_key, None)
+      return PendingReply(f"⏳ Wizard timed out. Run /{flow} again when you're ready.", f"/{flow} wizard")
+    state_lang = state.get('language') or LANGUAGE_FALLBACK
+    subject = text.strip()
+    if not subject:
+      return _start_write_wizard(flow, state_lang)
+    PENDING_WRITE_REQUESTS.pop(sender_key, None)
+    response = _generate_write_response(
+      flow,
+      subject,
+      state_lang,
+      sender_id=sender_id,
+      is_direct=is_direct,
+      channel_idx=channel_idx,
+      thread_root_ts=thread_root_ts,
+    )
+    if response:
+      return response
+    return _cmd_reply(f"/{flow}", "⚠️ Couldn't draft that message right now. Try again in a moment.")
   if sender_key and sender_key in PENDING_POSITION_CONFIRM and not text.startswith("/"):
     if check_only:
       return False
     reply = _handle_position_confirmation(sender_key, sender_id, text, is_direct, channel_idx)
     if reply:
       return reply
+  if is_direct and sender_key and sender_key in PENDING_SAVE_WIZARDS and not text.startswith("/"):
+    if check_only:
+      return False
+    wizard_reply = _handle_pending_save_response(sender_id, sender_key, text)
+    if wizard_reply:
+      return wizard_reply
   if is_direct and sender_key and MAIL_MANAGER.has_pending_creation(sender_key) and not text.startswith("/"):
     if check_only:
       return False
@@ -6810,6 +9794,19 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
     else:
       if not check_only:
         _clear_bible_nav(sender_key)
+
+  if sender_key and sender_key in PENDING_RECALL_SELECTIONS and not text.startswith("/"):
+    if check_only:
+      return True
+    pending_reply = _handle_pending_recall_response(sender_id, sender_key, text)
+    if pending_reply:
+      return pending_reply
+  if is_direct and sender_key and sender_key in PENDING_VIBE_SELECTIONS and not text.startswith("/"):
+    if check_only:
+      return False
+    vibe_reply = _handle_pending_vibe_selection(sender_key, text)
+    if vibe_reply:
+      return vibe_reply
 
   sanitized = text.replace('\u0007', '').strip()
   normalized = sanitized.lower()
@@ -6849,8 +9846,20 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
       PENDING_POSITION_CONFIRM[sender_key] = pending_position_info
     return PendingReply(quick_reply, quick_reason or "quick reply")
 
+  if is_direct and sender_key and not text.startswith("/"):
+    memory_result = _maybe_handle_memory_intent(sender_id, sender_key, sanitized, LANGUAGE_FALLBACK, check_only=check_only)
+    if memory_result is not None:
+      if check_only:
+        return bool(memory_result)
+      if isinstance(memory_result, PendingReply):
+        return memory_result
+      if isinstance(memory_result, bool):
+        return False
+
   if text.startswith("/") and sender_key in PENDING_WEATHER_REPORTS:
     PENDING_WEATHER_REPORTS.pop(sender_key, None)
+  if text.startswith("/") and sender_key in PENDING_WRITE_REQUESTS:
+    PENDING_WRITE_REQUESTS.pop(sender_key, None)
 
   # Commands (start with /) should be handled and given context
   if text.startswith("/"):
@@ -6935,7 +9944,20 @@ def on_receive(packet=None, interface=None, **kwargs):
   # normalize decoded to dict
   if not isinstance(decoded, dict):
     decoded = {'text': str(decoded), 'portnum': 'TEXT_MESSAGE_APP'}
-  
+
+  sender_node = (packet.get('fromId') if isinstance(packet, dict) else None) or (packet.get('from') if isinstance(packet, dict) else None) or kwargs.get('fromId') or kwargs.get('from')
+  raw_to = (packet.get('toId') if isinstance(packet, dict) else None) or (packet.get('to') if isinstance(packet, dict) else None) or kwargs.get('toId') or kwargs.get('to')
+  to_node_int = parse_node_id(raw_to)
+  if to_node_int is None:
+    to_node_int = BROADCAST_ADDR
+  sender_key = _safe_sender_key(sender_node)
+  if sender_key and sender_key not in NODE_FIRST_SEEN:
+    NODE_FIRST_SEEN[sender_key] = _now()
+  try:
+    MAIL_MANAGER.handle_heartbeat(sender_key, sender_node)
+  except Exception as exc:
+    clean_log(f"Mailbox heartbeat error: {exc}", "⚠️")
+
   # continue processing
   try:
     globals()['last_rx_time'] = _now()
@@ -6967,11 +9989,6 @@ def on_receive(packet=None, interface=None, **kwargs):
         text = payload
       else:
         text = str(payload) if payload is not None else ''
-    sender_node = (packet.get('fromId') if isinstance(packet, dict) else None) or (packet.get('from') if isinstance(packet, dict) else None) or kwargs.get('fromId') or kwargs.get('from')
-    raw_to = (packet.get('toId') if isinstance(packet, dict) else None) or (packet.get('to') if isinstance(packet, dict) else None) or kwargs.get('toId') or kwargs.get('to')
-    to_node_int = parse_node_id(raw_to)
-    if to_node_int is None:
-      to_node_int = BROADCAST_ADDR
     ch_idx = 0
     if isinstance(packet, dict):
       ch_idx = packet.get('channel') if packet.get('channel') is not None else packet.get('channelIndex', 0)
@@ -6991,14 +10008,16 @@ def on_receive(packet=None, interface=None, **kwargs):
     summary = _truncate_for_log(text)
     info_print(f"📨 {sender_display} → {dest_display} ({channel_label}): {summary}")
 
-    sender_key = _safe_sender_key(sender_node)
-
     entry = log_message(
         sender_node,
         text,
         direct=(to_node_int != BROADCAST_ADDR),
         channel_idx=(None if to_node_int != BROADCAST_ADDR else ch_idx),
     )
+
+    normalized_text = (text or "").strip()
+    if sender_key and normalized_text and not normalized_text.startswith('/'):
+        _cooldown_register(sender_key, sender_node, interface)
 
     global lastDMNode, lastChannelIndex
     if to_node_int != BROADCAST_ADDR:
@@ -7063,33 +10082,51 @@ def on_receive(packet=None, interface=None, **kwargs):
           info_print(f"🚨 [AsyncAI] Queue still full after wait; processing immediately")
           resp = parse_incoming_text(text, sender_node, is_direct, ch_idx, thread_root_ts=thread_root_ts)
           if resp:
-            pending = resp if isinstance(resp, PendingReply) else None
-            response_text = pending.text if pending else resp
+            response_text, pending, already_sent = _normalize_ai_response(resp)
             if response_text:
               if pending:
                 _command_delay(pending.reason)
-              if is_direct:
-                send_direct_chunks(interface, response_text, sender_node)
-              else:
-                send_broadcast_chunks(interface, response_text, ch_idx)
+              if not already_sent:
+                if is_direct:
+                  send_direct_chunks(interface, response_text, sender_node)
+                else:
+                  send_broadcast_chunks(interface, response_text, ch_idx)
+              if pending and pending.follow_up_text:
+                _schedule_follow_up_message(
+                  interface,
+                  pending.follow_up_text,
+                  delay=pending.follow_up_delay,
+                  is_direct=is_direct,
+                  sender_node=sender_node,
+                  channel_idx=ch_idx,
+                )
               _antispam_after_response(sender_key, sender_node, interface)
               _process_bible_autoscroll_request(sender_key, sender_node, interface)
     else:
       # Non-AI messages (e.g., simple commands) can be processed immediately
       resp = parse_incoming_text(text, sender_node, is_direct, ch_idx, thread_root_ts=thread_root_ts)
       if resp:
-        pending = resp if isinstance(resp, PendingReply) else None
-        response_text = pending.text if pending else resp
+        response_text, pending, already_sent = _normalize_ai_response(resp)
         if response_text:
           target_name = get_node_shortname(sender_node) or str(sender_node)
           summary = _truncate_for_log(response_text)
           clean_log(f"Ollama → {target_name} (0.0s): {summary}", "🦙", show_always=True, rate_limit=False)
           if pending:
             _command_delay(pending.reason)
-          if is_direct:
-            send_direct_chunks(interface, response_text, sender_node)
-          else:
-            send_broadcast_chunks(interface, response_text, ch_idx)
+          if not already_sent:
+            if is_direct:
+              send_direct_chunks(interface, response_text, sender_node)
+            else:
+              send_broadcast_chunks(interface, response_text, ch_idx)
+          if pending and pending.follow_up_text:
+            _schedule_follow_up_message(
+              interface,
+              pending.follow_up_text,
+              delay=pending.follow_up_delay,
+              is_direct=is_direct,
+              sender_node=sender_node,
+              channel_idx=ch_idx,
+            )
           _antispam_after_response(sender_key, sender_node, interface)
           _process_bible_autoscroll_request(sender_key, sender_node, interface)
 
@@ -7111,6 +10148,11 @@ def on_receive(packet=None, interface=None, **kwargs):
     except Exception:
       pass
     return
+  finally:
+    try:
+      MAIL_MANAGER.flush_notifications(interface, send_direct_chunks)
+    except Exception as exc:
+      clean_log(f"Mailbox notification flush error: {exc}", "⚠️")
 
 @app.route("/messages", methods=["GET"])
 def get_messages_api():
@@ -7173,6 +10215,8 @@ def logs_stream():
 
 _LOG_URL_PATTERN = re.compile(r"(https?://\S+)")
 
+LOG_VIEWER_CHAR_LIMIT = 96
+
 LOG_EMOJI_SVG = {
     "📨": "1f4e8.svg",
     "📬": "1f4ec.svg",
@@ -7191,10 +10235,12 @@ LOG_EMOJI_SVG = {
     "🟢": "1f7e2.svg",
     "🟡": "1f7e1.svg",
     "🟠": "1f7e0.svg",
+    "🕸️": "1f578.svg",
     "💚": "1f49a.svg",
     "💓": "1f493.svg",
     "🔗": "1f517.svg",
     "🔐": "1f510.svg",
+    "📍": "1f4cd.svg",
     "🚀": "1f680.svg",
     "🧠": "1f9e0.svg",
     "🧭": "1f9ed.svg",
@@ -7225,6 +10271,8 @@ def _inject_emoji_html(escaped_text: str) -> str:
 
 def _render_log_line_html(line: str) -> str:
   normalized = _normalize_log_timestamp(line)
+  if len(normalized) > LOG_VIEWER_CHAR_LIMIT:
+    normalized = _truncate_for_log(normalized, LOG_VIEWER_CHAR_LIMIT)
   css_class = _classify_log_line(normalized)
   safe = html.escape(normalized, quote=False)
   safe = _LOG_URL_PATTERN.sub(lambda m: f'<a href="{m.group(1)}" target="_blank" rel="noopener">{m.group(1)}</a>', safe)
@@ -7247,37 +10295,38 @@ def mesh_locations_kml():
 
 @app.route("/logs", methods=["GET"])
 def logs():
-    uptime = datetime.now(timezone.utc) - server_start_time
-    uptime_str = _humanize_uptime(uptime)
-    now_local_dt = datetime.now().astimezone()
-    rounded_now = (now_local_dt + timedelta(seconds=30)).replace(second=0, microsecond=0)
-    now_local = rounded_now.strftime("%b %d %H:%M %Z")
+    try:
+        uptime = datetime.now(timezone.utc) - server_start_time
+        uptime_str = _humanize_uptime(uptime)
+        now_local_dt = datetime.now().astimezone()
+        rounded_now = (now_local_dt + timedelta(seconds=30)).replace(second=0, microsecond=0)
+        now_local = rounded_now.strftime("%b %d %H:%M %Z")
 
-    visible = [
-        line for line in script_logs
-        if (_viewer_should_show(line) if _viewer_filter_enabled else True)
-    ]
-    log_text = "".join(_render_log_line_html(line) for line in visible)
+        visible = [
+            line for line in script_logs
+            if (_viewer_should_show(line) if _viewer_filter_enabled else True)
+        ]
+        log_text = "".join(_render_log_line_html(line) for line in visible)
 
-    lang_for_proverbs = LANGUAGE_FALLBACK
-    proverb_lang_key = _proverb_language_key(lang_for_proverbs)
-    initial_proverb = _next_proverb(lang_for_proverbs)
-    proverb_index_js = PROVERB_INDEX_TRACKER.get(proverb_lang_key, 0)
-    proverb_list = _load_proverbs(lang_for_proverbs)
-    proverbs_json = json.dumps(proverb_list, ensure_ascii=False)
-    initial_proverb_html = _inject_emoji_html(html.escape(initial_proverb, quote=False))
-    proverb_interval_ms = 60000
-    fade_duration_ms = 1200
-    emoji_html_map_json = json.dumps({emoji: _twemoji_img(emoji) for emoji in LOG_EMOJI_SVG}, ensure_ascii=False)
-    emoji_keys_json = json.dumps(_LOG_EMOJI_KEYS, ensure_ascii=False)
+        lang_for_proverbs = LANGUAGE_FALLBACK
+        proverb_lang_key = _proverb_language_key(lang_for_proverbs)
+        initial_proverb = _next_proverb(lang_for_proverbs)
+        proverb_index_js = PROVERB_INDEX_TRACKER.get(proverb_lang_key, 0)
+        proverb_list = _load_proverbs(lang_for_proverbs)
+        proverbs_json = json.dumps(proverb_list, ensure_ascii=False)
+        initial_proverb_html = _inject_emoji_html(html.escape(initial_proverb, quote=False))
+        proverb_interval_ms = 60000
+        fade_duration_ms = 1200
+        emoji_html_map_json = json.dumps({emoji: _twemoji_img(emoji) for emoji in LOG_EMOJI_SVG}, ensure_ascii=False)
+        emoji_keys_json = json.dumps(_LOG_EMOJI_KEYS, ensure_ascii=False)
 
-    html_page = f"""<html>
+        html_page = f"""<html>
   <head>
     <title>MESH-MASTER Logs - Smooth Stream</title>
     <style>
       body {{
         background:#000;
-        color:#fff;
+        color:#dfe5f1;
         font-family: 'Segoe UI', 'Noto Sans', 'Liberation Sans', 'Helvetica Neue', Arial, 'Twemoji Mozilla', 'Noto Color Emoji', 'Segoe UI Emoji', 'Apple Color Emoji', sans-serif;
         padding:20px;
         margin:0;
@@ -7310,43 +10359,46 @@ def logs():
         top:0;
         left:0;
         right:0;
-        background:rgba(0,0,0,0.75);
+        background:rgba(0,0,0,0.9);
         padding:14px 20px 12px;
         border-bottom:1px solid #333;
         z-index:1000;
         text-align:center;
       }}
       .content {{
-        margin-top:130px;
+        margin-top:150px;
         text-align:center;
       }}
       .logbox {{
+        position:relative;
         height: calc(100vh - 220px);
         overflow-y: auto;
         white-space: pre-wrap;
         word-break: break-word;
         margin:0;
-        padding-bottom:100px;
-        transform: rotate(180deg);
-      }}
-      .footer-status {{
-        position:fixed;
-        bottom:16px;
-        left:50%;
-        transform:translateX(-50%);
+        padding:20px 12px 140px;
         display:flex;
         flex-direction:column;
-        align-items:center;
+        justify-content:flex-end;
         gap:6px;
-        font-size:12px;
-        color:#fff;
+      }}
+      .logbox::before {{
+        content:"";
+        position:sticky;
+        top:0;
+        left:0;
+        right:0;
+        height:50px;
+        pointer-events:none;
+        background:linear-gradient(to bottom, rgba(0,0,0,0.9) 0%, rgba(0,0,0,0) 80%);
+        z-index:1;
       }}
       .scroll-indicator {{
         display:flex;
         align-items:center;
         gap:6px;
         background:#333;
-        padding:4px 10px;
+        padding:4px 12px;
         border-radius:6px;
         min-width:150px;
         justify-content:center;
@@ -7354,33 +10406,49 @@ def logs():
       .scroll-indicator .arrow {{
         font-size:14px;
         opacity:0;
+        display:inline-flex;
+        align-items:center;
       }}
       .scroll-indicator.on .arrow {{
-        opacity:1;
-        animation:pulse 1.2s infinite;
+        opacity:0.6;
+        animation:drift 2.4s ease-in-out infinite;
       }}
       .scroll-indicator .label {{
         text-transform:uppercase;
         letter-spacing:0.08em;
+        font-size:0.72rem;
+        color:#cfd9e6;
+      }}
+      .status-bar {{
+        display:flex;
+        justify-content:center;
+        align-items:center;
+        gap:16px;
+        flex-wrap:wrap;
+        margin-bottom:10px;
       }}
       .status-meta {{
-        background:rgba(0,0,0,0.55);
-        padding:3px 8px;
-        border-radius:6px;
         display:flex;
-        gap:10px;
+        gap:12px;
+        background:rgba(0,0,0,0.45);
+        padding:4px 12px;
+        border-radius:8px;
       }}
       .status-meta span {{
-        color:#aaa;
+        color:#9eb6d4;
+        font-size:0.85rem;
       }}
-      @keyframes slideup {{
-        from {{ transform: translateY(18px); opacity:0; }}
-        to {{ transform: translateY(0); opacity:1; }}
+      @keyframes rise-scale {{
+        0% {{ transform: translateY(22px) scale(0.68); opacity:0; }}
+        35% {{ transform: translateY(14px) scale(0.8); opacity:0.55; }}
+        65% {{ transform: translateY(6px) scale(0.92); opacity:0.85; }}
+        100% {{ transform: translateY(0) scale(1); opacity:1; }}
       }}
-      @keyframes pulse {{
-        0% {{ transform:translateY(0); opacity:0.2; }}
-        50% {{ transform:translateY(3px); opacity:1; }}
-        100% {{ transform:translateY(0); opacity:0.2; }}
+      @keyframes drift {{
+        0% {{ transform:translateY(-2px); opacity:0.2; }}
+        35% {{ transform:translateY(1px); opacity:0.7; }}
+        65% {{ transform:translateY(-1px); opacity:0.6; }}
+        100% {{ transform:translateY(-2px); opacity:0.2; }}
       }}
       .proverb-box {{
         display:inline-block;
@@ -7409,8 +10477,12 @@ def logs():
       .headline-text.highlight {{
         color:#cca961;
       }}
-      .log-line {{ display:block; margin:0; }}
-      .log-line.animate-up {{ animation: slideup 0.45s ease-out; }}
+      .log-line {{
+        display:block;
+        margin:0;
+        transform-origin: bottom center;
+      }}
+      .log-line.animate-up {{ animation: rise-scale 0.85s ease-out; position:relative; z-index:0; }}
       .emoji {{
         width:1em;
         height:1em;
@@ -7427,23 +10499,23 @@ def logs():
   </head>
   <body>
     <div class="header">
+      <div class="status-bar">
+        <div class="scroll-indicator on" id="scrollStatus">
+          <span class="label" id="scrollLabel">Scrolling</span>
+          <span class="arrow">↓</span>
+        </div>
+        <div class="status-meta">
+          <span id="statusTime">{now_local}</span>
+          <span id="statusUptime">{uptime_str}</span>
+          <span id="statusRestarts">Restarts: {restart_count}</span>
+        </div>
+      </div>
       <div class="proverb-box">
         <span class="headline-text" id="headlineText">{initial_proverb_html}</span>
       </div>
     </div>
     <div class="content">
       <div id="logbox" class="logbox">{log_text}</div>
-    </div>
-    <div class="footer-status">
-      <div class="scroll-indicator on" id="scrollStatus">
-        <span class="arrow">↓</span>
-        <span class="label" id="scrollLabel">Auto-scroll ON</span>
-      </div>
-      <div class="status-meta">
-        <span id="statusTime">{now_local}</span>
-        <span id="statusUptime">{uptime_str}</span>
-        <span id="statusRestarts">Restarts: {restart_count}</span>
-      </div>
     </div>
     <script>
       const EMOJI_HTML_MAP = {emoji_html_map_json};
@@ -7584,7 +10656,7 @@ def logs():
         }}
       }}
 
-      updateScrollLabel('Auto-scroll ON', true);
+      updateScrollLabel('Scrolling', true);
 
       function smoothScrollToBottom() {{
         if (autoScroll && !isUserScrolling) {{
@@ -7601,10 +10673,10 @@ def logs():
                 const nearBottom = logbox.scrollHeight - logbox.scrollTop <= logbox.clientHeight + 10;
                 if (nearBottom) {{
           autoScroll = true;
-          updateScrollLabel('Auto-scroll ON', true);
+          updateScrollLabel('Scrolling', true);
         }} else {{
           autoScroll = false;
-          updateScrollLabel('Auto-scroll OFF', false);
+          updateScrollLabel('Paused', false);
         }}
         scrollTimeout = setTimeout(() => {{
           isUserScrolling = false;
@@ -7617,7 +10689,7 @@ def logs():
       let lastMessageTime = Date.now();
 
       function createEventSource() {{
-        const url = `/logs_stream?v=${Date.now()}`;
+        const url = `/logs_stream?v=${{Date.now()}}`;
         eventSource = new EventSource(url);
 
         eventSource.onmessage = function(event) {{
@@ -7635,7 +10707,7 @@ def logs():
         eventSource.onopen = function(event) {{
           reconnectAttempts = 0;
           lastMessageTime = Date.now();
-          updateScrollLabel(autoScroll ? 'Auto-scroll ON' : 'Auto-scroll OFF', autoScroll);
+          updateScrollLabel(autoScroll ? 'Scrolling' : 'Paused', autoScroll);
         }};
 
         eventSource.onerror = function(event) {{
@@ -7657,9 +10729,9 @@ def logs():
           const now = Date.now();
           const elapsed = now - lastMessageTime;
           if (elapsed > 30000) {{
-            updateScrollLabel('Waiting for new logs…', false);
+            updateScrollLabel('Waiting…', false);
           }} else {{
-            updateScrollLabel('Auto-scroll ON', true);
+            updateScrollLabel('Scrolling', true);
           }}
         }}
         requestAnimationFrame(smoothScrollCheck);
@@ -7673,7 +10745,18 @@ def logs():
   </script>
 </html>"""
 
-    return html_page
+        return html_page
+    except Exception as exc:
+        err_message = f"⚠️ Logs page failed: {exc}"
+        try:
+            add_script_log(err_message)
+        except Exception:
+            pass
+        app.logger.exception("Logs endpoint error")
+        return (
+            "<h1>Log viewer error</h1><p>Please check mesh-master.log for details.</p>",
+            500,
+        )
 
 # -----------------------------
 # Web Routes
