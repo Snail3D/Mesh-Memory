@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.99.0] - 2025-09-29
+
+Highlights
+- Resend (No Ack): per‑chunk DM retries with configurable interval/attempts, “(Nth try)” suffix toggle, and network‑usage gating.
+- User controls: `/stop` mutes, `resume|/start|/continue` unmutes, `blacklistme` (with Y/N) blocks, and `unblock` restores.
+- Dynamic admin aliases: admins can link commands via `/new=/existing`; persisted in `commands_config.json`, reflected in menu.
+- Dashboard: Ack Telemetry snapshot (DM first/resend rates), “Reset All Defaults” button with confirmation + activity log.
+- Radio panel: clean stacked “Channels” layout, only active channels render, “Generate” PSK shows a reset warning, add‑channel cancel clears status.
+
+Notes
+- Broadcast resends remain optional and off by default; DMs honor per‑chunk ACKs and stop on success.
+- Telemetry is anonymous and stored in memory; can be expanded in UI later.
+
 ## [1.1.0] - 2025-09-27
 
 Highlights
@@ -30,4 +43,3 @@ Highlights
 Notes
 - Admin commands are DM-only to avoid channel misuse.
 - Health reports degraded states (disconnected radio, stalled queue, recent AI error).
-

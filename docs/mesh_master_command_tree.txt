@@ -13,9 +13,6 @@ Commands
 │   └─ (no aliases)
 ├─ /aivibe
 │   └─ (no aliases)
-├─ /apology
-│   ├─ /apologize [langs: en]
-│   └─ /sorrynote [langs: en]
 ├─ /bible
 │   ├─ /bibel [langs: de]
 │   ├─ /bibelvers [langs: de]
@@ -38,15 +35,8 @@ Commands
 │   ├─ /biblequiz [langs: en]
 │   ├─ /scripturetrivia [langs: en]
 │   └─ /triviabiblica [langs: es]
-├─ /bingo
-│   └─ (no aliases)
 ├─ /blond
 │   └─ (no aliases)
-├─ /boatingtrainer
-│   ├─ /barco [langs: es]
-│   ├─ /boatprep [langs: en]
-│   ├─ /boattrainer [langs: en]
-│   └─ /seguridadbarco [langs: es]
 ├─ /bot
 │   └─ (no aliases)
 ├─ /breakup
@@ -138,10 +128,6 @@ Commands
 │   ├─ /msaada [langs: sw]
 │   ├─ /pomoc [langs: pl]
 │   └─ /pomoć [langs: hr]
-├─ /hurricanetrainer
-│   ├─ /entrenadorhuracan [langs: es]
-│   ├─ /huracan [langs: es]
-│   ├─ /huracanes [langs: es]
 │   └─ /hurricaneprep [langs: en]
 ├─ /hype
 │   ├─ /hypeme [langs: en]
@@ -165,11 +151,7 @@ Commands
 │   └─ (no aliases)
 ├─ /morse
 │   └─ (no aliases)
-├─ /morsecodetrainer
-│   ├─ /codigomorse [langs: es]
-│   ├─ /entrenadormorse [langs: es]
 │   ├─ /morsecourse [langs: en]
-│   └─ /morsetrainer [langs: en]
 ├─ /motd
 │   ├─ /bulletin [langs: en]
 │   ├─ /dailymessage [langs: en]
@@ -192,10 +174,6 @@ Commands
 ├─ /offline
 │   ├─ /offlinewiki [langs: en]
 │   └─ /wikioffline [langs: en]
-├─ /navigationtrainer
-│   ├─ /navegacion [langs: es]
-│   ├─ /navtrainer [langs: en]
-│   └─ /sinbrujula [langs: es]
 ├─ /printprompt
 │   └─ (no aliases)
 ├─ /query
@@ -208,10 +186,6 @@ Commands
 │   └─ /resignation [langs: en]
 ├─ /quizbattle
 │   └─ (no aliases)
-├─ /radioprocedurestrainer
-│   ├─ /procedimientosradio [langs: es]
-│   ├─ /radiocomunicacion [langs: es]
-│   └─ /radiotrainer [langs: en]
 ├─ /reset
 │   ├─ /chongzhi [langs: zh]
 │   ├─ /reiniciar [langs: es]
@@ -250,44 +224,25 @@ Commands
 │   ├─ /tumasms [langs: sw]
 │   ├─ /vidpravysms [langs: uk]
 │   └─ /wyslijsms [langs: pl]
-├─ /survival
 │   ├─ /sobrevivir [langs: es]
-│   ├─ /supervivencia [langs: es]
-│   └─ /survivaltips [langs: en]
-├─ /survival_desert
 │   ├─ /desert [langs: en]
 │   └─ /desierto [langs: es]
-├─ /survival_jungle
-│   ├─ /jungla [langs: es]
 │   ├─ /jungle [langs: en]
-│   └─ /selva [langs: es]
-├─ /survival_medical
 │   ├─ /firstaid [langs: en]
 │   ├─ /medical [langs: en]
 │   ├─ /medico [langs: es]
-│   └─ /primerosauxilios [langs: es]
-├─ /survival_urban
 │   ├─ /city [langs: en]
 │   ├─ /ciudad [langs: es]
 │   ├─ /urban [langs: en]
 │   └─ /urbano [langs: es]
-├─ /survival_winter
 │   ├─ /cold [langs: en]
-│   ├─ /frio [langs: es]
-│   ├─ /invierno [langs: es]
 │   └─ /winter [langs: en]
-├─ /survival_woodland
-│   ├─ /bosque [langs: es]
 │   ├─ /forest [langs: en]
 │   └─ /woodland [langs: en]
 ├─ /test
 │   └─ (no aliases)
 ├─ /thankyou
 │   └─ /thanks [langs: en]
-├─ /tornadotrainer
-│   ├─ /entrenadortornado [langs: es]
-│   ├─ /tornado [langs: es]
-│   └─ /tornadoprep [langs: en]
 ├─ /trivia
 │   ├─ /acertijos [langs: es]
 │   ├─ /generaltrivia [langs: en]
@@ -312,11 +267,6 @@ Commands
 │   ├─ /wetter [langs: de]
 │   ├─ /wetterbericht [langs: de]
 │   └─ /wx [langs: en]
-├─ /wellnesstrainer
-│   ├─ /bienestar [langs: es]
-│   ├─ /bienestaremergencia [langs: es]
-│   ├─ /emergencywellness [langs: en]
-│   └─ /mascotas [langs: es]
 ├─ /whereami
 │   └─ (no aliases)
 ├─ /wipe

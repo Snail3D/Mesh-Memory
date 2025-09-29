@@ -1,0 +1,38 @@
+{
+  "users": {
+    "!376be684": [
+      {
+        "id": "92b5b595-8005-43ee-8569-963932b1a8c3",
+        "title": "Cigna",
+        "auto_title": false,
+        "summary": "SnMo: /remember SnMo: /save SnMo: Cigna",
+        "context": "SnMo: /remember\nSnMo: /save\nSnMo: Cigna",
+        "search_blob": "cigna snmo: /remember snmo: /save snmo: cigna snmo: /remember snmo: /save snmo: cigna",
+        "search_key": "cigna",
+        "lines": 3,
+        "created_at": 1759105068.081856,
+        "updated_at": 1759105112.8567889,
+        "tags": [],
+        "attribution": null,
+        "saved_at_human": "2025-09-28 18:17:48 MDT"
+      }
+    ],
+    "!a3cb5c4e": [
+      {
+        "id": "55d0bda0-15be-4cdb-9b12-20d80c84e824",
+        "title": "Morse code",
+        "auto_title": false,
+        "summary": "Lucy: /wiki Morse code Lucy: Give me all the letters and their dits and dashes Node_Mesh Master: \"Hey Lucy, gotcha covered! Here's the Morse code table: A .- B -... C -.-. D -.. E . F ..-. G --. H .... I .. J .--- K -.- L .-.. M -- N -. O --- P .--. Q --.- R .-. S ... T - U ..-…",
+        "context": "Lucy: /bingo\nLucy: B2\nNode_Mesh Master: \"Hey B2, just got your B2 update! Looks like you're all set for the main trail. Keep your wits about you and don't get too far off track. Stay hydrated and watch out for any wildflowers!\"\nLucy: /survivalurban\nLucy: /survival\nLucy: /survivalmedical\nLucy: /tornadotrainer\nLucy: /electricaltrainer\nLucy: /tornadotrainer\nLucy: /wiki Morse code table\nLucy: /wiki Morse code\nLucy: Give me all the letters and their dits and dashes\nNode_Mesh Master: \"Hey Lucy, gotcha covered! \n\nHere's the Morse code table:\n\nA .-\nB -...\nC -.-.\nD -..\nE .\nF ..-.\nG --.\nH ....\nI ..\nJ .---\nK -.-\nL .-..\nM --\nN -.\nO ---\nP .--.\nQ --.-\nR .-.\nS ...\nT -\nU ..-\nV ...-\nW .--\nX -..-\nY -.--\nZ --..\n\nAnd here's the 26-letter alphabet, with the corresponding Morse code:\n\nA .-\nB -...\nC -.-.\nD -..\nE .\nF ..-.\nG --.\nH ....\nI ..\nJ .---\nK -.-\nL .-..\nM --\nN -.\nO ---\nP .--.\nQ --.-\nR .-.\nS ...\nT -\nU ..-\nV ...-\nW .--\nX -..-\nY -.--\nZ --..\n\nKeep it in mind, Lucy! The International Telecommunication\nLucy: /save Morse code",
+        "search_blob": "morse code lucy: /wiki morse code lucy: give me all the letters and their dits and dashes node_mesh master: \"hey lucy, gotcha covered! here's the morse code table: a .- b -... c -.-. d -.. e . f ..-. g --. h .... i .. j .--- k -.- l .-.. m -- n -. o --- p .--. q --.- r .-. s ... t - u ..-... lucy: /bingo lucy: b2 node_mesh master: \"hey b2, just got your b2 update! looks like you're all set for the main trail. keep your wits about you and don't get too far off track. stay hydrated and watch out for any wildflowers!\" lucy: /survivalurban lucy: /survival lucy: /survivalmedical lucy: /tornadotrainer lucy: /electricaltrainer lucy: /tornadotrainer lucy: /wiki morse code table lucy: /wiki morse code lucy: give me all the letters and their dits and dashes node_mesh master: \"hey lucy, gotcha covered! here's the morse code table: a .- b -... c -.-. d -.. e . f ..-. g --. h .... i .. j .--- k -.- l .-.. m -- n -. o --- p .--. q --.- r .-. s ... t - u ..- v ...- w .-- x -..- y -.-- z --.. and here's the 26-letter alphabet, with the corresponding morse code: a .- b -... c -.-. d -.. e . f ..-. g --. h .... i .. j .--- k -.- l .-.. m -- n -. o --- p .--. q --.- r .-. s ... t - u ..- v ...- w .-- x -..- y -.-- z --.. keep it in mind, lucy! the international telecommunication lucy: /save morse code",
+        "search_key": "morse code",
+        "lines": 14,
+        "created_at": 1759119220.9710093,
+        "updated_at": 1759119220.9710093,
+        "tags": [],
+        "attribution": null,
+        "saved_at_human": "2025-09-28 22:13:40 MDT"
+      }
+    ]
+  }
+}

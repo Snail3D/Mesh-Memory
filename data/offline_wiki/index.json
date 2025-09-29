@@ -1,0 +1,66 @@
+{
+  "entries": [
+    {
+      "key": "ar-15-style rifle",
+      "title": "AR-15–style rifle",
+      "path": "ar-15-style-rifle.json",
+      "summary": "An AR-15–style rifle is a lightweight semi-automatic rifle based on or similar to the Colt AR-15 design. The Colt model removed the selective fire feature of its predecessor, the original ArmaLite AR-15, which is a scaled-down derivative of the AR-10 design (by Eugene Stoner). It is closely related to the military M16 rifle.",
+      "aliases": [
+        "ar15"
+      ]
+    },
+    {
+      "key": "computer mouse",
+      "title": "Computer mouse",
+      "path": "computer-mouse.json",
+      "summary": "A computer mouse (plural mice; also mouses) is a hand-held pointing device that detects two-dimensional motion relative to a surface. This motion is typically translated into the motion of the pointer (called a cursor) on a display, which allows a smooth control of the graphical user interface of a computer.",
+      "aliases": []
+    },
+    {
+      "key": "google",
+      "title": "Google",
+      "path": "google.json",
+      "summary": "Google LLC ( , GOO-gəl) is an American multinational technology corporation focused on information technology, online advertising, search engine technology, email, cloud computing, software, quantum computing, e-commerce, consumer electronics, and artificial intelligence (AI). It has been referred to as \"the most powerful company in the world\" by the BBC and is one of the world's most valuable br…",
+      "aliases": []
+    },
+    {
+      "key": "machine gun",
+      "title": "Machine gun",
+      "path": "machine-gun.json",
+      "summary": "A machine gun (MG) is a fully automatic and rifled firearm designed for sustained direct fire. Automatic firearms of 20 mm (0.79 in) caliber or more are classified as autocannons rather than machine guns.",
+      "aliases": []
+    },
+    {
+      "key": "morse code",
+      "title": "Morse code",
+      "path": "morse-code.json",
+      "summary": "Morse code is a telecommunications method which encodes text characters as standardized sequences of two different signal durations, called dots and dashes, or dits and dahs. Morse code is named after Samuel Morse, one of several developers of the code system. Morse's preliminary proposal for a telegraph code was replaced by an alphabet-based code developed by Alfred Vail, the engineer working wi…",
+      "aliases": []
+    },
+    {
+      "key": "sherbet",
+      "title": "Sherbet",
+      "path": "sherbet.json",
+      "summary": "Sherbet may refer to:",
+      "aliases": []
+    },
+    {
+      "key": "world war i",
+      "title": "World War I",
+      "path": "world-war-i.json",
+      "summary": "World War I or the First World War (28 July 1914 – 11 November 1918), also known as the Great War, was a global conflict between two coalitions: the Allies (or Entente) and the Central Powers. Main areas of conflict included Europe and the Middle East, as well as parts of Africa and the Asia-Pacific. There were important developments in weaponry including tanks, aircraft, artillery, machine guns,…",
+      "aliases": [
+        "ww1"
+      ]
+    },
+    {
+      "key": "world war ii",
+      "title": "World War II",
+      "path": "world-war-ii.json",
+      "summary": "World War II or the Second World War (1 September 1939 – 2 September 1945) was a global conflict between two coalitions: the Allies and the Axis powers. Nearly all of the world's countries participated, with many nations mobilising all resources in pursuit of total war. Tanks and aircraft played major roles, enabling the strategic bombing of cities and delivery of the first and only nuclear weapo…",
+      "aliases": [
+        "ww2"
+      ]
+    }
+  ]
+}

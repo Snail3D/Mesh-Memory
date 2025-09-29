@@ -1,0 +1,10 @@
+{
+  "ai_enabled": true,
+  "disabled_commands": [],
+  "message_mode": "both",
+  "admin_passphrase": "rough",
+  "auto_ping_enabled": true,
+  "admin_whitelist": [
+    "!0c31e379"
+  ]
+}

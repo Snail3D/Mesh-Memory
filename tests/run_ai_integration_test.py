@@ -91,6 +91,36 @@ sys.modules.setdefault('meshtastic', fake_meshtastic)
 sys.modules.setdefault('meshtastic.serial_interface', fake_serial)
 sys.modules.setdefault('meshtastic.mesh_interface', mesh_interface_mod)
 sys.modules.setdefault('meshtastic.tcp_interface', tcp_interface_mod)
+sys.modules.setdefault('meshtastic.portnums_pb2', types.ModuleType('meshtastic.portnums_pb2'))
+proto_pkg = types.ModuleType('meshtastic.protobuf')
+config_pb2_mod = types.ModuleType('meshtastic.protobuf.config_pb2')
+channel_pb2_mod = types.ModuleType('meshtastic.protobuf.channel_pb2')
+class _Channel:
+    class Role:
+        DISABLED = 0
+        SECONDARY = 1
+        @staticmethod
+        def Name(v):
+            return 'DISABLED' if v == 0 else 'SECONDARY'
+class _ChannelSettings:
+    def __init__(self):
+        self.name = ''
+        self.psk = b''
+        self.uplink_enabled = True
+        self.downlink_enabled = True
+        self.channel_num = 0
+channel_pb2_mod.Channel = _Channel
+channel_pb2_mod.ChannelSettings = _ChannelSettings
+proto_pkg.config_pb2 = config_pb2_mod
+proto_pkg.channel_pb2 = channel_pb2_mod
+sys.modules.setdefault('meshtastic.protobuf', proto_pkg)
+sys.modules.setdefault('meshtastic.protobuf.config_pb2', config_pb2_mod)
+sys.modules.setdefault('meshtastic.protobuf.channel_pb2', channel_pb2_mod)
+util_mod = types.ModuleType('meshtastic.util')
+util_mod.pskToString = lambda psk: ('unencrypted' if not psk else 'secret')
+util_mod.fromPSK = lambda s: b''
+util_mod.genPSK256 = lambda: b'\x00' * 32
+sys.modules.setdefault('meshtastic.util', util_mod)
 sys.modules.setdefault('pubsub', pubsub_mod)
 sys.modules.setdefault('pubsub.pub', pub_obj)
 sys.modules.setdefault('unidecode', unidecode_mod)
@@ -153,7 +183,13 @@ def _mock_requests_post(url, json=None, timeout=None, headers=None):
         print('No prompt found in payload')
     return _MockResponse(status_code=200, body={"response": "MOCKED_AI_REPLY"})
 
-ns['requests'] = type('r', (), {'post': _mock_requests_post})
+# Ensure both exec namespace and sys.modules import path see the mock
+mock_requests_mod = types.ModuleType('requests')
+mock_requests_mod.post = _mock_requests_post
+class _DummyResponse: pass
+mock_requests_mod.Response = _DummyResponse
+sys.modules.setdefault('requests', mock_requests_mod)
+ns['requests'] = mock_requests_mod
 
 exec(compile(src_mod, str(MODULE_PATH), 'exec'), ns)
 

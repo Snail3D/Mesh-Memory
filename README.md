@@ -1,840 +1,231 @@
-# MESH MASTER v1.0.0 - Enhanced AI with Persistent Memory
+# MESH MASTER v2.0.0 — Off-Grid AI Operations Suite
 
-**MESH MASTER** is an enhanced evolution of the Mesh-AI project that brings
-persistent memory, non-blocking async processing, and rugged performance to
-Meshtastic LoRa mesh networks. Never lose context again—the assistant remembers
-every conversation across restarts and reconnections.
+**MESH MASTER 2.0** is the next evolution of the Mesh-AI project: a resilient AI copilot for Meshtastic LoRa meshes that remembers conversations, coordinates teams, and keeps the network moving even when the wider internet is gone. Version 2.0 doubles down on collaboration with the new Mesh Mail hub, a suite of llama-powered games for morale and training, richer offline knowledge, and a refreshed web command center.
 
-### 🔧 New Administration Features (v1.0)
-- **Runtime configuration management**: Update AI prompts and MOTD without restart
-- **Secure DM-only commands**: Admin functions restricted to private messages
-- **Atomic configuration writes**: Safer config file updates
-- **Basic monitoring**: Health endpoints for container deployment
-- **Better diagnostics**: More detailed system health with performance metrics
+> **Disclaimer**  
+> This project is an independent community effort and is **not associated** with the official Meshtastic project. Always maintain backup communication paths for real emergencies.
 
-> **🧠 The Memory Advantage:**  
-> Unlike the original Mesh-AI release, MESH MASTER maintains **full conversation
-> history** and **context persistence**, making your mesh network AI truly
-> intelligent and reliable.
-
-![MESH-MASTER](https://github.com/user-attachments/assets/438dc643-6727-439d-a719-0fb905bec920)
-
-**Built on MESH-MASTER BETA v0.5.1** - An experimental project that bridges [Meshtastic](https://meshtastic.org/) LoRa mesh networks with powerful AI chatbots.
-
-## 🌟 **Why Choose MESH MASTER?**
-
-### 🧠 **Persistent Memory System**
-- **Never forget conversations** - Full chat history survives restarts, power cycles, and reconnections
-- **Context-aware responses** - AI remembers what you discussed yesterday, last week, or last month  
-- **Seamless session continuity** - Pick up conversations exactly where you left off
-- **Smart memory management** - Configurable history limits and automatic cleanup
-
-### ⚡ **Async Performance Revolution** 
-- **Instant message handling** - New messages process immediately even during long AI responses
-- **Non-blocking architecture** - No more waiting for "everything to calm down"
-- **Background AI processing** - Messages queued and handled efficiently 
-- **90% faster responsiveness** - Dramatically improved user experience
-
-### 🛡️ **Improved Reliability**
-- **Single-instance enforcement** - Prevents conflicts and resource contention
-- **Better error recovery** - Enhanced connection handling and retry logic
-- **Process management** - Cleaner startup, shutdown, and resource cleanup
-- **Stability improvements** - More robust async architecture
-
-### 🎯 **Enhanced User Experience**
-- **Reliable DM commands** - `/ai` and `/query` work much better in all scenarios
-- **Smart command parsing** - Better handling of typos and edge cases
-- **Performance improvements** - Faster AI responses with tuned parameters
-- **Better debugging** - Enhanced logging and diagnostic information
-
-> **Disclaimer:**  
-> This project is **NOT ASSOCIATED** with the official Meshtastic Project. It is provided solely as an extension to add AI and advanced features to your Mesh network.  
-
-> **Stable v1.0 Release:**  
-> MESH MASTER v1.0 represents a stable release with significant reliability improvements over previous versions. While always maintain backup communication methods for emergencies, this version is much more reliable for daily use.
-
->  
-> *Built with love by humans and AI working together. Field-tested with improved error handling and recovery mechanisms.*
+![Mesh Master 2.0 hero](docs/mesh-master-2.0-hero.svg)
 
 ---
 
-[![image](https://github.com/user-attachments/assets/bdf08934-3a80-4dc6-8a91-78e33c34db59)](https://meshtastic.org)
-The Meshtastic logo trademark is the trademark of Meshtastic LLC.
+## 2.0 Headline Upgrades
+- **Mesh Mail** — PIN-protected inboxes, multi-user notifications, and one-shot llama summaries keep longer messages flowing across the mesh.
+- **Game Hub** — Chess & Checkers duels, Blackjack, Yahtzee rounds, Tic-Tac-Toe, Hangman, Wordle, Word Ladder, Adventure stories, Cipher drills, Bingo, Morse, Rock–Paper–Scissors, Coinflip, Quiz Battle, and more—all DM-friendly and multilingual.
+- **Adaptive Personalities & Context Capsules** — `/aipersonality` and `/save`/`/recall` tune the assistant instantly while persistent archives keep continuity across restarts.
+- **Offline Knowledge on Tap** — Trimmed MeshTastic handbook, offline wiki lookups, and cached expert answers deliver verified guidance without leaving the mesh.
+- **Refreshed Ops Console** — Live SSE log stream with emoji tagging, command shortcuts, and mesh-aware send forms for both broadcasts and DMs.
+- **Hardening for the Field** — Larger async queues, smarter retry logic, strict single-instance locks, and heartbeat-driven health reporting for container or bare-metal deployments.
 
 ---
 
-## 🚀 v1.0 Latest Enhancements
+## Feature Overview
 
-### 🎨 **Beautiful Web Dashboard & Live Logs**
-- **Real-time log streaming** - Watch your mesh network activity live with Server-Sent Events (SSE)
-- **Emoji-enhanced logging** - Visual indicators make log reading intuitive and fun
-  - 📡 Connection events, 📨 Messages, 🤖 AI responses, ⚠️ Errors, 🔧 Commands
-- **Smart log filtering** - Toggle between All, Errors, AI, Messages, and Connection logs
-- **Auto-refreshing dashboard** - Never miss important events with live updates
-- **Stale connection recovery** - Automatic reconnection when log streams go stale
-- **Professional UI styling** - Clean, modern interface with responsive design
+### Persistent Mesh Intelligence
+- End-to-end message history survives restarts (`messages_archive.json`) with configurable limits.  
+- Background async workers keep RX/TX responsive while Ollama generates replies.  
+- System prompt, personalities, and MOTD can be adjusted at runtime via DM-only admin commands.
 
-### 🎛️ **Secure Admin Commands (DM-Only)**
-- **Runtime configuration updates** - No more restart required for changes!
-  - `/changeprompt <text>`: Update AI system prompt instantly (persists to `config.json`)
-  - `/changemotd <text>`: Update Message of the Day (persists to `motd.json`)
-  - `/showprompt` / `/printprompt`: Display current active system prompt
-- **Security-first design** - Admin commands only work in private DMs to prevent channel abuse
-- **Atomic file writes** - Configuration changes are safe and corruption-resistant
-- **Instant activation** - Changes take effect immediately without restart
+### Mesh Mail & Collaboration
+- Direct-message `/m mailbox message` to drop mail; guided flow creates boxes, sets optional PINs, and captures owner metadata.  
+- `/c mailbox [question]` shows the latest entries and, when a question is provided, uses the bundled `llama3.2:1b` model to pull a concise answer.  
+- `/wipe mailbox`, `/wipe chathistory`, `/wipe personality`, and `/wipe all <mailbox>` keep things tidy.  
+- Notification engine flags subscribers on heartbeat with unread counts while respecting PIN security and brute-force throttling.  
+- See `docs/mail_readme.md` for deep-dive internals.
 
-### 📊 **Health Monitoring**
-- **Useful health endpoints** for monitoring:
-  - `/healthz`: Detailed JSON health status with connection, queue, and timing data
-  - `/live`: Liveness probe for container deployments
-  - `/ready`: Readiness probe (200 only when radio connected)
-- **Degraded state detection** - Returns 503 when issues detected
-- **Heartbeat logging** - Status updates every ~30 seconds in `mesh-master.log`
-- **Performance metrics** - Track RX/TX ages, AI response times, and queue depths
+### Game Hub & Morale Tools
+- `/games` lists every title with quick descriptions and command hints.  
+- Story-driven `/adventure` adapts to the chat language and offers branching outcomes.  
+- `/wordladder` teammates can collaboratively bridge start/end words, asking the llama for hints on demand.  
+- Manage risk in `/blackjack`, push streaks in `/yahtzee`, or rally the squad with `/games` for the full list.  
+- Fast laughs with `/rps`, `/coinflip`, and `/quizbattle`; puzzle practice with `/cipher`, `/morse`, `/hangman`, `/wordle`.
 
-### ⚡ **Enhanced Message Processing**
-- **Smart timeout handling** - Progressive retry logic with exponential backoff
-- **Reliable SSE connections** - Better connection management prevents stale streams  
-- **Improved error recovery** - Better handling of connection drops and timeouts
-- **Better user feedback** - Clear error messages and status indicators
+### Knowledge & Research Aids
+- `/meshtastic <question>` consults a curated ~25k token field guide with a warm cache for instant follow-ups.  
+- `/offline wiki <topic>` or `/offline wiki <topic> PIN=1234` taps locally mirrored reference articles.  
+- `/save` captures conversation context capsules for later `/recall`—perfect for mission hand-offs.
 
-## 🚀 **Enhanced Fork Features**
+### Web Dashboard & APIs
+- Real-time log viewer with emoji categories (📡 connection, 📨 messages, 🤖 AI, ⚠️ warnings, 🔧 admin).  
+- Three-column mesh console surfaces broadcasts, direct messages, and nearby nodes; quick-send form handles DM routing and chunking.  
+- Health endpoints: `GET /ready`, `/live`, `/healthz`, `/heartbeat`, plus `/dashboard` and `/logs` frontends.  
+- `/send` and `/ui_send` POST endpoints enable automated workflows; optional `/discord_webhook` bridge for cross-platform relays.
 
-This fork includes significant performance, reliability, and user experience improvements over the original mesh-master:
-
-### 🔄 **Async Message Processing System**
-- **Non-blocking message handling**: New messages are processed immediately even during long AI responses (200+ seconds)
-- **Background worker thread**: Messages queued and processed asynchronously to prevent timing issues
-- **Smart message triage**: Quick commands processed immediately, AI requests handled asynchronously
-- **Solves the core timing problem**: No more waiting for "everything to calm down" before responses
-
-### 🧠 **Enhanced Memory & Context Management**
-- **Persistent chat history**: Conversations survive system restarts with `messages_archive.json`
-- **Context-aware responses**: AI remembers previous conversations and maintains context
-- **Optimized memory usage**: Configurable context windows and automatic cleanup
-- **Session continuity**: Users can resume conversations seamlessly after reconnections
-
-### ⚡ **Performance Optimizations**
-- **Faster AI responses**: Reduced Ollama timeout (200s→120s) and context size (6000→4000 chars)
-- **Optimized AI parameters**: Better `temperature`, `num_predict`, and threading settings
-- **Improved chunk delivery**: Configurable chunk buffer between message segments (defaults to 4 s)
-- **Queue fallback processing**: Prevents message drops when system is busy
-
-### 🔒 **Single-Instance Enforcement**
-- **Process conflict prevention**: Lock file mechanism prevents multiple mesh-master instances
-- **Automatic cleanup**: Stale process detection and cleanup on startup
-- **Resource protection**: Prevents serial port conflicts and resource contention
-- **Reliable restarts**: Clean shutdown and startup procedures
-
-### 🎯 **Better DM Command Handling**
-- **Graceful error recovery**: `/ai` and `/query` commands work reliably in DMs
-- **Smart command parsing**: Empty commands like `/ai` alone are handled gracefully
-- **Better user experience**: Clear error messages and intuitive behavior
-- **Channel vs DM distinction**: Different behaviors for private vs public commands
-
-### 🛠️ **Infrastructure Improvements**
-- **Improved startup script**: `start_mesh_master.sh` with better error handling
-- **Better connection recovery**: Improved retry logic for Meshtastic device connections
-- **Enhanced logging**: More detailed debugging and status information
-- **Better error handling**: Improved exception handling and recovery
-
-### 🎨 **Modern Web Interface (New in v1.0)**
-- **Real-time log viewer**: Live streaming logs with Server-Sent Events technology
-- **Visual log categorization**: Emoji indicators for different event types (📡📨🤖⚠️🔧)
-- **Interactive filtering**: Toggle between All, Errors, AI, Messages, and Connection logs
-- **Auto-reconnecting streams**: Intelligent detection and recovery from stale connections
-- **Professional styling**: Clean, responsive design that works on mobile and desktop
-- **Live dashboard updates**: Never refresh - everything updates automatically
-
-### � **Advanced Administration Features (New in v1.0)**
-- **Runtime configuration management**: Update AI prompts and MOTD without restart
-- **Secure DM-only commands**: Admin functions restricted to private messages
-- **Atomic configuration writes**: Corruption-resistant config file updates
-- **Production monitoring**: Health endpoints for Docker/Kubernetes deployment
-- **Comprehensive diagnostics**: Detailed system health with performance metrics
-
-### �📊 **Key Metrics Improved**
-- **Message responsiveness**: ~90% faster response to new messages during AI processing
-- **Log accessibility**: Real-time log streaming eliminates file access needs
-- **Admin efficiency**: Instant configuration changes without service disruption  
-- **Connection reliability**: 95% reduction in SSE stream failures
-- **User experience**: Visual indicators make troubleshooting 10x easier
-- **Memory efficiency**: Persistent context without memory leaks
-- **Connection reliability**: Significantly reduced connection conflicts and failures
-- **User experience**: Eliminated common command confusion and timing issues
+### Integrations & Extensibility
+- Native Ollama support tuned for low-bandwidth meshes (`llama3.2:1b` by default) with adjustable context size, chunk delays, and timeout controls.  
+- Home Assistant relay can forward a dedicated channel (with optional PIN requirement) to the Conversation API.  
+- Feature flags (`feature_flags.json`) let operators disable specific commands or restrict replies to DMs/broadcasts.
 
 ---
 
+## Quick Start (Python)
 
-## Features
-
-- **Ollama-Optimized AI**  
-  - Tuned for local Ollama deployments with optional Home Assistant integration for scripted automations.
-- **Home Assistant Integration**  
-  - Seamlessly forward messages from a designated channel to Home Assistant’s conversation API. Optionally secure the integration using a PIN.
-- **Comprehensive /Commands System**  
-  - **Built-in Commands**: `/about`, `/test`, `/help`, `/motd`, `/ai` (aliases: `/bot`, `/query`, `/data`), `/reset`, plus fun trivia commands: `/bible`, `/chucknorris`, `/elpaso`
-  - **Admin Commands (DM-only)**: `/changemotd`, `/showprompt`, `/printprompt` *(system prompt is fixed—tune tone with `/aipersonality` instead)*
-  - **Personalities (DM-only)**: `/aipersonality` to list options, set a new tone, add custom prompt text, or reset to defaults
-  - **Custom Commands**: Fully configurable via `commands_config.json` with static responses or dynamic AI prompts
-  - **Case-insensitive**: All commands work regardless of capitalization for mobile usability
-  - **Smart Response System**: Instant replies for alarm bells 🔔 and position requests 📍
-- **Enhanced REST API & WebUI Dashboard**  
-  - A modern three‑column layout showing broadcast messages, direct messages, and available nodes.
-  - **Multi-language menu support** - Internationalized interface with language selection options
-  - UI customization through settings such as theme color, hue rotation, and custom sounds.
-- **Improved Message Chunking & Routing**  
-  - Automatically splits long AI responses into configurable chunks with delays to reduce radio congestion.
-  - Configurable flags control whether the bot replies to broadcast channels and/or direct messages.
-- **Robust Error Handling & Logging**  
-  - Uses UTC‑based timestamps with an auto‑truncating script log file (keeping the last 100 lines if the file grows beyond 100 MB).
-  - Enhanced error detection (including specific OSError codes) and graceful reconnection using threaded exception hooks.
-- **Speedy Quick Commands**  
-  - `/bible` now pulls straight from the public-domain **World English Bible** (English) or **Reina-Valera 1909** (Spanish)—ask for a random verse or target passages like `/bible Nehemiah 1:11` or `/bible Juan 3:16` (ranges up to five verses supported). Calling `/bible` with no reference resumes where you left off, so missionaries can keep a continuous reading plan.
-  - `/chucknorris` replies with a random fact from a curated 1,000 item Chuck Norris library.
-  - `/elpaso` surfaces one of 300 lesser-known facts about the Sun City’s people and history.
-  - `/meshtastic <question>` consults a trimmed MeshTastic field guide (≈26k tokens of curated docs) and responds only with verified information—perfect for safety-critical operations. Warm queries reuse a cached context for quick follow-ups.
-  - Every slash/special command now buffers three seconds (`⏳`) before transmitting to keep mesh congestion low.
-- **Windows & Linux Focused**
-  - Official support for Windows environments with installation guides; instructions for Linux available now - MacOS coming soon!
+1. **Clone & enter the repository**
+   ```bash
+   git clone https://github.com/snailpi/mesh-ai.git
+   cd mesh-ai
+   ```
+2. **Create a virtual environment and install dependencies**
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   pip install --upgrade pip
+   pip install -r requirements.txt
+   ```
+3. **Configure your node**
+   - Edit `config.json` and update connection details (`serial_port` or `wifi_host`), `ai_provider` settings, and channel preferences.  
+   - Adjust `commands_config.json`, `motd.json`, and any feature flags as desired.
+4. **Launch Mesh Master**
+   ```bash
+   NO_BROWSER=1 python mesh-master.py
+   ```
+5. **Open the dashboard**
+   - Visit `http://localhost:5000/dashboard` for live logs and controls.
 
 ---
 
-![image](https://github.com/user-attachments/assets/8ea74ff1-bb34-4e3e-9514-01a98a469cb2)
+## Container Workflow
 
-> An example of an awesome Raspberry Pi 5 powered mini terminal - running MESH-MASTER & Ollama with HomeAssistant integration!
-> - Top case model here by oinkers1: https://www.thingiverse.com/thing:6571150
-> - Bottom Keyboard tray model here by mr_tbot: https://www.thingiverse.com/thing:7084222
-> - Keyboard on Amazon here:  https://a.co/d/2dAC9ph
-
-
----
-
-## 🔋 RAK4631 Always-On Setup
-
-RAK's [RAK4631 quick start](https://docs.rakwireless.com/Product-Categories/WisBlock/RAK4631/Datasheet/) and [deep sleep tutorial](https://github.com/RAKWireless/WisBlock/tree/master/tutorials/RAK4631-Deep-Sleep-P2P) show how the core aggressively powers down (down to about 120 uA) whenever it can. On a USB-powered node with no LiPo or GPS that behavior can cut the USB serial path after a few idle minutes. Pin the module in an always-on profile before running MESH MASTER:
-
-- **Disable USB autosuspend.** Copy `99-rak-no-autosuspend.rules` into `/etc/udev/rules.d/` and reload udev so the host keeps the WisBlock CDC interface awake:
-  ```bash
-  sudo cp 99-rak-no-autosuspend.rules /etc/udev/rules.d/
-  sudo udevadm control --reload-rules
-  sudo udevadm trigger
-  ```
-- **Push the RAK4631 always-on Meshtastic profile.** The repo includes `hardware_profiles/rak4631_always_on.yaml` plus a helper script that reads your `config.json` serial path:
-  ```bash
-  ./scripts/apply_rak4631_profile.py
-  ```
-  Add `--dry-run` to inspect the underlying Meshtastic command. The profile forces `device.role=ROUTER_CLIENT`, disables power saving, and turns off GPS polling so USB power alone is stable.
-- **Verify the node stays awake.** After the profile is applied, run `meshtastic --port /dev/serial/... --info` and confirm it reports `role: ROUTER_CLIENT` and `is_power_saving: false`. The serial link should remain available even after long idle periods.
-
-## Changelog
-
-### v1.0.0 - September 24, 2025 🎉
-**Major Release: MESH MASTER Production Ready**
-
-#### 🎨 **Beautiful Web Interface & Live Logging**
-- **Real-time log streaming** with Server-Sent Events (SSE) technology
-- **Emoji-enhanced logging** with visual indicators (📡📨🤖⚠️🔧) 
-- **Interactive log filtering** - All, Errors, AI, Messages, Connection views
-- **Smart reconnection** - Automatic recovery from stale SSE connections
-- **Professional responsive design** - Works beautifully on mobile and desktop
-- **Live dashboard updates** - No more manual refresh needed
-
-#### 🎛️ **Secure Administration Commands (DM-Only)**
-- `/changeprompt <text>` - Update AI system prompt instantly (persists to config.json)
-- `/changemotd <text>` - Update Message of the Day (persists to motd.json)  
-- `/showprompt` / `/printprompt` - Display current active system prompt
-- **Security-first design** - Admin commands restricted to private DMs only
-- **Atomic file writes** - Corruption-resistant configuration updates
-
-#### 📊 **Health Monitoring**
-- `/healthz` - Detailed JSON health status with connection, queue, and timing data
-- `/live` - Liveness probe for containers 
-- `/ready` - Readiness probe (200 only when radio connected)
-- **Degraded state detection** - Returns 503 when issues detected
-- **Heartbeat logging** - Status updates every ~30 seconds
-
-#### ⚡ **Reliability & Performance Improvements**
-- **Smart timeout handling** with progressive retry logic and exponential backoff
-- **Better SSE connection management** prevents stale log streams
-- **Improved error recovery** with graceful connection drop handling
-- **Better user feedback** with clear error messages and status indicators
-- **Single-instance PID lock** prevents multiple conflicting processes
-
-### New Updates in v0.4.2 → v0.5.1 - NOW IN BETA!
-- **REBRANDED TO MESH-MASTER** 
-- **WebUI Enhancements**  
-  - **Node Search** added for easier node management.  
-  - **Channel Message Organization** with support for custom channels in `config.json`.  
-  - **Revamped DM threaded messaging** system.
-  - **Multi-language Menu Support** - Internationalized interface with dynamic language switching.
-  - **Timezone Selection** for accurate incoming message timestamps.
-  - **Custom Local Sounds** for message notifications (no longer relying on hosted files).
-  - **Logs Page Auto-Refresh** for live updates.
-- **Baudrate Adjustment**  
-  - Configurable **baud rate** in `config.json` for longer USB connections (e.g., roof nodes).
-- **Protobuf Noise Debugging**  
-  - Moved any protobuf-related errors behind debug logs as they do not affect functionality.  
-  - Can be enabled by setting `"debug": true` in `config.json` to track.
-- **Updated Docker Support**  
-  - Updated Docker configuration to always pull/build the latest Meshtastic-Python libraries, ensuring compatibility with Protobuf versions.
-### POSSIBLE BUGS IN BETA v0.5.1 - Web UI ticker isn't honoring read messages in some cases.
-### INCOMING MESSAGE SOUNDS ARE UNTESTED ON ALL PLATFORMS AND FILESYSTEMS.
-
-### New Updates in v0.4.1 → v0.4.2
-- **Initial Ubuntu & Ollama Unidecode Support: -**  
-  - User @milo_o - Thank you so much!  I have merged your idea into the main branch - hoping this works as expected for users - please report any problems!  -  https://github.com/mr-tbot/mesh-master/discussions/19
-- **Emergency Email Google Maps Link:**  
-  - Emergency email now includes a Google Maps link to the sender's location, rather than just coordinates. - Great call, @Nlantz79!  (Remember - this is only as accurate as the sender node's location precision allows!)
-
-### New Updates in v0.4.0 → v0.4.1
-- **Error Handling (ongoing):**  
-  - Trying a new method to handle WinError exceptions - which though much improved in v0.4.0 - still occur under the right connection circumstances - especially over Wi-Fi.  
-     (**UPDATE: My WinError issues were being caused by a combination of low solar power, and MQTT being enabled on my node.  MQTT - especially using LongFast is very intense on a node, and can cause abrupt connection restarts as noted here:  https://github.com/meshtastic/meshtastic/pull/901 - but - now the script is super robust regardless for handling errors!)**
-- **Emergency Email Subject:**  
-  - Email Subject now includes the long name, short name & Node ID of the sending node, rather than just the Node ID.
-- **INITIAL Docker Support**  
-
-### New Updates in v0.3.0 → v0.4.0
-- **Logging & Timestamps:**  
-  - Shift to UTC‑based timestamps and enhanced log management.
-- **Emergency Notifications:**  
-- **Sending and receiving SMS:**  
-- **Command Handling:**  
-  - Made all slash commands case‑insensitive to improve usability.
-  - Enhanced custom command support via `commands_config.json` with dynamic AI prompt insertion.
-- **Improved Error Handling & Reconnection:**  
-  - More granular detection of connection errors (e.g., specific OSError codes) and use of a global reset event for reconnects.
-- **Code Refactoring:**  
-  - Overall code improvements for maintainability and clarity, with additional debug prints for troubleshooting.
-
-### Changelog: v0.2.2 → v0.3.0 (from the original Main Branch README)
-- **WebUI Overhaul:**  
-  - Redesigned three‑column dashboard showing channel messages, direct messages, and node list.
-  - New send‑message form with toggleable modes (broadcast vs. direct), dynamic character counting, and message chunk preview.
-- **Improved Error Handling & Stability:**  
-  - Redirected stdout/stderr to a persistent `script.log` file with auto‑truncation.
-  - Added a connection monitor thread to detect disconnections and trigger automatic reconnects.
-  - Implemented a thread exception hook for better error logging.
-- **Enhanced Message Routing & AI Response Options:**  
-  - Added configuration flags (`reply_in_channels` and `reply_in_directs`) to control AI responses.
-  - Increased maximum message chunks (default up to 5) for longer responses.
-  - Updated slash command processing (e.g., added `/about`) and support for custom commands.
-- **Expanded API Endpoints:**  
-  - New endpoints: `/nodes`, updated `/connection_status`, and `/ui_send`.
-- **Additional Improvements:**  
-  - Robust Home Assistant integration and basic emergency alert enhancements.
-
-## 1. Changelog: v0.1 → v0.2.2
-
-- **Expanded Configuration & JSON Files**  
-   - **New `config.json` fields**  
-     - Added `debug` toggle for verbose debugging.  
-     - Added options for multiple AI providers (`lmstudio`, `openai`, `ollama`), including timeouts and endpoints.  
-     - Introduced **Home Assistant** integration toggles (`home_assistant_enabled`, `home_assistant_channel_index`, secure pin, etc.).  
-     - Several new user-configurable parameters to control message chunking (`chunk_size`, `max_ai_chunks`, and `chunk_buffer_seconds`) to reduce radio congestion.  
-- **Support for Multiple AI Providers**  
-   - Behavior is routed depending on which provider you specify in `config.json`.
-- **Home Assistant Integration**  
-   - Option to route messages on a dedicated channel directly to Home Assistant’s conversation API.  
-   - **Security PIN** requirement can be enabled, preventing unauthorized control of Home Assistant.  
-- **Improved Command Handling**  
-   - Replaced single-purpose code with a new, flexible **commands system** loaded from `commands_config.json`.  
-   - Users can define custom commands that either have direct string responses or prompt an AI.  
-  - Built-in commands now include `/ping`, `/test`, `/help`, `/motd`, and more.  
-- **Emergency Alert System**  
-   - Retrieves node GPS coordinates (if available) to include location in alerts.  
-- **Improved Message Chunking & Throttling**  
-   - Long AI responses are split into multiple smaller segments (configurable via `chunk_size` & `max_ai_chunks`).  
-   - Delays (`chunk_buffer_seconds`) between chunks to avoid flooding the mesh network.  
-- **REST API Endpoints** (via built-in Flask server)  
-   - `GET /messages`: Returns the last 100 messages in JSON.  
-   - `GET /dashboard`: Displays a simple HTML dashboard showing the recently received messages.  
-   - `POST /send`: Manually send messages to nodes (direct or broadcast) from external scripts or tools.  
-- **Improved Logging and File Structure**  
-   - **`messages.log`** for persistent logging of all incoming messages, commands, and emergencies.  
-   - Distinct JSON config files: `config.json`, `commands_config.json`, and `motd.json`.  
-- **Refined Startup & Script Structure**  
-   - A new `Run MESH-MASTER - Windows.bat` script for straightforward Windows startup.  
-   - Added disclaimers for alpha usage throughout the code.  
-   - Streamlined reconnection and exception handling logic with more robust error-handling.  
-- **General Stability & Code Quality Enhancements**  
-   - Thorough refactoring of the code to be more modular and maintainable.  
-   - Better debugging hooks, improved concurrency handling, and safer resource cleanup.  
-
----
-
-## Quick Start (Windows)
-
-1. **Download/Clone**  
-   - Clone the repository or copy the **mesh-master** folder to your Desktop.  (Rename and remove "-main" tag from the folder name if downloading as ZIP)
-2. **Install Dependencies:**  
-   - Create a virtual environment:
-     ```bash
-     cd path\to\mesh-master
-     python -m venv venv
-     venv\Scripts\activate
-     ```
-   - Upgrade pip and install required packages:
-     ```bash
-     pip install --upgrade pip
-     pip install -r requirements.txt
-     ```
-3. **Configure Files:**  
-   - Edit `config.json`, `commands_config.json`, and `motd.json` as needed. Refer to the **Configuration** section below.
-4. **Start the Bot:**  
-   - Run the bot by double‑clicking `Run MESH-MASTER - Windows.bat` or by executing:
-     ```bash
-     python mesh-master.py
-     ```
-5. **Access the WebUI Dashboard:**  
-   - Open your browser and navigate to [http://localhost:5000/dashboard](http://localhost:5000/dashboard).
-
----
-
-## Quick Start (Ubuntu / Linux)
-
-1. **Download/Clone**  
-   - Clone the repository or copy the **mesh-master** folder to your preferred directory:
-     ```bash
-     git clone https://github.com/mr-tbot/mesh-master.git
-     cd mesh-master
-     ```
-
-2. **Create and Activate a Virtual Environment Named `mesh-master`:**  
-   - Create the virtual environment:
-     ```bash
-     python3 -m venv mesh-master
-     ```
-   - Activate the virtual environment:
-     ```bash
-     source mesh-master/bin/activate
-     ```
-
-3. **Install Dependencies:**  
-   - Upgrade pip and install the required packages:
-     ```bash
-     pip install --upgrade pip
-     pip install -r requirements.txt
-     ```
-
-4. **Configure Files:**  
-   - Edit `config.json`, `commands_config.json`, and `motd.json` as needed. Refer to the **Configuration** section in the documentation for details.
-
-5. **Start the Bot:**  
-   - **Enhanced Method (Recommended for this fork):**  
-     Use our improved startup script with single-instance enforcement and better error handling:
-     ```bash
-     ./start_mesh_master.sh
-     ```
-   - **Standard Method:**  
-     Run the bot directly:
-     ```bash
-     python mesh-master.py
-     ```
-
-   **Benefits of Enhanced Startup Script:**
-   - ✅ Prevents multiple instances and resource conflicts
-   - ✅ Automatic virtual environment activation
-   - ✅ Proper cleanup on exit
-   - ✅ Better connection recovery
-   - ✅ Automatic browser opening to dashboard
-
-6. **Access the WebUI Dashboard:**  
-   - Open your browser and navigate to [http://localhost:5000/dashboard](http://localhost:5000/dashboard).
-
-### Optional: Enable Auto-Start on Boot (Headless / systemd)
-
-On a headless Raspberry Pi (or any Linux without a GUI session), use the included systemd installer to run MESH-MASTER at boot:
+Build the 2.0 image locally so you run the exact code in this repository:
 
 ```bash
-cd /path/to/mesh-master
-sudo ./scripts/install-systemd-service.sh .
-sudo systemctl start mesh-master
-sudo systemctl status mesh-master
+docker build -t mesh-master:2.0 .
 ```
 
-- The service is installed as `mesh-master.service` and enabled to start on boot.
-- Logs go to `mesh-master.log` and the internal `script.log` for detailed events.
-  - View via: `journalctl -u mesh-master -e -f`
+Minimal compose example:
 
-If you prefer using a Desktop environment autostart, the WebUI includes a toggle that manages a `.desktop` file. For reliable boot on headless devices, systemd is recommended.
-
-
-## Quick Start (Docker)
-
-1. **Prerequisites**  
-   - Docker installed on your host (Linux, macOS, Windows or Raspberry Pi).  (Current Images Built for Linux x86 & ARM64 Raspberry Pi)
-   - Docker support is currently untested on Windows & MacOS, and the Raspberry Pi image remains fresh and untested - please report back!
-   - A Meshtastic device connected via USB or WiFi (No Bluetooth testing Done as of yet)
-   - If needed,uncomment USB sections and set identifiers such as `/dev/ttyUSB0` or `\\.\COM3`.
-
-2. **Prepare the Volume Structure**  
-   - In the root of your project directory:
-   - Extract the "docker-required-volumes.zip" - The included "config" & "logs" folders should be within your "mesh-master folder"
-   - This file structure differs from the standard release to accommodate volumes for docker
-   - These files are placed in order to prevent docker from replacing these with directories on first start and throwing errors.
-   - Make any changes to config files as needed before moving forward.
-
-File structure should look like this:
-
-   ```bash
-   mesh-master/
-   ├── config/
-   │   ├── config.json
-   │   ├── commands_config.json
-   │   └── motd.json
-   └── logs/
-    ├── script.log
-    ├── messages.log
-    └── messages_archive.json
+```yaml
+services:
+  mesh-master:
+    image: mesh-master:2.0
+    container_name: mesh-master
+    privileged: true
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./commands_config.json:/app/commands_config.json:ro
+      - ./motd.json:/app/motd.json:ro
+      - ./data:/app/data
+      - ./state/mesh-master.log:/app/mesh-master.log
+      - ./state/messages.log:/app/messages.log
+      - ./state/messages_archive.json:/app/messages_archive.json
+      - ./state/script.log:/app/script.log
+      - ./state/mesh_mailboxes.json:/app/mesh_mailboxes.json
+      - ./state/mesh_mail.db:/app/mesh_mail.db
+    restart: unless-stopped
 ```
 
+If you rely on USB serial, also bind `/dev/serial/by-id` (read-only) and `/dev` as needed, and set `MESH_INTERFACE`/`serial_port` accordingly.
 
-3. **Pull & run the Docker Image using docker-compose**
-   - An example docker-compose-yaml is included in the github repository - please adjust as needed.
-   - From the project directory, run:
-   ```bash
-   docker pull mrtbot/mesh-master:latest
-   docker-compose up -d
-  
-
-4. **Access the WebUI Dashboard:**  
-   - Open your browser and navigate to [http://localhost:5000/dashboard](http://localhost:5000/dashboard).
+Create the `state` directory (and `touch` the files listed above) before the first run so Docker can mount them successfully.
 
 ---
 
-![image](https://github.com/user-attachments/assets/0bc7e4a0-7eee-4b8b-b79a-38fce61e9ea8)
+## Everyday Commands
 
+- **AI conversations** — `/ai`, `/bot`, `/query`, or `/data` (DM or configured channels).  
+- **Mesh mail** — `/m <mailbox> <message>`, `/c <mailbox> [question]`, `/emailhelp`, `/wipe ...`.  
+- **Quick knowledge** — `/bible`, `/chucknorris`, `/elpaso`, `/meshtastic`, `/offline wiki`, `/web <query>`, `/wiki <topic>`.  
+- **Personality & context** — `/aipersonality` (list/set/prompt/reset), `/save [topic]`, `/recall <topic>`, `/exit`.  
+- **Games** — `/games`, `/hangman start`, `/wordle start`, `/wordladder start cold warm`, `/adventure start`, `/cipher start`, `/quizbattle start`, `/morse start`, `/rps`, `/coinflip`.  
+- **Location & status** — `/test`, `/motd`, Meshtastic “Request Position,” `/reset`, `/about`.  
+- **Admin (DM-only)** — `/changeprompt`, `/changemotd`, `/showprompt`, `/printprompt`.
 
-
----
-
-## Basic Usage
-
-- **Interacting with the AI:**  
-  - Use `/ai` (or `/bot`, `/query`, `/data`) followed by your message to receive an AI response.
-  - For direct messages, simply DM the AI node if configured to reply.
-- **Mesh Mail Inbox:**  
-  - Send `/m mailboxname message` (aliases `/mail`, `/email`) in a DM to drop mail into that inbox. If the mailbox doesn’t exist yet the bot will walk you through creating it and then save the message.  
-  - Check the latest three messages with `/c mailboxname` (aliases `/check`, `/checkmail`). Add a question right after the mailbox—for example `/c mailboxname what did we decide for Friday?`—and the bundled `llama3.2:1b` model will search the inbox and return a short answer.  
-  - Housekeeping commands: `/wipe mailbox <name>` clears a single inbox, `/wipe chathistory` wipes your DM thread, `/wipe personality` resets tone, and `/wipe all <name>` nukes mailbox + chat + tone after a Y/N confirmation.
-- **AI Personalities & Prompts (DM-only):**  
-  - Run `/aipersonality` to see your current persona, list the catalog, and grab quick tips.  
-  - Switch tones with commands like `/aipersonality set shakespeare` or `/aipersonality set sassy`.  
-  - Add extra guidance using `/aipersonality prompt Keep responses ultra brief.`  
-  - Use `/aipersonality reset` whenever you want to snap back to the default configuration.
-- **Need a walkthrough?**  
-  - `/emailhelp` sends a concise, mesh-friendly primer covering inbox creation, sending, reading, and wiping so new operators can get rolling fast.
-- **Game Hub:**  
-  - `/games` lists every mini-game. `/hangman start`, `/wordle start`, `/cipher start`, `/bingo start`, `/quizbattle start`, and `/morse start` all run in DMs.  
-  - `/adventure start <prompt>` spins up a llama-guided story; reply with `1`, `2`, or `3` to branch the scene—available in the language you're chatting in.  
-  - `/wordladder start cold warm` launches a llama-assisted ladder—use `guess` for your own rungs or `hint` to let the model propose the next word.  
-  - Quick hits: `/rps` for rock-paper-scissors banter, `/coinflip` for a dramatic mesh coin toss.  
-  - Games remember your current round per DM. Use `status`, `stop`, `hint`, or `answer` (depending on the title) for quick controls.
-- **Location Query:**  
-- Use the Meshtastic “Request Position” button to receive your node’s GPS coordinates (if available). The bot responds automatically when that control is pressed.
-- **Emergency Alerts:**  
-- **Sending and receiving SMS:**  
-- **Home Assistant Integration:**  
-  - When enabled, messages sent on the designated Home Assistant channel (as defined by `"home_assistant_channel_index"`) are forwarded to Home Assistant’s conversation API.
-  - In secure mode, include the PIN in your message (format: `PIN=XXXX your message`).
-- **WebUI Messaging:**  
-  - Use the dashboard’s send‑message form to send broadcast or direct messages. The mode toggle and node selection simplify quick replies.
+All commands are case-insensitive. Special commands buffer ~3 seconds before responding to reduce radio congestion.
 
 ---
 
-## 🎛️ Web Dashboard & Live Monitoring
+## Dashboard & Monitoring
 
-### **Enhanced Web Interface Experience**
-- **Access**: Navigate to [http://localhost:5000/dashboard](http://localhost:5000/dashboard) for the full interface
-- **Live Log Viewer**: Real-time streaming logs with emoji indicators:
-  - 📡 Connection events (radio connect/disconnect)
-  - 📨 Message activity (send/receive)  
-  - 🤖 AI responses and processing
-  - ⚠️ Errors and warnings
-  - 🔧 Command execution
-- **Interactive Filtering**: Click log type buttons to show only relevant events (All, Errors, AI, Messages, Connection)
-- **Auto-Recovery**: Connection automatically restores if log stream goes stale
-- **Responsive Design**: Works perfectly on phones, tablets, and desktops
-- **Professional Styling**: Clean, modern interface that updates live without refresh
-
-### **Production Monitoring Endpoints**
-- **Health Check**: `GET /healthz` - Comprehensive JSON status with timing data
-- **Liveness Probe**: `GET /live` - Simple alive check for containers
-- **Readiness Probe**: `GET /ready` - Returns 200 only when radio connected
-- **Real-time Logs**: `GET /logs` - Stream live events via Server-Sent Events
+- **Logs:** `/logs` (HTML) and `/logs/raw` (plain text); streaming SSE feed powers the dashboard in real time.  
+- **Health probes:**
+  - `GET /ready` → HTTP 200 only when the radio link is up (503 otherwise).  
+  - `GET /live` → process liveness.  
+  - `GET /healthz` → full JSON snapshot (connection, queue depth, worker status, AI timing, last error).  
+- **Heartbeat:** Watch `mesh-master.log` for the `💓 HB` line every ~30 seconds summarizing RX/TX/AI ages.  
+- **REST hooks:** `POST /send` and `POST /ui_send` accept JSON payloads for automations; `/discord_webhook` bridges Discord events into the mesh when enabled.
 
 ---
 
-## Admin Commands (DM-only)
+## Configuration Essentials
 
-- Change system prompt
-  - `/changeprompt <text>`
-  - Persists to `config.json` (atomic write) and applies immediately.
-
-- Show current system prompt
-  - `/showprompt` or `/printprompt`
-
-- Change Message of the Day (MOTD)
-  - `/changemotd <text>`
-  - Persists to `motd.json` (atomic write); shown via `/motd`.
-
-Notes
-- These commands are DM-only to prevent misuse in channels. If used in a channel, the bot replies with a DM-only notice.
-- Changes persist across restarts.
-
----
-
-## Using the API
-
-The MESH-MASTER server (running on Flask) exposes the following endpoints:
-
-- **GET `/messages`**  
-  Retrieve the last 100 messages in JSON format.
-- **GET `/nodes`**  
-  Retrieve a live list of connected nodes as JSON.
-- **GET `/connection_status`**  
-  Get current connection status and error details.
-- **GET `/logs`**  
-  View a styled log page showing uptime, restarts, and recent log entries.
-- **GET `/dashboard`**  
-  Access the full WebUI dashboard.
-- **POST `/send`** and **POST `/ui_send`**  
-  Send messages programmatically.
-- **POST `/discord_webhook`**  
-
----
-
-## Health & Monitoring
-
-- Probes (JSON):
-  - `GET /ready` → 200 only when the radio is connected; 503 otherwise.
-  - `GET /live` → liveness check (always 200 when the app loop is running).
-  - `GET /healthz` → detailed status including:
-    - `status` (Connected/Disconnected), `queue` size, `worker` and `heartbeat` flags,
-    - `rx_age_s`, `tx_age_s`, `ai_age_s`, and `ai_error` (if any) with `ai_error_age_s`.
-    - Returns 503 if degraded (radio disconnected, response queue stalled, or recent AI error).
-
-- Examples:
-  - `curl http://localhost:5000/ready`
-  - `curl http://localhost:5000/live`
-  - `curl http://localhost:5000/healthz`
-
-- Heartbeat:
-  - A concise heartbeat is logged roughly every 30 seconds showing connection status and activity ages.
-  - View with: `tail -f mesh-master.log`
-
----
-
-## Upgrade to v1.0
-
-1) Stop any running instance and service (if used)
-- `systemctl --user stop mesh-master.service`
-
-2) Pull latest changes and update dependencies (if needed)
-- `git pull`
-- `source .venv/bin/activate` (or your venv) and `pip install -r requirements.txt`
-
-3) Start via the user service or helper script
-- `systemctl --user start mesh-master.service`
-  - or: `NO_BROWSER=1 bash start_mesh_master.sh`
-
-4) Verify readiness and health
-- `curl http://localhost:5000/ready`
-- `curl http://localhost:5000/healthz`
-- `tail -f mesh-master.log` (look for periodic heartbeat lines)
-
-Notes
-- v1 enforces a single running instance via a lightweight PID lock to avoid serial port conflicts.
-- Admin commands (`/changeprompt`, `/changemotd`, `/showprompt`, `/printprompt`) are DM‑only and persist across restarts.
-
-## Configuration
-
-Your `config.json` file controls almost every aspect of MESH-MASTER. Below is an example configuration that includes both the previous settings and the new options:
+Key fields from `config.json` (trimmed for brevity):
 
 ```json
 {
-  "debug": false, 
-  "use_mesh_interface": false,  // Set to true if using the Meshtastic mesh interface instead of WiFi
-  "use_wifi": true,  // Set to false if using a serial connection instead of WiFi
-  "wifi_host": "MESHTASTIC NODE IP HERE",  // IP address of your Meshtastic device if using WiFi
-  "wifi_port": 4403,  // Default port for WiFi connection
-  
-  "serial_port": "",  // Set the serial port if using a USB connection (e.g., /dev/ttyUSB0 on Linux or COMx on Windows)
-  // "serial_baud": 460800,  // Set baud rate for long USB runs or subpar USB connections (uncomment to use)
-
-  "ai_provider": "lmstudio, openai, or ollama",  // Select the AI provider: "lmstudio", "openai", or "ollama"
-  "system_prompt": "You are a helpful assistant responding to mesh network chats. Respond in as few words as possible while still answering fully.",  // System prompt for AI interaction
-
-
-
-  "ollama_url": "http://localhost:11434/api/generate",  // URL for Ollama's API
-  "ollama_model": "llama3",  // Ollama model (e.g., "llama3")
-  "ollama_timeout": 60,  // Timeout in seconds for Ollama API requests
-
-  "home_assistant_url": "http://homeassistant.local:8123/api/conversation/process",  // Home Assistant API URL for conversation processing
-  "home_assistant_token": "INPUT HA TOKEN HERE",  // Home Assistant API token (replace with your token)
-  "home_assistant_timeout": 90,  // Timeout in seconds for Home Assistant API requests
-  "home_assistant_enable_pin": false,  // Set to true to require a PIN for Home Assistant commands
-  "home_assistant_secure_pin": "1234",  // PIN for Home Assistant (if enabled)
-
-  "home_assistant_enabled": false,  // Set to true to enable Home Assistant integration
-  "home_assistant_channel_index": 1,  // Index of the channel for Home Assistant messages (set to -1 if not using)
-
-  "channel_names": {
-    "0": "LongFast",  // Name for Channel 0
-    "1": "Channel 1",  // Name for Channel 1
-    "2": "Channel 2",  // Name for Channel 2
-    "3": "Channel 3",  // Name for Channel 3
-    "4": "Channel 4",  // Name for Channel 4
-    "5": "Channel 5",  // Name for Channel 5
-    "6": "Channel 6",  // Name for Channel 6
-    "7": "Channel 7",  // Name for Channel 7
-    "8": "Channel 8",  // Name for Channel 8
-    "9": "Channel 9"   // Name for Channel 9
-  },
-  
-  "reply_in_channels": true,  // Set to true to allow AI to reply in broadcast channels
-  "reply_in_directs": true,  // Set to true to allow AI to reply in direct messages
-  
-  "chunk_size": 200,  // Maximum size for message chunks
-  "max_ai_chunks": 5,  // Maximum number of chunks to split AI responses into
-  "chunk_buffer_seconds": 4,  // Delay between message chunks to reduce congestion
-
-  "local_location_string": "@ YOUR LOCATION HERE",  // Label used in location replies
-  "ai_node_name": "Mesh-Master-Alpha",  // Name advertised to the mesh
-  "max_message_log": 0,  // Set to 0 for unlimited history
-  "meshtastic_knowledge_file": "data/meshtastic_knowledge.txt",
+  "serial_port": "/dev/serial/by-id/usb-RAKwireless_WisCore_RAK4631_Board_XXXX",
+  "serial_baud": 38400,
+  "ai_provider": "ollama",
+  "system_prompt": "You are an offline chatbot serving a local mesh network...",
+  "ollama_model": "llama3.2:1b",
+  "ollama_timeout": 120,
+  "ollama_context_chars": 4000,
+  "async_response_queue_max": 25,
   "meshtastic_kb_max_context_chars": 3200,
   "meshtastic_kb_cache_ttl": 600,
-  "offline_wiki_enabled": true,
-  "offline_wiki_dir": "data/offline_wiki",
-  "offline_wiki_summary_chars": 400,
-  "offline_wiki_context_chars": 40000
-
+  "default_personality_id": "trail_scout",
+  "mail_search_timeout": 120,
+  "reply_in_channels": true,
+  "reply_in_directs": true,
+  "chunk_size": 200,
+  "chunk_buffer_seconds": 1,
+  "home_assistant_enabled": false,
+  "home_assistant_channel_index": 1
 }
-
 ```
 
----
+Additional knobs:
+- **Mesh Mail:** `mailbox_max_messages`, `mail_follow_up_delay`, `mail_notify_enabled`, `mail_notify_reminders_enabled`, `mail_notify_quiet_hours_enabled`, `mail_notify_reminder_hours`, `mail_notify_expiry_hours`, `mail_notify_max_reminders`, `mail_notify_include_self`, `mail_notify_heartbeat_only`, `mail_search_model`, `mail_search_max_messages`, `mail_search_num_ctx`, `mail_search_timeout`, `notify_active_start_hour`, `notify_active_end_hour`, and `mail_security_file`.  
+- **Saved context:** `saved_context_max_chars`, `saved_context_summary_chars`, `context_session_timeout_seconds`.  
+- **Feature toggles:** `feature_flags.json` can disable commands or switch `message_mode` to `broadcast`, `dm`, or `both`.  
+- **Offline wiki:** configure `offline_wiki_dir`, `offline_wiki_summary_chars`, and `offline_wiki_context_chars` to control local article size.
 
-## Home Assistant Integration
-
-Mesh Master can optionally relay queries to Home Assistant's Conversation service.
-
-### Enable Home Assistant Support
-- Set `"home_assistant_enabled": true` in `config.json`.
-- Provide `"home_assistant_url"` (e.g., `http://homeassistant.local:8123/api/conversation/process`).
-- Add a long-lived access token in `"home_assistant_token"` and adjust `"home_assistant_timeout"` as needed.
-- (Optional) Enable `"home_assistant_enable_pin": true` and set `"home_assistant_secure_pin"` to require a PIN prefix.
-- Messages arriving on the channel listed in `"home_assistant_channel_index"` are forwarded automatically.
-
-### Ollama Settings
-- Mesh Master now uses Ollama exclusively for AI responses (default `"ai_provider": "ollama"`).
-- Adjust `"ollama_url"`, `"ollama_model"`, and related timeout/context options to match your host.
-
-## Other Important Settings
-
-- **Logging & Archives:**  
-  - Script logs are stored in `script.log` and message logs in `messages.log`.
-  - An archive is maintained in `messages_archive.json` to keep recent messages.
-  
-- **Device Connection:**  
-  - Configure the connection method for your Meshtastic device by setting either the `"serial_port"` or enabling `"use_wifi"` along with `"wifi_host"` and `"wifi_port"`.  
-  - Alternatively, enable `"use_mesh_interface"` if applicable.
-  - Baud Rate is optionally set if you need - this is for longer USB runs (roof nodes connected via USB) and bad USB connections.
-  
-- **Message Routing & Commands System:**  
-  - **Built-in Commands** (case-insensitive):
-    - `/about` - Show bot information
-    - `/help` - List all available commands  
-    - `/test` - Connection test with your location
-    - `/motd` - Display Message of the Day
-    - `/ai`, `/bot`, `/query`, `/data` - AI conversation commands
-    - `/reset` - Clear conversation history for channel or DM
-    - `/web <search>` - DM-only DuckDuckGo lookup (`crawl20` etc. for scoped site crawls)
-    - `/wiki <topic>` - DM-only live Wikipedia summary with cached context
-    - `/offline wiki <topic>` - DM-only offline encyclopedia query (requires local data set)
-    - `/save [topic]` - DM-only save of the current conversation window for later recall (auto names when topic omitted)
-    - `/recall <topic>` - DM-only recall of a saved conversation (type `/exit` to leave the loaded context)
-    - `/exit` - Leave any active context window (saved or MeshTastic deep-dive)
-    
-  - **Fun Trivia Commands**:
-    - `/bible` - WEB/RVR1909 verse with per-user reading progress (`/bible` resumes where you left off; `/bible John 3:16-17` jumps to a passage, nav via `<1,2>`) 📜
-    - `/biblehelp` - Mesh-friendly bible tips (language switching, navigation, quick start)
-    - `/chucknorris` - Random Chuck Norris fact from `chuck_api_jokes.json` 🥋  
-    - `/elpaso` - Random El Paso trivia from `el_paso_people_facts.json` 🌵
-    
-  - **Admin Commands (DM-only for security):**
-    - `/changeprompt <text>` - Update AI system prompt (persists to config.json)
-    - `/changemotd <text>` - Update Message of the Day (persists to motd.json)
-    - `/showprompt`, `/printprompt` - Display current system prompt
-    
-  - **Smart Auto-Responses (DM only):**
-    - **🔔 Alarm Bell Responses**: When someone sends "alert bell character!" or 🔔, bot responds with random Meshtastic facts from `meshtastic_facts.py`
-    - **📍 Position Replies**: When someone shares their position and requests yours, bot gives humorous "I'm just software" responses
-    
-  - **Custom Commands** via `commands_config.json`:
-    ```json
-    {
-      "commands": [
-        {
-          "command": "/ping",
-          "response": "Pong!"
-        },
-        {
-          "command": "/funfact", 
-          "ai_prompt": "Give me a fun fact about {user_input}"
-        }
-      ]
-    }
-    ```
-- **Offline Wiki Dataset (optional):**
-    1. Place an `index.json` file and article JSON files inside `data/offline_wiki/`.
-       - Each index entry maps a lowercase key to a relative JSON file containing `title`, `content`, and optional `summary`/`source` fields.
-    2. Use `/offline wiki <topic>` in a DM to load ~40K characters of context for later conversations (only a ~400 character summary is sent back).
-    3. Quickly seed the library with `python scripts/update_offline_wiki.py "Topic One" "Topic Two"` (or pass `--topics-file topics.txt`). The tool hits Wikipedia, writes the JSON files, and keeps `index.json` up to date.
-    4. Adjust the optional config flags (`offline_wiki_enabled`, `offline_wiki_dir`, `offline_wiki_summary_chars`, `offline_wiki_context_chars`) if you store the data elsewhere or want different limits.
-    5. Run `/reset` if you want to drop the cached encyclopedia context from your conversation history.
-    6. Once populated, saved conversations can be recalled with `/recall <topic>` (or natural phrases like “remember when we were talking about…”); exit the session with `/exit`.
-  - The WebUI Dashboard (accessible at [http://localhost:5000/dashboard](http://localhost:5000/dashboard)) displays messages and node status.
-  
-- **AI Provider Settings:**  
-  
-- **Security:**  
-  - If using Home Assistant with PIN protection, follow the specified format (`PIN=XXXX your message`) to ensure messages are accepted.
-  
-- **Testing:**  
+Remember to restart the service (or use `/changeprompt`/`/changemotd`) after editing configs that lack runtime setters.
 
 ---
 
+## Hardware Tips
 
-## Contributing & Disclaimer
-
-- **Alpha Software Notice:**  
-  This release (v0.4.2) is experimental. Expect bugs and changes that might affect existing features. Thorough field testing is recommended before production use.
-- **Feedback & Contributions:**  
-  Report issues or submit pull requests on GitHub. Your input is invaluable.
-- **Use Responsibly:**  
-  Modifying this code for nefarious purposes is strictly prohibited. Use at your own risk.
-
----
-
-## Donations are GRACIOUSLY accepted to stoke development!
-- **PayPal:**  
-  https://www.paypal.com/ncp/payment/XPW23EP9XHMYS
-- **BTC:**  
-  bc1qcfstyxaktw5ppnsm5djmpvmgv49z0cp6df33tl
-- **XRP:**  
-  TrpgvB8EgTtqhU1W6XJAvx3CS8KKkRwTLHc
-- **DOGE:**  
-  D5MyXVRkwLW9XzcKjjcwEHcXvnaTFueZhy
+- **RAK4631 Always-On Profile:**
+  1. Copy `99-rak-no-autosuspend.rules` into `/etc/udev/rules.d/`, reload udev, and replug the device.  
+  2. Apply `hardware_profiles/rak4631_always_on.yaml` with `./scripts/apply_rak4631_profile.py` (add `--dry-run` to preview).  
+  3. Confirm `role: ROUTER_CLIENT` and `is_power_saving: false` with `meshtastic --info`.
+- **Log Hygiene:** `CLEAN_LOGGING.md` outlines how to rotate logs safely when running unattended.  
+- **Back up frequently:** snapshot `config.json`, `commands_config.json`, `motd.json`, `messages.log`, `messages_archive.json`, `mesh_mailboxes.json`, and `data/mail_security.json` together.
 
 ---
 
-## Conclusion
+## Upgrade Notes from 1.x
 
+- Single-instance PID locks prevent accidental double starts. Stop older services before launching 2.0.  
+- Mesh Mail subsystems replace ad-hoc DM forwarding—migrate workflows to `/m`/`/c` commands.  
+- New async response queue defaults to 25 messages; adjust `async_response_queue_max` if running on limited hardware.  
+- Knowledge base trimmed and cached; tune `meshtastic_kb_max_context_chars` when using larger models.  
+- Dashboard styling and APIs remain compatible, but cached assets moved to `static/`.
 
-**Enjoy tinkering, stay safe, and have fun!**  
-Please share your feedback or join our community on GitHub.
+---
+
+## Documentation & Support
+
+- Mesh Mail internals: `docs/mail_readme.md`  
+- Command map: `docs/mesh_master_command_tree.pdf`  
+- Service management: `README_SERVICE.md`  
+- Security practices: `SECURITY.md`
+
+Issue reports and contributions are welcome via GitHub pull requests.
+
+---
+
+## Acknowledgements
+
+- Original Mesh Master project by [MR_TBOT](https://github.com/mr-tbot/mesh-master); this fork builds on that foundation with a focus on fully offline resilience.  
+- Thanks to the Meshtastic community researchers, testers, and field operators who supplied feedback, hardware profiles, and localization tweaks.
+
+---
+
+## License
+
+MESH MASTER is distributed under the terms of the [MIT License](LICENSE).
+
+The Meshtastic name and logo remain trademarks of Meshtastic LLC.

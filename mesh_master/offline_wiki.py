@@ -159,10 +159,32 @@ class OfflineWikiStore:
         summary_clipped = _clip(summary or _fallback_summary(content, summary_limit), summary_limit)
         content_clipped = _clip(content, max(2000, context_limit))
         alias_list = [alias for alias in (aliases or []) if alias]
+        normalized_aliases = [_normalize(alias) for alias in alias_list if alias]
 
         with self._lock:
-            if normalized in self._entries and not overwrite:
-                return False
+            existing = self._entries.get(normalized)
+            if existing and not overwrite:
+                existing_aliases = set(existing.aliases)
+                new_aliases = tuple(
+                    alias
+                    for alias in normalized_aliases
+                    if alias and alias != normalized and alias not in existing_aliases
+                )
+                if not new_aliases:
+                    return False
+                updated_entry = _IndexEntry(
+                    key=existing.key,
+                    title=existing.title,
+                    path=existing.path,
+                    summary=existing.summary,
+                    aliases=existing.aliases + new_aliases,
+                )
+                self._entries[normalized] = updated_entry
+                for alias in new_aliases:
+                    self._alias_map[alias] = normalized
+                self._write_index()
+                self._load_error = None
+                return True
             slug = _slugify(title)
             rel_path = Path(f"{slug}.json")
             target = self.base_dir / rel_path
@@ -183,7 +205,7 @@ class OfflineWikiStore:
                 title=title,
                 path=target,
                 summary=summary_clipped,
-                aliases=tuple(_normalize(alias) for alias in alias_list if alias),
+                aliases=tuple(alias for alias in normalized_aliases if alias and alias != normalized),
             )
             self._entries[normalized] = entry
             for alias in entry.aliases:

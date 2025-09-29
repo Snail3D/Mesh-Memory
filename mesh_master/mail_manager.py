@@ -6,12 +6,11 @@ import os
 import random
 import threading
 import time
-import textwrap
 from collections import deque
-from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from datetime import datetime, timezone, timedelta
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from mesh_master_mail import MailStore
+from mesh_master_mail import MailStore, MAIL_RETENTION_SECONDS
 from .replies import PendingReply
 
 MAIL_TIME_DISPLAY = "%m-%d %H:%M"
@@ -50,11 +49,16 @@ class MailManager:
         message_limit: int,
         follow_up_delay: float,
         notify_enabled: bool,
+        reminders_enabled: bool,
         reminder_interval_seconds: float,
         reminder_expiry_seconds: float,
         reminder_max_count: int,
         include_self_notifications: bool,
         heartbeat_only: bool,
+        quiet_hours_enabled: bool,
+        quiet_start_hour: int,
+        quiet_end_hour: int,
+        stats: Optional[Any] = None,
     ) -> None:
         self.store = MailStore(store_path, limit=message_limit)
         self.clean_log = clean_log
@@ -73,12 +77,148 @@ class MailManager:
         self.notify_enabled = bool(notify_enabled)
         self.reminder_interval = max(60.0, float(reminder_interval_seconds))
         self.reminder_expiry = max(self.reminder_interval, float(reminder_expiry_seconds))
-        self.reminder_max_count = max(1, int(reminder_max_count))
+        reminder_count = int(reminder_max_count)
+        self.reminder_max_count = max(0, reminder_count)
+        self.reminders_enabled = bool(reminders_enabled) and self.reminder_max_count > 0
         self.include_self_notifications = bool(include_self_notifications)
         self.heartbeat_only = bool(heartbeat_only)
+        self.quiet_hours_enabled = bool(quiet_hours_enabled)
+        self.quiet_start_hour = int(quiet_start_hour) % 24
+        self.quiet_end_hour = int(quiet_end_hour) % 24
+        self.active_window_all_day = (not self.quiet_hours_enabled) or self.quiet_start_hour == self.quiet_end_hour
         self.events = deque()
+        self.stats = stats
+        self.reply_contexts: Dict[str, Dict[str, Any]] = {}
+        self._reply_lock = threading.Lock()
+        self.active_auto_notifications: Dict[str, Dict[str, Any]] = {}
+        self.last_engagement_prompt: Dict[str, float] = {}
 
     # Utility helpers -------------------------------------------------
+    def _local_datetime(self, ts: float) -> datetime:
+        try:
+            return datetime.fromtimestamp(ts)
+        except Exception:
+            return datetime.now()
+
+    def _within_active_window(self, ts: float) -> bool:
+        if self.active_window_all_day:
+            return True
+        dt = self._local_datetime(ts)
+        hour_fraction = dt.hour + dt.minute / 60.0
+        start = self.quiet_start_hour
+        end = self.quiet_end_hour
+        if start == end:
+            return True
+        if start < end:
+            return start <= hour_fraction < end
+        return hour_fraction >= start or hour_fraction < end
+
+    def _next_window_start(self, ts: float, include_today: bool = False) -> float:
+        if self.active_window_all_day:
+            return ts
+        reference = self._local_datetime(ts)
+        for days_ahead in range(0, 3):
+            candidate = reference + timedelta(days=days_ahead)
+            candidate = candidate.replace(
+                hour=self.quiet_start_hour,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            if not include_today and days_ahead == 0 and candidate < reference:
+                continue
+            if candidate < reference:
+                continue
+            candidate_ts = candidate.timestamp()
+            if self._within_active_window(candidate_ts):
+                return candidate_ts
+        fallback = (reference + timedelta(days=1)).replace(
+            hour=self.quiet_start_hour,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        return fallback.timestamp()
+
+    def _first_reminder_time(self, base_ts: float) -> Optional[float]:
+        if not self.reminders_enabled:
+            return None
+        base_dt = self._local_datetime(base_ts) + timedelta(days=1)
+        if self.active_window_all_day:
+            candidate = base_dt.replace(minute=0, second=0, microsecond=0)
+            return candidate.timestamp()
+        candidate = base_dt.replace(
+            hour=self.quiet_start_hour,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        candidate_ts = candidate.timestamp()
+        if self._within_active_window(candidate_ts):
+            return candidate_ts
+        return self._next_window_start(candidate_ts, include_today=True)
+
+    def _compute_next_reminder_time(self, after_ts: float) -> Optional[float]:
+        if not self.reminders_enabled:
+            return None
+        candidate = after_ts + self.reminder_interval
+        if self._within_active_window(candidate):
+            return candidate
+        return self._next_window_start(candidate)
+
+    def _seed_reminders(self, sub: Dict[str, Any], now: float) -> None:
+        if not self.reminders_enabled:
+            sub.pop('reminders', None)
+            return
+        next_ts = self._first_reminder_time(now)
+        if next_ts is None:
+            sub['reminders'] = {}
+            return
+        expiry_ts = now + self.reminder_expiry if self.reminder_expiry else None
+        sub['reminders'] = {
+            'base_ts': now,
+            'next_ts': next_ts,
+            'count': 0,
+            'last_sent_ts': None,
+            'expiry_ts': expiry_ts,
+        }
+        node_id = sub.get('node_id')
+        if node_id is not None:
+            sub['reminders']['node_id'] = node_id
+
+    def _clear_reminders(self, sub: Dict[str, Any]) -> None:
+        if 'reminders' in sub:
+            sub['reminders'] = {}
+
+    def cancel_all_for_sender(self, sender_key: Optional[str]) -> int:
+        """Clear pending notices and reminders for a subscriber across all mailboxes.
+        Returns the number of mailboxes touched.
+        """
+        if not sender_key:
+            return 0
+        touched = 0
+        with self.security_lock:
+            for key, entry in list(self.security.items()):
+                subscribers, _ = self._ensure_mailbox_state(entry)
+                sub = subscribers.get(sender_key)
+                if not isinstance(sub, dict):
+                    continue
+                changed = False
+                if sub.get('pending_notice'):
+                    sub['pending_notice'] = False
+                    changed = True
+                if 'reminders' in sub and sub['reminders']:
+                    sub['reminders'] = {}
+                    changed = True
+                if changed:
+                    touched += 1
+            if touched:
+                try:
+                    self._save_security()
+                except Exception:
+                    pass
+        return touched
+
     def _format_mail_timestamp(self, ts: str) -> str:
         try:
             normalized = ts
@@ -88,6 +228,27 @@ class MailManager:
             return dt.strftime(MAIL_TIME_DISPLAY)
         except Exception:
             return ts[:16]
+
+    def _parse_mail_timestamp(self, value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            text = value.strip()
+            if text.endswith('Z'):
+                text = text[:-1] + '+00:00'
+            dt = datetime.fromisoformat(text)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            return None
+
+    def _format_deletion_eta(self, timestamp: Optional[str]) -> str:
+        parsed = self._parse_mail_timestamp(timestamp)
+        if parsed is None:
+            parsed = datetime.now(timezone.utc)
+        deadline = parsed + timedelta(seconds=MAIL_RETENTION_SECONDS)
+        return self._format_mail_timestamp(deadline.isoformat())
 
     def _shorten_sender(self, sender: str, limit: int = 14) -> str:
         cleaned = (sender or "unknown").strip()
@@ -158,8 +319,98 @@ class MailManager:
         messages = entry.setdefault('messages', {})
         return subscribers, messages
 
+    def _ensure_subscriber_entry(
+        self,
+        entry: Dict[str, Any],
+        subscriber_key: str,
+        *,
+        node_id: Any = None,
+        short: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        subscribers, _ = self._ensure_mailbox_state(entry)
+        now = time.time()
+        sub = subscribers.setdefault(
+            subscriber_key,
+            {
+                'first_seen': now,
+                'last_check': 0.0,
+                'node_id': node_id,
+                'short': short or subscriber_key,
+                'unread': [],
+                'pending_notice': False,
+            },
+        )
+        if node_id is not None:
+            sub['node_id'] = node_id
+        if short:
+            sub['short'] = short
+        sub.setdefault('unread', [])
+        sub.setdefault('pending_notice', False)
+        sub.setdefault('last_check', now)
+        sub.setdefault('first_seen', now)
+        sub.setdefault('reminders', {})
+        return sub
+
     def _queue_event(self, event: Dict[str, Any]) -> None:
         self.events.append(event)
+
+    def _prune_reply_contexts(self) -> None:
+        cutoff = time.time() - 3600  # keep contexts for up to 1 hour
+        with self._reply_lock:
+            stale_keys = [key for key, ctx in self.reply_contexts.items() if ctx.get('captured', 0) < cutoff]
+            for key in stale_keys:
+                self.reply_contexts.pop(key, None)
+
+    def _store_reply_context(
+        self,
+        sender_key: Optional[str],
+        entries: List[Dict[str, Any]],
+    ) -> None:
+        if not sender_key:
+            return
+        self._prune_reply_contexts()
+        usable: List[Dict[str, Any]] = []
+        name_map: Dict[str, Dict[str, Any]] = {}
+        seen_nodes: Set[str] = set()
+        for entry in entries:
+            node_id = str(entry.get('sender_id') or "").strip()
+            if not node_id:
+                continue
+            short = str(entry.get('sender_short') or node_id).strip()
+            index = int(entry.get('index', 0))
+            if index <= 0:
+                continue
+            key = short.lower()
+            record = {
+                'index': index,
+                'short': short,
+                'node_id': node_id,
+                'mailbox': entry.get('mailbox'),
+                'message_id': entry.get('message_id'),
+            }
+            usable.append(record)
+            if node_id not in seen_nodes:
+                seen_nodes.add(node_id)
+                name_map[key] = record
+        if not usable:
+            with self._reply_lock:
+                self.reply_contexts.pop(sender_key, None)
+            return
+        usable.sort(key=lambda item: item['index'])
+        with self._reply_lock:
+            self.reply_contexts[sender_key] = {
+                'captured': time.time(),
+                'entries': usable,
+                'names': name_map,
+            }
+
+    def _lookup_reply_context(self, sender_key: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not sender_key:
+            return None
+        self._prune_reply_contexts()
+        with self._reply_lock:
+            ctx = self.reply_contexts.get(sender_key)
+            return dict(ctx) if ctx else None
 
     def _iso_to_timestamp(self, iso_ts: str) -> float:
         try:
@@ -176,12 +427,22 @@ class MailManager:
     def _set_mailbox_security(self, mailbox: str, owner: Optional[str], pin: Optional[str]) -> None:
         entry = self._get_security_entry(mailbox)
         with self.security_lock:
+            subscribers, _ = self._ensure_mailbox_state(entry)
             entry['owner'] = owner or entry.get('owner')
             if pin:
                 entry['pin_hash'] = self._hash_pin(pin)
+                for key, sub in subscribers.items():
+                    if not key or (owner and key == owner):
+                        continue
+                    sub['trusted'] = False
             else:
                 entry['pin_hash'] = None
+                for sub in subscribers.values():
+                    sub['trusted'] = True
             entry.setdefault('failures', {})
+            if owner:
+                owner_entry = self._ensure_subscriber_entry(entry, owner)
+                owner_entry['trusted'] = True
             self._save_security()
 
     def _record_failure(self, entry: Dict[str, Any], sender_key: str) -> int:
@@ -222,14 +483,42 @@ class MailManager:
         tokens = text.strip().split()
         pin_value: Optional[str] = None
         remainder: List[str] = []
+        expecting_pin = False
+        remainder_started = False
+
         for token in tokens:
-            lower = token.lower()
-            if lower.startswith("pin=") and pin_value is None:
-                pin_candidate = token[4:].strip().rstrip(',.;:')
-                if pin_candidate:
-                    pin_value = pin_candidate
+            cleaned = token.strip(',.;:')
+            lowered = cleaned.lower()
+            candidate: Optional[str] = None
+
+            if expecting_pin:
+                candidate = cleaned
+                expecting_pin = False
+            elif lowered == "pin":
+                expecting_pin = True
                 continue
+            elif lowered.startswith("pin="):
+                candidate = cleaned[4:]
+            elif lowered.startswith("pin") and not remainder_started:
+                candidate = cleaned[3:]
+            elif not remainder_started and cleaned.isdigit():
+                candidate = cleaned
+
+            if candidate and not pin_value:
+                candidate = candidate.strip()
+                if candidate.isdigit() and 4 <= len(candidate) <= 8:
+                    pin_value = candidate
+                    continue
+                if lowered.startswith("pin") and candidate:
+                    pin_value = candidate
+                    continue
+
             remainder.append(token)
+            remainder_started = True
+
+        if expecting_pin and pin_value is None:
+            remainder.append("PIN")
+
         return pin_value, " ".join(remainder).strip()
 
     def _authorise_mailbox(self, sender_key: str, mailbox: str, provided_pin: Optional[str]) -> Optional[PendingReply]:
@@ -245,12 +534,30 @@ class MailManager:
                 "/c command",
             )
 
+        with self.security_lock:
+            subscribers, _ = self._ensure_mailbox_state(entry)
+            sub = self._ensure_subscriber_entry(entry, sender_key)
+            trusted = bool(sub.get('trusted'))
+        if trusted:
+            self._reset_failures(entry, sender_key)
+            return None
+
         if provided_pin and self._verify_pin(entry, provided_pin):
+            with self.security_lock:
+                subscribers, _ = self._ensure_mailbox_state(entry)
+                sub = self._ensure_subscriber_entry(entry, sender_key)
+                sub['trusted'] = True
+                self._save_security()
             self._reset_failures(entry, sender_key)
             return None
 
         if self._is_blacklisted(entry, sender_key):
             if provided_pin and self._verify_pin(entry, provided_pin):
+                with self.security_lock:
+                    subscribers, _ = self._ensure_mailbox_state(entry)
+                    sub = self._ensure_subscriber_entry(entry, sender_key)
+                    sub['trusted'] = True
+                    self._save_security()
                 self._reset_failures(entry, sender_key)
                 return None
             return PendingReply(
@@ -260,7 +567,7 @@ class MailManager:
 
         if not provided_pin:
             return PendingReply(
-                f"🔐 Mailbox '{mailbox}' requires a PIN. Use `/c {mailbox} PIN=1234`.",
+                f"🔐 Mailbox '{mailbox}' requires a PIN. Add your PIN after the inbox name (example: `/c {mailbox} PIN`).",
                 "/c command",
             )
 
@@ -278,6 +585,11 @@ class MailManager:
                 )
             return PendingReply("❌ Incorrect PIN. Try again.", "/c command")
 
+        with self.security_lock:
+            subscribers, _ = self._ensure_mailbox_state(entry)
+            sub = self._ensure_subscriber_entry(entry, sender_key)
+            sub['trusted'] = True
+            self._save_security()
         self._reset_failures(entry, sender_key)
         return None
 
@@ -294,7 +606,6 @@ class MailManager:
         entry = self._get_security_entry(mailbox)
         now = time.time()
         needs_save = False
-        notifications: List[Dict[str, Any]] = []
         with self.security_lock:
             subscribers, messages = self._ensure_mailbox_state(entry)
             entry.setdefault('mailbox_name', mailbox)
@@ -316,41 +627,33 @@ class MailManager:
                 }
             )
             meta.setdefault('readers', {})
-            meta.setdefault('notified_sender', False)
             needs_save = True
+
+            owner_key = entry.get('owner')
+            if owner_key:
+                self._ensure_subscriber_entry(entry, owner_key)
 
             for sub_key, sub in subscribers.items():
                 if not sub_key:
                     continue
                 if not self.include_self_notifications and sub_key == sender_key:
                     continue
-                node_id = sub.get('node_id')
-                if node_id is None:
-                    continue
                 unread = sub.setdefault('unread', [])
                 if msg_id not in unread:
                     unread.append(msg_id)
                     needs_save = True
-                reminders = sub.setdefault('reminders', {})
-                if msg_id in reminders:
-                    reminders.pop(msg_id, None)
+                if sub.get('pending_notice') is not True:
+                    sub['pending_notice'] = True
                     needs_save = True
-                notifications.append({'node_id': node_id})
-
+                if self.reminders_enabled:
+                    self._seed_reminders(sub, now)
+                    needs_save = True
+                else:
+                    sub.pop('reminders', None)
+        
         if needs_save:
             self._save_security()
-
-        if not notifications:
-            return
-
-        snippet = textwrap.shorten(str(message.get('body', '') or ''), width=70, placeholder="…")
-        base_text = f"📬 New mail in '{mailbox}' from {sender_short}"
-        text = f"{base_text}: {snippet}" if snippet else base_text
-        for note in notifications:
-            node_id = note.get('node_id')
-            if node_id is None:
-                continue
-            self._queue_event({'type': 'dm', 'node_id': node_id, 'text': text})
+        # Notifications are delivered on the recipient's next heartbeat.
 
     def _record_mailbox_view(
         self,
@@ -364,64 +667,275 @@ class MailManager:
         entry = self._get_security_entry(mailbox)
         now = time.time()
         needs_save = False
-        sender_notifications: List[Dict[str, Any]] = []
         with self.security_lock:
             subscribers, messages = self._ensure_mailbox_state(entry)
             entry.setdefault('mailbox_name', mailbox)
-            sub = subscribers.setdefault(
-                sender_key,
-                {
-                    'first_seen': now,
-                    'last_check': now,
-                    'node_id': sender_id,
-                    'short': sender_short,
-                    'unread': [],
-                    'reminders': {},
-                },
-            )
+            sub = self._ensure_subscriber_entry(entry, sender_key, node_id=sender_id, short=sender_short)
             sub['last_check'] = now
-            sub['node_id'] = sender_id
-            sub['short'] = sender_short
             sub.setdefault('first_seen', now)
             unread = sub.setdefault('unread', [])
-            reminders = sub.setdefault('reminders', {})
 
             for msg_id, meta in list(messages.items()):
                 readers = meta.setdefault('readers', {})
                 if sender_key not in readers:
                     readers[sender_key] = now
-                    sender_key_meta = meta.get('sender_key')
-                    if sender_key_meta and sender_key_meta != sender_key and not meta.get('notified_sender'):
-                        node_id = meta.get('sender_node')
-                        if node_id is not None:
-                            reader_name = sender_short or sender_key
-                            text = (
-                                f"✅ {reader_name} read your message in '{mailbox}'. You won't receive more alerts about it."
-                            )
-                            sender_notifications.append({'node_id': node_id, 'text': text})
-                            meta['notified_sender'] = True
-                            needs_save = True
                 if msg_id in unread:
                     unread.remove(msg_id)
                     needs_save = True
-                if msg_id in reminders:
-                    reminders.pop(msg_id, None)
-                    needs_save = True
 
             sub['unread'] = [msg_id for msg_id in unread if msg_id in messages]
-            sub['reminders'] = reminders
+            if not sub['unread']:
+                if sub.get('pending_notice'):
+                    sub['pending_notice'] = False
+                    needs_save = True
+                if sub.get('reminders'):
+                    self._clear_reminders(sub)
+                    needs_save = True
 
         if needs_save:
             self._save_security()
 
-        for note in sender_notifications:
-            node_id = note.get('node_id')
-            text = note.get('text')
-            if node_id is None or not text:
+    def _mark_all_mailboxes_checked(
+        self,
+        sender_key: Optional[str],
+        sender_id: Any,
+        sender_short: str,
+        *,
+        exclude: Optional[str] = None,
+    ) -> None:
+        if not sender_key:
+            return
+        try:
+            mailbox_names = self.mailboxes_for_user(sender_key)
+        except Exception:
+            return
+        exclude_norm = self.store.normalize_mailbox(exclude) if exclude else None
+        for other in mailbox_names:
+            if exclude_norm and self.store.normalize_mailbox(other) == exclude_norm:
                 continue
-            self._queue_event({'type': 'dm', 'node_id': node_id, 'text': text})
+            try:
+                self._record_mailbox_view(other, sender_key, sender_id, sender_short)
+            except Exception:
+                continue
+
+    def _compose_engagement_message(self) -> str:
+        suggestions = [
+            "🎲 Need a break? Try `/games` for quick challenges.",
+            "🧠 Test your brain with `/trivia` whenever you're ready.",
+            "📖 Looking for inspiration? `/bible` shares a verse on demand.",
+            "😂 Want a laugh? `/jokes` has something light-hearted.",
+            "🌤️ Curious about the weather? `/weather` has the latest update.",
+            "📋 Curious about everything else? `/menu` shows the highlights.",
+        ]
+        random.shuffle(suggestions)
+        picked = suggestions[:3]
+        intro = "👍 Got your reply — mail alerts are paused for now."
+        return "\n".join([intro, *picked])
+
+    def user_engaged(
+        self,
+        sender_key: Optional[str],
+        node_id: Any = None,
+        *,
+        skip_prompt: bool = False,
+    ) -> Optional[str]:
+        if not sender_key:
+            return None
+        now = time.time()
+        cleared = False
+        with self.security_lock:
+            for entry in self.security.values():
+                subscribers = entry.get('subscribers') or {}
+                messages = entry.get('messages') or {}
+                sub = subscribers.get(sender_key)
+                if not sub:
+                    continue
+                unread = sub.get('unread') or []
+                if unread:
+                    filtered = [mid for mid in unread if mid in messages]
+                    if filtered != unread:
+                        sub['unread'] = filtered
+                        cleared = True
+                if sub.get('pending_notice'):
+                    sub['pending_notice'] = False
+                    cleared = True
+                if sub.get('reminders'):
+                    self._clear_reminders(sub)
+                    cleared = True
+                sub['last_check'] = now
+                if node_id is not None:
+                    sub['node_id'] = node_id
+            if cleared:
+                self._save_security()
+        had_auto = sender_key in self.active_auto_notifications
+        if had_auto:
+            self.active_auto_notifications.pop(sender_key, None)
+        if node_id is not None:
+            retains = deque()
+            while self.events:
+                event = self.events.popleft()
+                if event.get('node_id') == node_id or event.get('sender_key') == sender_key:
+                    continue
+                retains.append(event)
+            while retains:
+                self.events.appendleft(retains.pop())
+        should_prompt = (had_auto or cleared) and not skip_prompt and node_id is not None
+        if should_prompt:
+            last = self.last_engagement_prompt.get(sender_key, 0.0)
+            if now - last >= 60:
+                message = self._compose_engagement_message()
+                if message:
+                    self.last_engagement_prompt[sender_key] = now
+                    return message
+        return None
 
     # Public API ------------------------------------------------------
+    def mailboxes_for_user(self, sender_key: Optional[str]) -> List[str]:
+        if not sender_key:
+            return []
+        normalized_sender = str(sender_key).strip()
+        if not normalized_sender:
+            return []
+
+        results: List[str] = []
+        seen: Set[str] = set()
+        with self.security_lock:
+            for secure_key, entry in self.security.items():
+                if not isinstance(entry, dict):
+                    continue
+                mailbox_name = entry.get('mailbox_name') or secure_key
+                if not mailbox_name:
+                    continue
+                owner_key = entry.get('owner')
+                owner_normalized = str(owner_key).strip() if owner_key else ""
+                subscribers = entry.get('subscribers') or {}
+                subscriber_keys = {str(key).strip() for key in subscribers.keys() if key}
+                if normalized_sender != owner_normalized and normalized_sender not in subscriber_keys:
+                    continue
+                normalized_mailbox = self.store.normalize_mailbox(mailbox_name)
+                if normalized_mailbox in seen:
+                    continue
+                seen.add(normalized_mailbox)
+                results.append(mailbox_name)
+
+        results.sort(key=lambda name: name.lower())
+        return results
+
+    def handle_reply_intent(
+        self,
+        sender_key: Optional[str],
+        sender_id: Any,
+        sender_short: str,
+        text: str,
+    ) -> Optional[PendingReply]:
+        if not sender_key or not text:
+            return None
+        stripped = text.strip()
+        if not stripped:
+            return None
+        lower = stripped.lower()
+        if not lower.startswith('reply'):
+            return None
+
+        context = self._lookup_reply_context(sender_key)
+        if not context:
+            return PendingReply(
+                "No recent inbox senders to reply to. Run `/c <mailbox>` first, then try `reply <number> <message>`.",
+                "mail reply",
+                chunk_delay=2.0,
+            )
+
+        parts = stripped.split()
+        if len(parts) < 2:
+            return PendingReply(
+                "Usage: `reply <number> <message>` or `reply to <name> <message>`.",
+                "mail reply",
+            )
+
+        idx = 1
+        if parts[idx].lower() == 'to':
+            idx += 1
+            if idx >= len(parts):
+                return PendingReply(
+                    "Usage: `reply to <name> <message>`.",
+                    "mail reply",
+                )
+
+        target_token = parts[idx]
+        idx += 1
+        if idx >= len(parts):
+            return PendingReply(
+                "Reply needs a message. Example: `reply 1 Thank you!`.",
+                "mail reply",
+            )
+
+        message_text = " ".join(parts[idx:]).strip()
+        if not message_text:
+            return PendingReply(
+                "Reply needs a message. Example: `reply 1 Thank you!`.",
+                "mail reply",
+            )
+
+        entries = context.get('entries', [])
+        entry = None
+        if target_token.isdigit():
+            try:
+                desired = int(target_token)
+            except Exception:
+                desired = None
+            if desired is not None:
+                for item in entries:
+                    if item.get('index') == desired:
+                        entry = item
+                        break
+        if entry is None:
+            names = context.get('names', {})
+            lookup = target_token.lower()
+            entry = names.get(lookup)
+            if entry is None:
+                for key, item in names.items():
+                    if key.startswith(lookup):
+                        entry = item
+                        break
+        if not entry:
+            hints = ", ".join(f"{item.get('index')}: {item.get('short')}" for item in entries)
+            return PendingReply(
+                f"I couldn't match `{target_token}` to a recent sender. Options right now: {hints}.",
+                "mail reply",
+            )
+
+        node_id = entry.get('node_id')
+        if not node_id:
+            return PendingReply(
+                "I couldn't locate that user's radio ID. Ask them to send another message first.",
+                "mail reply",
+            )
+
+        mailbox_name = entry.get('mailbox') or "their inbox"
+        header = f"📬 Reply from {sender_short or sender_key} (via '{mailbox_name}')"
+        outbound = f"{header}\n{message_text}"
+        self._queue_event({
+            'type': 'dm',
+            'node_id': node_id,
+            'text': outbound,
+            'meta': {
+                'kind': 'mail-reply',
+                'from': sender_key,
+                'mailbox': mailbox_name,
+            },
+        })
+        ack_lines = [
+            f"📨 Sent your reply directly to {entry.get('short')}.",
+            "👍 Mail alerts are paused for now. Want more? Try `/games`, `/trivia`, or `/bible`.",
+        ]
+        self.user_engaged(sender_key, node_id=sender_id, skip_prompt=True)
+        self.clean_log(
+            f"Forwarded mailbox reply from {sender_short or sender_key} to {entry.get('short')} ({node_id})",
+            "📨",
+            show_always=False,
+        )
+        return PendingReply("\n".join(ack_lines), "mail reply", chunk_delay=2.0)
+
     def handle_send(
         self,
         *,
@@ -457,13 +971,14 @@ class MailManager:
             return PendingReply(prompt, "/m create")
 
         if not entry:
+            example = f"/mail {mailbox} your message here"
             return PendingReply(
-                f"Mailbox '{mailbox}' already exists. Include a message after the mailbox name to send mail.",
+                f"Mailbox '{mailbox}' already exists. Send mail by typing `{example}` with your own words.",
                 "/m command",
             )
 
         try:
-            count, _, stored_message = self.store.append(mailbox, entry, allow_create=False)
+            _count, _, stored_message = self.store.append(mailbox, entry, allow_create=False)
         except KeyError:
             self.pending_creation[sender_key] = {
                 "mailbox": mailbox,
@@ -479,15 +994,21 @@ class MailManager:
             return PendingReply("Failed to store message. Please try again.", "/m command")
 
         self.clean_log(f"Stored mail for '{mailbox}' from {sender_short}")
-        suffix = "" if count == 1 else "s"
         lines = [
-            f"Saved message to '{mailbox}'. Inbox now has {count} message{suffix}.",
+            f"Saved message to '{mailbox}'.",
             f"Use /c {mailbox} to check the latest messages.",
         ]
+        deletion_eta = self._format_deletion_eta(stored_message.get('timestamp'))
+        lines.append(f"🗑️ This message auto-deletes around {deletion_eta}.")
         try:
             self._record_message_append(mailbox, stored_message, sender_key, sender_id, sender_short)
         except Exception as exc:
             self.clean_log(f"Mail notification error: {exc}", "⚠️")
+        if self.stats:
+            try:
+                self.stats.record_mail_sent(mailbox)
+            except Exception:
+                pass
         return PendingReply("\n".join(lines), "/m command")
 
     def has_pending_creation(self, sender_key: str) -> bool:
@@ -658,7 +1179,33 @@ class MailManager:
         lines = [self._format_mail_line(idx, msg) for idx, msg in enumerate(ordered, start=1)]
         mailbox_label = ordered[0].get("mailbox") or mailbox
         header = f"📥 Inbox '{mailbox_label}' (newest first, showing {len(ordered)} messages)"
-        response_text = "\n".join([header] + lines)
+        response_sections = [header] + lines
+        reply_entries: List[Dict[str, Any]] = []
+        for idx, msg in enumerate(ordered, start=1):
+            reply_entries.append(
+                {
+                    'index': idx,
+                    'sender_id': msg.get('sender_id'),
+                    'sender_short': msg.get('sender_short') or msg.get('sender_id'),
+                    'message_id': msg.get('id'),
+                    'mailbox': mailbox_label,
+                }
+            )
+        self._store_reply_context(sender_key, reply_entries)
+        if reply_entries:
+            response_sections.append(
+                ""
+            )
+            response_sections.append(
+                "Reply with `reply <number> <message>` or `reply to <name> <message>` to DM the sender directly."
+            )
+        response_sections.append(
+            "Checking any inbox pauses all mail alerts until a new message arrives."
+        )
+        response_text = "\n".join(response_sections)
+        if sender_key:
+            self._mark_all_mailboxes_checked(sender_key, sender_id, sender_short, exclude=mailbox)
+            self.user_engaged(sender_key, node_id=sender_id, skip_prompt=True)
         self.clean_log(f"Mailbox '{mailbox}' checked")
         return PendingReply(
             response_text,
@@ -672,57 +1219,144 @@ class MailManager:
         if not self.notify_enabled or not sender_key:
             return
         now = time.time()
-        notifications: List[Dict[str, Any]] = []
+        aggregated: List[Tuple[str, int]] = []
+        reminder_actions: List[Dict[str, Any]] = []
+        pending_notice_subs: List[Dict[str, Any]] = []
         needs_save = False
+        node_id_candidate = sender_id
         with self.security_lock:
             for mailbox_key, entry in self.security.items():
                 subscribers = entry.get('subscribers')
-                if not subscribers or sender_key not in subscribers:
+                if not subscribers:
                     continue
-                sub = subscribers[sender_key]
+                sub = subscribers.get(sender_key)
+                if not sub:
+                    continue
                 sub['last_heartbeat'] = now
-                unread_ids = [mid for mid in sub.get('unread', []) if mid in entry.get('messages', {})]
-                if not unread_ids:
-                    continue
-                node_id = sub.get('node_id')
-                if node_id is None:
-                    continue
-                reminders = sub.setdefault('reminders', {})
-                messages = entry.get('messages', {})
-                for msg_id in unread_ids:
-                    meta = messages.get(msg_id)
-                    if not meta:
-                        continue
-                    if not self.include_self_notifications and sender_key == meta.get('sender_key'):
-                        continue
-                    msg_time = self._iso_to_timestamp(meta.get('timestamp', now))
-                    if now - msg_time > self.reminder_expiry:
-                        continue
-                    info = reminders.setdefault(msg_id, {'last': 0.0, 'count': 0})
-                    if info.get('count', 0) >= self.reminder_max_count:
-                        continue
-                    if now - info.get('last', 0.0) < self.reminder_interval:
-                        continue
-                    if not allow_send:
-                        continue
-                    info['last'] = now
-                    info['count'] = info.get('count', 0) + 1
+                if sender_id is not None and sub.get('node_id') != sender_id:
+                    sub['node_id'] = sender_id
                     needs_save = True
-                    mailbox_name = entry.get('mailbox_name', mailbox_key)
-                    notifications.append(
-                        {
-                            'node_id': node_id,
-                            'text': f"⏰ Inbox '{mailbox_name}' still has unread mail. Reply `/c {mailbox_name}` to check.",
-                        }
-                    )
+                messages = entry.get('messages') or {}
+                unread_ids = [mid for mid in sub.get('unread', []) if mid in messages]
+                sub['unread'] = unread_ids
+                if not unread_ids:
+                    if sub.get('pending_notice'):
+                        sub['pending_notice'] = False
+                        needs_save = True
+                    if sub.get('reminders'):
+                        self._clear_reminders(sub)
+                        needs_save = True
+                    continue
+                mailbox_name = entry.get('mailbox_name', mailbox_key)
+                aggregated.append((mailbox_name, len(unread_ids)))
+                if node_id_candidate is None:
+                    node_id_candidate = sub.get('node_id')
+                if sub.get('pending_notice'):
+                    pending_notice_subs.append(sub)
+                if self.reminders_enabled and self.reminder_max_count > 0:
+                    reminders = sub.get('reminders')
+                    if not isinstance(reminders, dict) or not reminders:
+                        self._seed_reminders(sub, now)
+                        reminders = sub.get('reminders')
+                        needs_save = True
+                    if isinstance(reminders, dict) and reminders:
+                        count_sent = int(reminders.get('count', 0))
+                        next_ts = reminders.get('next_ts')
+                        expiry_ts = reminders.get('expiry_ts')
+                        if next_ts is not None and count_sent < self.reminder_max_count:
+                            if expiry_ts is None or now <= expiry_ts:
+                                if now >= next_ts and self._within_active_window(now):
+                                    reminder_actions.append(
+                                        {
+                                            'reminders': reminders,
+                                            'sub': sub,
+                                            'mailbox': mailbox_name,
+                                            'next_count': count_sent + 1,
+                                        }
+                                    )
+                            else:
+                                reminders['next_ts'] = None
+                                needs_save = True
+        if not aggregated:
+            if sender_key in self.active_auto_notifications:
+                self.active_auto_notifications.pop(sender_key, None)
+            if needs_save:
+                self._save_security()
+            return
+
+        if not allow_send:
+            if needs_save:
+                self._save_security()
+            return
+
+        if node_id_candidate is None:
+            if needs_save:
+                self._save_security()
+            return
+
+        should_send = bool(pending_notice_subs or reminder_actions)
+        if not should_send:
+            if needs_save:
+                self._save_security()
+            return
+
+        reminder_max_index = 0
+        for sub in pending_notice_subs:
+            sub['pending_notice'] = False
+            sub['node_id'] = node_id_candidate
+            needs_save = True
+        for action in reminder_actions:
+            reminders = action['reminders']
+            sub = action['sub']
+            next_count = action['next_count']
+            reminders['count'] = next_count
+            reminders['last_sent_ts'] = now
+            reminders['node_id'] = node_id_candidate
+            sub['node_id'] = node_id_candidate
+            if next_count >= self.reminder_max_count:
+                reminders['next_ts'] = None
+            else:
+                reminders['next_ts'] = self._compute_next_reminder_time(now)
+            reminder_max_index = max(reminder_max_index, next_count)
+            needs_save = True
+
         if needs_save:
             self._save_security()
-        for notice in notifications:
-            node_id = notice.get('node_id')
-            text = notice.get('text')
-            if node_id is None or not text:
-                continue
-            self._queue_event({'type': 'dm', 'node_id': node_id, 'text': text})
+
+        capped = aggregated[:6]
+        summary = ", ".join(f"{name} ({count})" for name, count in capped)
+        if len(aggregated) > len(capped):
+            summary += ", …"
+        example_mailbox = aggregated[0][0]
+        text_lines = [
+            f"📬 Unread mail waiting: {summary}.",
+            f"Reply `/c <mailbox>` (try `/c {example_mailbox}`) to read — checking any inbox pauses alerts until new mail arrives.",
+        ]
+        if reminder_max_index:
+            text_lines.append(f"⏰ Reminder {reminder_max_index}/{self.reminder_max_count}.")
+        message_text = "\n".join(text_lines)
+        self._queue_event(
+            {
+                'type': 'dm',
+                'node_id': node_id_candidate,
+                'text': message_text,
+                'sender_key': sender_key,
+                'meta': {'kind': 'mail-alert'},
+            }
+        )
+        try:
+            self.clean_log(
+                f"Mailbox alert for {sender_key}: {summary}",
+                "📬",
+                show_always=False,
+            )
+        except Exception:
+            pass
+        self.active_auto_notifications[sender_key] = {
+            'timestamp': now,
+            'counts': aggregated,
+            'node_id': node_id_candidate,
+        }
 
     def flush_notifications(self, interface, send_fn, can_send: bool = True) -> None:
         if not self.events:
@@ -764,10 +1398,9 @@ class MailManager:
             if entry:
                 stored_entry = entry
                 entry.setdefault("mailbox", mailbox)
-                count, created, stored_entry = self.store.append(mailbox, entry, allow_create=True)
+                _, created, stored_entry = self.store.append(mailbox, entry, allow_create=True)
             else:
                 created = self.store.create_mailbox(mailbox)
-                count = self.store.mailbox_count(mailbox)
         except Exception as exc:
             self.clean_log(f"Mail store write failed while creating '{mailbox}': {exc}")
             self.pending_creation.pop(sender_key, None)
@@ -775,18 +1408,39 @@ class MailManager:
 
         if created:
             self.clean_log(f"New mailbox '{mailbox}' created by {sender_short}", "🗂️")
+            if self.stats:
+                try:
+                    self.stats.record_mailbox_created(mailbox)
+                except Exception:
+                    pass
         if entry:
             self.clean_log(f"Stored mail for '{mailbox}' from {sender_short}", "✉️")
 
         self._set_mailbox_security(mailbox, sender_key, pin)
+        try:
+            security_entry = self._get_security_entry(mailbox)
+            owner_key = security_entry.get('owner')
+            if owner_key:
+                with self.security_lock:
+                    self._ensure_subscriber_entry(
+                        security_entry,
+                        owner_key,
+                        node_id=state.get('sender_id'),
+                        short=sender_short,
+                    )
+                    security_entry.setdefault('mailbox_name', mailbox)
+                    self._save_security()
+        except Exception:
+            pass
         self.pending_creation.pop(sender_key, None)
 
-        suffix = "" if count == 1 else "s"
         lines = [f"🎉 Mailbox '{mailbox}' ready."]
         if pin:
             lines.append("🔐 PIN set. Share it carefully!")
         if entry:
-            lines.append(f"✉️ Message saved—now {count} message{suffix} inside.")
+            lines.append("✉️ Message saved—recipients will be notified.")
+            deletion_eta = self._format_deletion_eta(stored_entry.get('timestamp') if stored_entry else None)
+            lines.append(f"🗑️ Auto-deletes around {deletion_eta}.")
             try:
                 self._record_message_append(mailbox, stored_entry, sender_key, state.get('sender_id'), sender_short)
             except Exception as exc:
@@ -799,13 +1453,56 @@ class MailManager:
         lines.append("📸 Screenshot this so you don't lose it.")
         return PendingReply("\n".join(lines), "/m command")
 
-    def handle_wipe(self, mailbox: str) -> PendingReply:
+    def handle_wipe(
+        self,
+        mailbox: str,
+        *,
+        actor_key: Optional[str] = None,
+        is_admin: bool = False,
+    ) -> PendingReply:
         if not mailbox:
             return PendingReply("Mailbox name cannot be empty.", "/wipe command")
         existed = self.store.mailbox_exists(mailbox)
         if not existed:
             fun_reply = random.choice(MISSING_MAILBOX_RESPONSES).format(mailbox=mailbox)
             return PendingReply(fun_reply, "/wipe command")
+
+        normalized_actor = (actor_key or "").strip()
+        if not is_admin:
+            if not normalized_actor:
+                self.clean_log(
+                    f"Mailbox wipe denied for '{mailbox}' — missing actor key",
+                    "⛔",
+                )
+                return PendingReply(
+                    "⛔ I couldn't verify you're the mailbox owner. Try again from the same device or ask an admin to help.",
+                    "/wipe command",
+                )
+            owner_key = ""
+            with self.security_lock:
+                entry = self.security.get(self._security_key(mailbox))
+                if entry:
+                    owner_key = str(entry.get('owner') or "").strip()
+            if owner_key:
+                if normalized_actor != owner_key:
+                    self.clean_log(
+                        f"Mailbox wipe denied for '{mailbox}' — {normalized_actor} is not owner ({owner_key})",
+                        "⛔",
+                    )
+                    return PendingReply(
+                        "⛔ Only the mailbox owner can wipe this inbox.",
+                        "/wipe command",
+                    )
+            else:
+                self.clean_log(
+                    f"Mailbox wipe denied for '{mailbox}' — no owner recorded",
+                    "⛔",
+                )
+                return PendingReply(
+                    "⛔ This inbox doesn't have an owner on file. Ask an admin to help clear it if needed.",
+                    "/wipe command",
+                )
+
         try:
             cleared = self.store.clear_mailbox(mailbox)
         except Exception as exc:
@@ -822,6 +1519,7 @@ class MailManager:
                     for sub in subscribers.values():
                         sub['unread'] = []
                         sub['reminders'] = {}
+                        sub['pending_notice'] = False
                     self._save_security()
             return PendingReply(f"🧹 Mailbox '{mailbox}' is now empty.", "/wipe command")
         fun_reply = random.choice(MISSING_MAILBOX_RESPONSES).format(mailbox=mailbox)

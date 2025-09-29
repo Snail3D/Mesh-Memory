@@ -1,0 +1,53 @@
+{
+  "happye": {
+    "pin_hash": null,
+    "owner": null,
+    "created": 1759091635.9833455,
+    "failures": {},
+    "subscribers": {},
+    "messages": {
+      "daff1514-fbfa-41d3-9261-caf54061e555": {
+        "id": "daff1514-fbfa-41d3-9261-caf54061e555",
+        "mailbox": "happye",
+        "sender_key": "!376be684",
+        "sender_node": "!376be684",
+        "sender_short": "SnMo",
+        "timestamp": "2025-09-28T20:33:55.976364+00:00",
+        "body": "hey there camper rise and shine",
+        "readers": {}
+      }
+    },
+    "mailbox_name": "happye"
+  },
+  "happy": {
+    "pin_hash": "675fa5692e307231f466088b86e84624c4e4a52ae49ec1ee320e878121450b2e",
+    "owner": "!376be684",
+    "created": 1759103875.754297,
+    "failures": {},
+    "subscribers": {
+      "!376be684": {
+        "first_seen": 1759103875.7552705,
+        "last_check": 1759104055.0008636,
+        "node_id": "!376be684",
+        "short": "SnMo",
+        "unread": [],
+        "pending_notice": false,
+        "last_heartbeat": 1759111768.5040038,
+        "trusted": true
+      }
+    },
+    "messages": {
+      "93fa9e14-8cc3-42a2-bd27-aa6701291d2a": {
+        "id": "93fa9e14-8cc3-42a2-bd27-aa6701291d2a",
+        "mailbox": "happy",
+        "sender_key": "!376be684",
+        "sender_node": "!376be684",
+        "sender_short": "SnMo",
+        "timestamp": "2025-09-29T00:01:15.300936+00:00",
+        "body": "how’s it going?",
+        "readers": {}
+      }
+    },
+    "mailbox_name": "happy"
+  }
+}

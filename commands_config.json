@@ -3,10 +3,6 @@
     {
       "command": "/ping",
       "response": "Pong!"
-    },
-	{
-	  "command": "/funfact",
-      "ai_prompt": "Give me a fun fact about {user_input}"
     }
   ]
 }

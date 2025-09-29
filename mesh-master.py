@@ -2,6 +2,8 @@ import meshtastic
 import meshtastic.serial_interface
 from meshtastic import BROADCAST_ADDR
 from meshtastic import portnums_pb2
+from meshtastic.protobuf import config_pb2 as meshtastic_config_pb2, channel_pb2 as meshtastic_channel_pb2
+import meshtastic.util as meshtastic_util
 from pubsub import pub
 import json
 import calendar
@@ -14,7 +16,8 @@ from datetime import datetime, timedelta, timezone  # Added timezone import
 import threading
 import os
 import logging
-from collections import deque, Counter
+import string
+from collections import deque, Counter, defaultdict, OrderedDict
 from pathlib import Path
 import traceback
 from flask import Flask, request, jsonify, redirect, url_for, stream_with_context, Response
@@ -26,15 +29,38 @@ import subprocess
 import math
 import textwrap
 import uuid
-from typing import Optional, Set, Dict, Any, List, Tuple, Union
+from typing import Optional, Set, Dict, Any, List, Tuple, Union, Sequence
 from dataclasses import dataclass, field
+# Optional system metrics libraries
+try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    psutil = None
+
+try:
+    import pynvml  # type: ignore
+    try:
+        pynvml.nvmlInit()
+    except Exception:
+        pynvml = None
+except Exception:  # pragma: no cover - optional dependency
+    pynvml = None
+
 from meshtastic_facts import MESHTASTIC_ALERT_FACTS
 from unidecode import unidecode   # Added unidecode import for Ollama text normalization
 from google.protobuf.message import DecodeError
 import queue  # For async message processing
 import itertools
 import atexit
-from mesh_master import GameManager, MailManager, PendingReply, OfflineWikiStore
+from mesh_master import (
+    GameManager,
+    MailManager,
+    OnboardingManager,
+    PendingReply,
+    OfflineWikiStore,
+)
+from mesh_master.alarm_timer_manager import AlarmTimerManager
+from mesh_master.command_utils import promote_bare_command
 # Make sure DEBUG_ENABLED exists before any logger/filter classes use it
 # -----------------------------
 # Global Debug & Noise Patterns
@@ -75,6 +101,7 @@ for lg in (root_log, meshtastic_log):
 # Custom exception for fatal serial exclusive-lock scenarios
 class ExclusiveLockError(Exception):
     pass
+
 
 def dprint(*args, **kwargs):
     if DEBUG_ENABLED:
@@ -164,6 +191,752 @@ _NODE_ID_PATTERN = re.compile(r"!(?:[0-9a-f]{8})", re.IGNORECASE)
 _CHANNEL_ID_PATTERN = re.compile(r"ch=(\d+)", re.IGNORECASE)
 
 
+def _is_heartbeat_text(message: Optional[str]) -> bool:
+    """Return True if the provided message appears to be a heartbeat ping."""
+
+    if not isinstance(message, str):
+        return False
+    text = message.strip()
+    if not text:
+        return False
+    if text.startswith('💓'):
+        return True
+    lowered = text.lower()
+    if lowered.startswith('hb conn=') or 'hb conn=' in lowered:
+        return True
+    if lowered in {'hb', 'heartbeat', 'heartbeat ping', 'heartbeat check'}:
+        return True
+    if lowered.startswith('hb ') and len(text) <= 40:
+        return True
+    if lowered.startswith('heartbeat ') and len(text) <= 40:
+        return True
+    return False
+
+
+NODE_HEARTBEAT_LAST: Dict[str, float] = {}
+
+
+class StatsManager:
+    """Tracks rolling operational metrics for the dashboard."""
+
+    WINDOW_SECONDS = 24 * 60 * 60
+    RECENT_RESPONSE_SAMPLE = 5
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.ai_requests: deque[tuple[float, int]] = deque()
+        self.ai_responses: deque[tuple[float, float]] = deque()
+        self.mail_sends: deque[tuple[float, str]] = deque()
+        self.mailbox_creations: deque[tuple[float, str]] = deque()
+        self.game_events: deque[tuple[float, str]] = deque()
+        self.user_events: deque[tuple[float, str]] = deque()
+        self.new_onboards: deque[tuple[float, str]] = deque()
+        self.message_totals: Dict[str, int] = {
+            'total': 0,
+            'channel': 0,
+            'direct': 0,
+            'ai': 0,
+        }
+        # ACK telemetry (timestamp, attempt, success(bool), route('dm'|'ch'))
+        self.ack_events: deque[tuple[float, int, bool, str]] = deque()
+
+    def _prune(self, dq: deque, now: float) -> None:
+        window = self.WINDOW_SECONDS * 2
+        while dq and now - dq[0][0] > window:
+            dq.popleft()
+
+    def record_ai_request(self) -> None:
+        now = time.time()
+        with self.lock:
+            self.ai_requests.append((now, 1))
+            self._prune(self.ai_requests, now)
+
+    def record_ai_response(self, duration_seconds: float) -> None:
+        now = time.time()
+        with self.lock:
+            self.ai_responses.append((now, float(max(0.0, duration_seconds))))
+            self._prune(self.ai_responses, now)
+
+    def record_mail_sent(self, mailbox: str) -> None:
+        now = time.time()
+        with self.lock:
+            self.mail_sends.append((now, mailbox))
+            self._prune(self.mail_sends, now)
+
+    def record_mailbox_created(self, mailbox: str) -> None:
+        now = time.time()
+        with self.lock:
+            self.mailbox_creations.append((now, mailbox))
+            self._prune(self.mailbox_creations, now)
+
+    def record_ack_event(self, *, is_direct: bool, attempt: int, success: bool) -> None:
+        if not RESEND_TELEMETRY_ENABLED:
+            return
+        now = time.time()
+        route = 'dm' if is_direct else 'ch'
+        with self.lock:
+            self.ack_events.append((now, int(max(1, attempt)), bool(success), route))
+            self._prune(self.ack_events, now)
+
+    def record_game(self, game_type: str) -> None:
+        now = time.time()
+        with self.lock:
+            self.game_events.append((now, game_type))
+            self._prune(self.game_events, now)
+
+    def record_user_interaction(self, sender_key: Optional[str]) -> None:
+        if not sender_key:
+            return
+        now = time.time()
+        with self.lock:
+            self.user_events.append((now, sender_key))
+            self._prune(self.user_events, now)
+
+    def record_new_onboard(self, sender_key: Optional[str]) -> None:
+        if not sender_key:
+            return
+        now = time.time()
+        with self.lock:
+            self.new_onboards.append((now, sender_key))
+            self._prune(self.new_onboards, now)
+
+    def record_message(self, *, direct: bool, is_ai: bool) -> None:
+        direct_flag = bool(direct)
+        with self.lock:
+            self.message_totals['total'] += 1
+            if direct_flag:
+                self.message_totals['direct'] += 1
+            else:
+                self.message_totals['channel'] += 1
+            if is_ai:
+                self.message_totals['ai'] += 1
+
+    def snapshot(self) -> Dict[str, Any]:
+        now = time.time()
+        with self.lock:
+            for dq in (
+                self.ai_requests,
+                self.ai_responses,
+                self.mail_sends,
+                self.mailbox_creations,
+                self.game_events,
+                self.user_events,
+                self.new_onboards,
+            ):
+                self._prune(dq, now)
+
+            window = self.WINDOW_SECONDS
+            start_current = now - window
+            start_previous = now - (2 * window)
+
+            def _count_in_window(dq: deque, start: float, end: float | None = None) -> int:
+                if end is None:
+                    return sum(1 for ts, _ in dq if ts >= start)
+                return sum(1 for ts, _ in dq if start <= ts < end)
+
+            ai_requests_curr = _count_in_window(self.ai_requests, start_current)
+            ai_processed = _count_in_window(self.ai_responses, start_current)
+            durations_ms = [duration * 1000.0 for ts, duration in self.ai_responses if ts >= start_current]
+            avg_ms = sum(durations_ms) / len(durations_ms) if durations_ms else None
+            recent = durations_ms[-self.RECENT_RESPONSE_SAMPLE :]
+            avg_recent_ms = sum(recent) / len(recent) if recent else None
+
+            ai_requests_prev = _count_in_window(self.ai_requests, start_previous, start_current)
+            ai_responses_prev = _count_in_window(self.ai_responses, start_previous, start_current)
+            mail_curr = _count_in_window(self.mail_sends, start_current)
+            mail_prev = _count_in_window(self.mail_sends, start_previous, start_current)
+            mailbox_curr = _count_in_window(self.mailbox_creations, start_current)
+            mailbox_prev = _count_in_window(self.mailbox_creations, start_previous, start_current)
+            games_curr = _count_in_window(self.game_events, start_current)
+            games_prev = _count_in_window(self.game_events, start_previous, start_current)
+
+            user_counts = Counter(sender for ts, sender in self.user_events if ts >= start_current)
+            user_set = set(user_counts.keys())
+            prev_user_set = {sender for ts, sender in self.user_events if start_previous <= ts < start_current}
+            onboard_set = {sender for ts, sender in self.new_onboards if ts >= start_current}
+            prev_onboard_set = {sender for ts, sender in self.new_onboards if start_previous <= ts < start_current}
+
+            recent_onboards: List[Tuple[str, float]] = []
+            seen_recent: Set[str] = set()
+            for ts, sender in reversed(self.new_onboards):
+                if ts < start_current:
+                    break
+                if not sender or sender in seen_recent:
+                    continue
+                seen_recent.add(sender)
+                recent_onboards.append((sender, ts))
+            recent_onboards.sort(key=lambda item: item[1], reverse=True)
+
+            game_breakdown = Counter(kind for ts, kind in self.game_events if ts >= start_current)
+
+            snapshot = {
+                'ai_requests_24h': ai_requests_curr,
+                'ai_processed_24h': ai_processed,
+                'ai_avg_response_ms': avg_ms,
+                'ai_avg_recent_ms': avg_recent_ms,
+                'mail_sent_24h': mail_curr,
+                'mailboxes_created_24h': mailbox_curr,
+                'games_24h': games_curr,
+                'games_breakdown': dict(game_breakdown),
+                'active_users_24h': len(user_set),
+                'new_onboards_24h': len(onboard_set),
+                'top_users_24h': user_counts.most_common(5),
+                'message_totals': dict(self.message_totals),
+                'recent_onboards': [
+                    {'sender_key': sender, 'timestamp': ts}
+                    for sender, ts in recent_onboards
+                ],
+                'previous': {
+                    'ai_requests_24h': ai_requests_prev,
+                    'ai_processed_24h': ai_responses_prev,
+                    'mail_sent_24h': mail_prev,
+                    'mailboxes_created_24h': mailbox_prev,
+                    'games_24h': games_prev,
+                    'active_users_24h': len(prev_user_set),
+                    'new_onboards_24h': len(prev_onboard_set),
+                },
+            }
+        return snapshot
+
+
+STATS = StatsManager()
+
+
+def _collect_system_metrics() -> Dict[str, Any]:
+    """Gather lightweight CPU/GPU/memory stats for the dashboard."""
+    metrics: Dict[str, Any] = {
+        'cpu_percent': None,
+        'memory_percent': None,
+        'gpu_percent': None,
+    }
+
+    def classify(value: Optional[float]) -> str:
+        if value is None:
+            return 'grey'
+        if value < 50.0:
+            return 'green'
+        if value < 75.0:
+            return 'yellow'
+        return 'red'
+
+    if psutil is not None:
+        try:
+            metrics['cpu_percent'] = float(psutil.cpu_percent(interval=None))
+        except Exception:
+            metrics['cpu_percent'] = None
+        try:
+            metrics['memory_percent'] = float(psutil.virtual_memory().percent)
+        except Exception:
+            metrics['memory_percent'] = None
+
+    if pynvml is not None:
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+            metrics['gpu_percent'] = float(util.gpu)
+        except Exception:
+            metrics['gpu_percent'] = None
+
+    metrics['cpu_state'] = classify(metrics['cpu_percent'])
+    metrics['memory_state'] = classify(metrics['memory_percent'])
+    metrics['gpu_state'] = classify(metrics['gpu_percent'])
+    return metrics
+
+
+def _collect_message_activity() -> Dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    window = timedelta(seconds=StatsManager.WINDOW_SECONDS)
+    current_start = now - window
+    previous_start = now - (2 * window)
+    hour_window = timedelta(hours=1)
+    hour_start = now - hour_window
+    prev_hour_start = now - (2 * hour_window)
+
+    current = {
+        'total': 0,
+        'channel': 0,
+        'direct': 0,
+        'ai': 0,
+        'hour': 0,
+    }
+    previous = {
+        'total': 0,
+        'channel': 0,
+        'direct': 0,
+        'ai': 0,
+        'hour': 0,
+    }
+
+    with messages_lock:
+        for entry in messages:
+            if _is_heartbeat_text(entry.get('message')):
+                continue
+            ts = _parse_message_timestamp(entry.get('timestamp'))
+            if ts is None:
+                continue
+            target = None
+            if ts >= current_start:
+                target = current
+                if ts >= hour_start:
+                    target['hour'] += 1
+            elif ts >= previous_start:
+                target = previous
+                if prev_hour_start <= ts < hour_start:
+                    previous['hour'] += 1
+            if target is None:
+                continue
+            target['total'] += 1
+            if entry.get('direct'):
+                target['direct'] += 1
+            else:
+                target['channel'] += 1
+            if entry.get('is_ai'):
+                target['ai'] += 1
+
+    return {
+        'current': current,
+        'previous': previous,
+    }
+
+
+def _collect_node_activity() -> Dict[str, Any]:
+    now_ts = _now()
+    window = StatsManager.WINDOW_SECONDS
+    recent: List[Tuple[str, float]] = []
+    previous: List[Tuple[str, float]] = []
+
+    stale_keys: List[str] = []
+    for sender_key, ts in NODE_HEARTBEAT_LAST.items():
+        if not sender_key or ts is None:
+            continue
+        age = now_ts - ts
+        if age <= window:
+            recent.append((sender_key, ts))
+        elif age <= 2 * window:
+            previous.append((sender_key, ts))
+        else:
+            stale_keys.append(sender_key)
+
+    for key in stale_keys:
+        NODE_HEARTBEAT_LAST.pop(key, None)
+
+    recent.sort(key=lambda item: item[1], reverse=True)
+
+    new_nodes = sum(1 for ts in NODE_FIRST_SEEN.values() if now_ts - ts <= window)
+    prev_new_nodes = sum(1 for ts in NODE_FIRST_SEEN.values() if window < now_ts - ts <= 2 * window)
+    return {
+        'recent': recent,
+        'recent_count': len(recent),
+        'previous_count': len(previous),
+        'new_24h': new_nodes,
+        'prev_new_24h': prev_new_nodes,
+    }
+
+
+LAST_METRICS_SNAPSHOT: Optional[Dict[str, Any]] = None
+
+
+def _calculate_network_usage_percent(window_seconds: int = StatsManager.WINDOW_SECONDS) -> Optional[float]:
+    if window_seconds <= 0:
+        return None
+    if NETWORK_CAPACITY_PER_HOUR <= 0:
+        return None
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=window_seconds)
+    with messages_lock:
+        recent_messages = 0
+        for entry in messages:
+            ts = _parse_message_timestamp(entry.get('timestamp'))
+            if ts is None or ts < cutoff:
+                continue
+            recent_messages += 1
+    capacity = NETWORK_CAPACITY_PER_HOUR * (window_seconds / 3600.0)
+    if capacity <= 0:
+        return None
+    usage = min(100.0, (recent_messages / capacity) * 100.0) if capacity else 0.0
+    return round(usage, 1)
+
+
+def _format_meshinfo_report(language: Optional[str]) -> str:
+    """Summarize recent mesh activity for the last rolling hour."""
+
+    lang = language or LANGUAGE_FALLBACK
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=1)
+    prev_cutoff = cutoff - timedelta(hours=1)
+
+    with messages_lock:
+        message_snapshot = list(messages)
+
+    current_counts: Counter[str] = Counter()
+    prev_counts: Counter[str] = Counter()
+    label_cache: Dict[str, str] = {}
+
+    def _label(key: str) -> str:
+        if key not in label_cache:
+            label_cache[key] = _display_sender_label(key)
+        return label_cache[key]
+
+    for entry in message_snapshot:
+        if entry.get('is_ai'):
+            continue
+        ts = _parse_message_timestamp(entry.get('timestamp'))
+        if ts is None:
+            continue
+        node_raw = entry.get('node_id')
+        if node_raw is None:
+            continue
+        node_key = _safe_sender_key(node_raw) or str(node_raw)
+        timestamp = ts
+        if timestamp >= cutoff:
+            current_counts[node_key] += 1
+            _label(node_key)
+        elif prev_cutoff <= timestamp < cutoff:
+            prev_counts[node_key] += 1
+            _label(node_key)
+
+    current_nodes = set(current_counts.keys())
+    prev_nodes = set(prev_counts.keys())
+
+    cutoff_epoch = cutoff.timestamp()
+    new_node_ids = [key for key, first_seen in NODE_FIRST_SEEN.items() if first_seen >= cutoff_epoch]
+    new_node_ids.sort()
+    new_node_labels = [_label(node_id) for node_id in new_node_ids]
+
+    left_node_ids = sorted(prev_nodes - current_nodes)
+    left_node_labels = [_label(node_id) for node_id in left_node_ids]
+
+    top_nodes = current_counts.most_common(3)
+
+    lines: List[str] = [
+        translate(lang, 'meshinfo_header', "Mesh network summary (last hour)"),
+    ]
+
+    if new_node_labels:
+        lines.append(
+            translate(
+                lang,
+                'meshinfo_new_nodes_some',
+                "New nodes: {count} ({list})",
+                count=len(new_node_labels),
+                list=", ".join(new_node_labels),
+            )
+        )
+    else:
+        lines.append(translate(lang, 'meshinfo_new_nodes_none', "New nodes: none"))
+
+    if left_node_labels:
+        lines.append(
+            translate(
+                lang,
+                'meshinfo_left_nodes_some',
+                "Nodes that left: {count} ({list})",
+                count=len(left_node_labels),
+                list=", ".join(left_node_labels),
+            )
+        )
+    else:
+        lines.append(
+            translate(lang, 'meshinfo_left_nodes_none', "No nodes dropped out in the last hour."),
+        )
+
+    active_count = len(current_nodes)
+    lines.append(
+        translate(
+            lang,
+            'meshinfo_active_nodes',
+            "Active nodes (1h): {count}",
+            count=active_count,
+        )
+    )
+
+    total_messages = sum(current_counts.values())
+    lines.append(
+        translate(
+            lang,
+            'meshinfo_message_volume',
+            "Messages logged (1h): {count}",
+            count=total_messages,
+        )
+    )
+
+    if top_nodes:
+        formatted_top = ", ".join(f"{_label(node)} ({count})" for node, count in top_nodes)
+        lines.append(
+            translate(
+                lang,
+                'meshinfo_top_nodes',
+                "Top nodes by traffic: {list}",
+                list=formatted_top,
+            )
+        )
+    else:
+        lines.append(translate(lang, 'meshinfo_top_nodes_none', "No traffic recorded in the last hour"))
+
+    usage_percent = _calculate_network_usage_percent(StatsManager.WINDOW_SECONDS)
+    if usage_percent is not None:
+        lines.append(
+            translate(
+                lang,
+                'meshinfo_network_usage',
+                "Approximate network usage: {percent}% (last hour)",
+                percent=f"{usage_percent:.1f}",
+            )
+        )
+    else:
+        lines.append(
+            translate(lang, 'meshinfo_network_usage_unknown', "Network usage data unavailable."),
+        )
+
+    lines.append(
+        translate(
+            lang,
+            'meshinfo_avg_batt_unknown',
+            "Battery data unavailable.",
+        )
+    )
+
+    return "\n".join(lines)
+
+
+def _format_stats_report(language: Optional[str]) -> str:
+    snapshot = STATS.snapshot()
+    top_users = snapshot.get('top_users_24h') or []
+    most_active_label = "n/a"
+    if top_users:
+        user_id, interaction_count = top_users[0]
+        if user_id:
+            display = get_node_shortname(user_id) or str(user_id)
+        else:
+            display = "unknown"
+        most_active_label = f"{display} ({interaction_count})"
+
+    mailboxes_created = snapshot.get('mailboxes_created_24h', 0) or 0
+    ai_processed = snapshot.get('ai_processed_24h', 0) or 0
+    games_played = snapshot.get('games_24h', 0) or 0
+    game_breakdown = snapshot.get('games_breakdown') or {}
+    if game_breakdown:
+        top_game, top_game_count = max(game_breakdown.items(), key=lambda item: item[1])
+        pretty_game = top_game.replace('_', ' ').title()
+        most_popular_game = f"{pretty_game} ({top_game_count})"
+    else:
+        most_popular_game = "n/a"
+
+    network_usage = _calculate_network_usage_percent(StatsManager.WINDOW_SECONDS)
+    network_label = f"{network_usage:.1f}%" if network_usage is not None else "n/a"
+    active_nodes = snapshot.get('active_users_24h', 0) or 0
+
+    lines = [
+        f"most active user: {most_active_label}",
+        f"mailboxes: {mailboxes_created}",
+        f"ollama instances: {ai_processed}",
+        f"games played: {games_played}",
+        f"most popular game: {most_popular_game}",
+        f"average network usage %: {network_label}",
+        f"number of active nodes: {active_nodes}",
+    ]
+    return "\n".join(lines)
+
+
+def _value_delta(current: Optional[Union[int, float]], previous: Optional[Union[int, float]]) -> Dict[str, Optional[Union[int, float]]]:
+    if current is None:
+        return {'value': None, 'delta': None}
+    if previous is None:
+        return {'value': current, 'delta': 0}
+    return {'value': current, 'delta': current - previous}
+
+
+def _gather_dashboard_metrics() -> Dict[str, Any]:
+    global LAST_METRICS_SNAPSHOT
+    now = datetime.now(timezone.utc)
+    uptime_delta = now - server_start_time if server_start_time else timedelta(0)
+    uptime_label = _humanize_uptime(uptime_delta)
+    stats_snapshot = STATS.snapshot()
+    stats_previous = stats_snapshot.get('previous', {}) or {}
+    message_activity = _collect_message_activity()
+    node_activity = _collect_node_activity()
+
+    try:
+        mailboxes_total = len(MAIL_MANAGER.store.list_mailboxes())
+    except Exception:
+        mailboxes_total = None
+
+    try:
+        queue_size = response_queue.qsize()
+    except Exception:
+        queue_size = -1
+
+    prev_cache = LAST_METRICS_SNAPSHOT or {}
+
+    message_metrics: Dict[str, Dict[str, Optional[int]]] = {}
+    message_totals_snapshot = stats_snapshot.get('message_totals', {}) or {}
+    prev_message_metrics = prev_cache.get('message_activity') if isinstance(prev_cache.get('message_activity'), dict) else {}
+    prev_total_value = None
+    if isinstance(prev_message_metrics, dict):
+        total_entry = prev_message_metrics.get('total')
+        if isinstance(total_entry, dict):
+            prev_total_value = total_entry.get('value')
+    total_current_val = message_totals_snapshot.get('total')
+    if total_current_val is None:
+        total_current_val = message_activity['current'].get('total', 0)
+    message_metrics['total'] = _value_delta(total_current_val, prev_total_value)
+    for key in ('channel', 'direct', 'ai', 'hour'):
+        current_val = message_activity['current'].get(key, 0)
+        previous_val = message_activity['previous'].get(key, 0)
+        message_metrics[key] = _value_delta(current_val, previous_val)
+
+    recent_nodes_list: List[Tuple[str, float]] = node_activity.get('recent', []) or []
+    prev_recent_count = node_activity.get('previous_count', 0)
+    node_metrics = {
+        'current': _value_delta(len(recent_nodes_list), prev_recent_count),
+        'new_24h': _value_delta(node_activity.get('new_24h', 0), node_activity.get('prev_new_24h', 0)),
+        'roster': [
+            {
+                'sender_key': sender,
+                'label': _display_sender_label(sender),
+                'last_heartbeat': datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+                if isinstance(ts, (int, float))
+                else None,
+            }
+            for sender, ts in recent_nodes_list
+        ],
+    }
+
+    active_users_metric = _value_delta(
+        stats_snapshot.get('active_users_24h', 0),
+        stats_previous.get('active_users_24h', 0),
+    )
+    new_onboards_metric = _value_delta(
+        stats_snapshot.get('new_onboards_24h', 0),
+        stats_previous.get('new_onboards_24h', 0),
+    )
+
+    games_metric = {
+        'value': stats_snapshot.get('games_24h', 0),
+        'delta': stats_snapshot.get('games_24h', 0) - stats_previous.get('games_24h', 0),
+        'breakdown': stats_snapshot.get('games_breakdown', {}),
+    }
+
+    mail_metrics = {
+        'sent_24h': _value_delta(
+            stats_snapshot.get('mail_sent_24h', 0),
+            stats_previous.get('mail_sent_24h', 0),
+        ),
+        'new_mailboxes_24h': _value_delta(
+            stats_snapshot.get('mailboxes_created_24h', 0),
+            stats_previous.get('mailboxes_created_24h', 0),
+        ),
+        'total_mailboxes': _value_delta(
+            mailboxes_total,
+            prev_cache.get('mail', {}).get('total_mailboxes', {}).get('value')
+            if isinstance(prev_cache.get('mail'), dict)
+            else None,
+        ),
+    }
+
+    ai_requests_metric = _value_delta(
+        stats_snapshot.get('ai_requests_24h', 0),
+        stats_previous.get('ai_requests_24h', 0),
+    )
+    ai_processed_metric = _value_delta(
+        stats_snapshot.get('ai_processed_24h', 0),
+        stats_previous.get('ai_processed_24h', 0),
+    )
+
+    queue_metric = _value_delta(queue_size, prev_cache.get('queue_size'))
+
+    recent_onboard_records = stats_snapshot.get('recent_onboards', []) or []
+    recent_onboard_list = []
+    for record in recent_onboard_records:
+        sender = record.get('sender_key')
+        ts = record.get('timestamp')
+        recent_onboard_list.append({
+            'sender_key': sender,
+            'label': _display_sender_label(sender),
+            'timestamp': datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+            if isinstance(ts, (int, float))
+            else None,
+        })
+
+    try:
+        onboard_roster_raw = ONBOARDING_MANAGER.list_completed(limit=50)
+    except Exception:
+        onboard_roster_raw = []
+    onboard_roster: List[Dict[str, Any]] = []
+    for entry in onboard_roster_raw:
+        sender = entry.get('sender_key')
+        label = entry.get('label') or _display_sender_label(sender)
+        completed_iso = entry.get('completed_at_iso')
+        if not completed_iso:
+            ts_val = entry.get('completed_at')
+            if isinstance(ts_val, (int, float)):
+                completed_iso = datetime.fromtimestamp(ts_val, tz=timezone.utc).isoformat()
+        onboard_roster.append({
+            'sender_key': sender,
+            'label': label,
+            'completed_at': completed_iso,
+            'language': entry.get('language'),
+            'mailbox': entry.get('mailbox'),
+        })
+
+    metrics = {
+        'timestamp': now.isoformat(),
+        'uptime_human': uptime_label,
+        'uptime_seconds': int(uptime_delta.total_seconds()),
+        'restart_count': restart_count,
+        'connection_status': connection_status,
+        'message_activity': message_metrics,
+        'message_totals': message_totals_snapshot,
+        'node_activity': node_metrics,
+        'active_users': active_users_metric,
+        'new_onboards': new_onboards_metric,
+        'games': games_metric,
+        'mail': mail_metrics,
+        'ai_requests': ai_requests_metric,
+        'ai_processed': ai_processed_metric,
+        'queue': queue_metric,
+        'queue_size': queue_size,
+        'ai_avg_response_ms': stats_snapshot.get('ai_avg_response_ms'),
+        'ai_avg_recent_ms': stats_snapshot.get('ai_avg_recent_ms'),
+    }
+    metrics['onboarding'] = {
+        'recent': recent_onboard_list,
+        'roster': onboard_roster,
+        'total': len(onboard_roster),
+    }
+    metrics['features'] = gather_feature_snapshot()
+    metrics['config_overview'] = _build_config_overview()
+
+    # Ack telemetry summary (last 24h)
+    try:
+        now_ts = time.time()
+        window = StatsManager.WINDOW_SECONDS
+        with STATS.lock:
+            ack_list = [rec for rec in STATS.ack_events if rec and (now_ts - rec[0] <= window)]
+        dm_first_total = sum(1 for ts, att, ok, route in ack_list if route == 'dm' and int(att) == 1)
+        dm_first_ok = sum(1 for ts, att, ok, route in ack_list if route == 'dm' and int(att) == 1 and bool(ok))
+        dm_resend_total = sum(1 for ts, att, ok, route in ack_list if route == 'dm' and int(att) > 1)
+        dm_resend_ok = sum(1 for ts, att, ok, route in ack_list if route == 'dm' and int(att) > 1 and bool(ok))
+        def _pct(ok, total):
+            return None if total <= 0 else round(100.0 * (ok / total), 1)
+        metrics['ack'] = {
+            'dm': {
+                'first_total': dm_first_total,
+                'first_ok': dm_first_ok,
+                'first_rate': _pct(dm_first_ok, dm_first_total),
+                'resend_total': dm_resend_total,
+                'resend_ok': dm_resend_ok,
+                'resend_rate': _pct(dm_resend_ok, dm_resend_total),
+                'events': dm_first_total + dm_resend_total,
+            }
+        }
+    except Exception:
+        metrics['ack'] = {'dm': {}}
+
+    LAST_METRICS_SNAPSHOT = metrics
+    return metrics
+
+
 def _truncate_for_log(text: Optional[str], limit: int = 160) -> str:
     if text is None:
         return ""
@@ -209,6 +982,36 @@ def _beautify_log_text(message: str) -> str:
         return f"ch={_channel_display_name(idx)}"
     cleaned = _CHANNEL_ID_PATTERN.sub(repl_channel, cleaned)
     return cleaned
+
+
+def _node_display_label(node_id: Any) -> str:
+    if node_id == "WebUI":
+        return "WebUI"
+    key = _safe_sender_key(node_id)
+    if key:
+        return key
+    return str(node_id)
+
+
+def _display_sender_label(sender_key: Optional[str]) -> str:
+    if not sender_key:
+        return "Unknown"
+    label = None
+    manager = globals().get('ONBOARDING_MANAGER')
+    if manager is not None:
+        try:
+            label = manager.get_sender_label(sender_key)
+        except Exception:
+            label = None
+    if label:
+        return str(label)
+    node_id = parse_node_id(sender_key)
+    if node_id is not None:
+        try:
+            return get_node_shortname(node_id)
+        except Exception:
+            pass
+    return str(sender_key)
 
 def clean_log(message, emoji="📝", show_always=False, rate_limit=True):
     """Clean, emoji-enhanced logging for better human readability with rate limiting"""
@@ -355,8 +1158,12 @@ def _viewer_should_show(line: str) -> bool:
     "Messaging Dashboard Access: http://",
     "📨 Message from ",
     "[AsyncAI]",
+    "Offline wiki index has no entries",
   )
   if any(s in line for s in spam):
+    return False
+
+  if '💓 HB' in line:
     return False
 
   stripped = line.strip()
@@ -371,7 +1178,9 @@ def _viewer_should_show(line: str) -> bool:
     "📨 Message from ",
     "📨 ",
     "📡 Broadcasting",
+    "📡 Broadcast",
     "📤 Sending direct",
+    "📤 Direct send",
     "Sent chunk ",
     "[AsyncAI]",
     "Processing:",
@@ -381,6 +1190,7 @@ def _viewer_should_show(line: str) -> bool:
     "Error processing response",
     "EMERGENCY",
     "[UI] ",
+    "🖥️ ",
     # AI provider clean_log prefixes with emojis
     "🦙 OLLAMA:",
   )
@@ -747,7 +1557,7 @@ BANNER = (
 ██║ ╚═╝ ██║███████╗███████║██║  ██║            ██║  ██║██║
 ╚═╝     ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝            ╚═╝  ╚═╝╚═╝
 
-MESH-MASTER v1.0.0 by: MR_TBOT (https://mr-tbot.com)
+MESH-MASTER v1.99.0 by: MR_TBOT (https://mr-tbot.com)
 https://mesh-master.dev - (https://github.com/mr-tbot/mesh-master/)
     \033[32m 
 Messaging Dashboard Access: http://localhost:5000/dashboard \033[38;5;214m
@@ -782,6 +1592,7 @@ COMMANDS_CONFIG_FILE = "commands_config.json"
 MOTD_FILE = "motd.json"
 LOG_FILE = "messages.log"
 ARCHIVE_FILE = "messages_archive.json"
+FEATURE_FLAGS_FILE = "feature_flags.json"
 
 print("Loading config files...")
 
@@ -806,6 +1617,780 @@ def write_atomic(path: str, data: str):
 
 config = safe_load_json(CONFIG_FILE, {})
 commands_config = safe_load_json(COMMANDS_CONFIG_FILE, {"commands": []})
+
+def _get_dynamic_command_aliases() -> Dict[str, str]:
+    try:
+        data = commands_config.get('command_aliases')
+        if not isinstance(data, dict):
+            return {}
+        aliases: Dict[str, str] = {}
+        for k, v in data.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                continue
+            alias = k if k.startswith('/') else f'/{k}'
+            target = v if v.startswith('/') else f'/{v}'
+            aliases[alias.lower()] = target.lower()
+        return aliases
+    except Exception:
+        return {}
+CONFIG_LOCK = threading.Lock()
+
+
+CONFIG_OVERVIEW_LAYOUT: "OrderedDict[str, Dict[str, Any]]" = OrderedDict([
+    (        "general",
+        {
+            "label": "General Settings",
+            "keys": [
+                "debug",
+                "clean_logs",
+                "language_selection",
+                "local_location_string",
+                "ai_node_name",
+                "start_on_boot",
+                "max_message_log",
+                "default_personality_id",
+                "user_ai_settings_file",
+                "mail_search_timeout",
+                "async_response_queue_max",
+            ],
+        },
+    ),
+    (        "mesh_interface",
+        {
+            "label": "Mesh Interface",
+            "keys": ["use_mesh_interface", "serial_port", "serial_baud"],
+        },
+    ),
+    (
+        "wifi",
+        {
+            "label": "Wi-Fi",
+            "keys": ["use_wifi", "wifi_host", "wifi_port"],
+        },
+    ),
+    (
+        "ai_provider",
+        {
+            "label": "AI Provider",
+            "keys": [
+                "ai_provider",
+                "system_prompt",
+                "chunk_size",
+                "max_ai_chunks",
+                "chunk_buffer_seconds",
+                "ai_chill_mode",
+                "ai_chill_queue_limit",
+            ],
+        },
+    ),
+    (
+        "ollama",
+        {
+            "label": "Ollama",
+            "keys": [
+                "ollama_url",
+                "ollama_model",
+                "ollama_timeout",
+                "ollama_context_chars",
+                "ollama_num_ctx",
+                "ollama_max_messages",
+            ],
+        },
+    ),
+    (
+        "home_assistant",
+        {
+            "label": "Home Assistant",
+            "keys": [
+                "home_assistant_enabled",
+                "home_assistant_url",
+                "home_assistant_token",
+                "home_assistant_timeout",
+                "home_assistant_enable_pin",
+                "home_assistant_secure_pin",
+                "home_assistant_channel_index",
+            ],
+        },
+    ),
+    (
+        "messaging",
+        {
+            "label": "Messaging",
+            "keys": ["reply_in_channels", "reply_in_directs", "channel_names"],
+        },
+    ),
+    (
+        "knowledge",
+        {
+            "label": "Knowledge Stores",
+            "keys": [
+                "bible_progress_file",
+                "meshtastic_knowledge_file",
+                "meshtastic_kb_max_context_chars",
+                "meshtastic_kb_cache_ttl",
+            ],
+        },
+    ),
+    (
+        "automessages",
+        {
+            "label": "Automessages",
+            "keys": [
+                "mail_notify_enabled",
+                "mail_notify_reminders_enabled",
+                "mail_notify_max_reminders",
+                "mail_notify_reminder_hours",
+                "mail_notify_include_self",
+                "automessage_quiet_hours",
+            ],
+        },
+    ),
+    (
+        "radio_settings",
+        {
+            "label": "Radio Settings",
+            "keys": [
+                "radio_settings_info",
+            ],
+        },
+    ),
+    (
+        "resending_no_ack",
+        {
+            "label": "Resending (No Ack)",
+            "keys": [
+                "resend_enabled",
+                "resend_usage_threshold_percent",
+                "resend_dm_only",
+                "resend_broadcast_enabled",
+                "resend_suffix_enabled",
+                "resend_system_attempts",
+                "resend_system_interval_seconds",
+                "resend_user_attempts",
+                "resend_user_interval_seconds",
+                "resend_jitter_seconds",
+                "resend_telemetry_enabled",
+            ],
+        },
+    ),
+])
+
+CONFIG_HIDDEN_KEYS = {
+    "openai_api_key",
+    "openai_model",
+    "openai_timeout",
+    "openai_base_url",
+    "lmstudio_url",
+    "lmstudio_model",
+    "lmstudio_timeout",
+    "lmstudio_api_key",
+    "notify_active_start_hour",
+    "notify_active_end_hour",
+    "mail_notify_quiet_hours_enabled",
+    "mail_quiet_start_hour",
+    "mail_quiet_end_hour",
+}
+
+CONFIG_KEY_FRIENDLY_NAMES: Dict[str, str] = {
+    "debug": "Debug logging",
+    "clean_logs": "Clean log output",
+    "language_selection": "Default language",
+    "local_location_string": "Location note",
+    "ai_node_name": "AI callsign",
+    "start_on_boot": "Auto-start on boot",
+    "max_message_log": "Message history limit",
+    "default_personality_id": "Default personality",
+    "user_ai_settings_file": "AI user settings file",
+    "mail_search_timeout": "Mail search timeout",
+    "async_response_queue_max": "Response queue max",
+    "use_mesh_interface": "Use mesh interface",
+    "serial_port": "Serial port",
+    "serial_baud": "Serial baud rate",
+    "use_wifi": "Use Wi-Fi link",
+    "wifi_host": "Wi-Fi host",
+    "wifi_port": "Wi-Fi port",
+    "ai_provider": "AI provider",
+    "system_prompt": "System prompt",
+    "chunk_size": "Chunk size",
+    "max_ai_chunks": "Max AI chunks",
+    "chunk_buffer_seconds": "Chunk buffer",
+    "ai_chill_mode": "AI chill mode",
+    "ai_chill_queue_limit": "Chill queue limit",
+    "ollama_url": "Ollama URL",
+    "ollama_model": "Ollama model",
+    "ollama_timeout": "Ollama timeout",
+    "ollama_context_chars": "Ollama context chars",
+    "ollama_num_ctx": "Ollama context window",
+    "ollama_max_messages": "Ollama message cap",
+    "home_assistant_enabled": "Home Assistant enabled",
+    "home_assistant_url": "Home Assistant URL",
+    "home_assistant_token": "Home Assistant token",
+    "home_assistant_timeout": "Home Assistant timeout",
+    "home_assistant_enable_pin": "Require HA PIN",
+    "home_assistant_secure_pin": "Home Assistant PIN",
+    "home_assistant_channel_index": "HA channel index",
+    "reply_in_channels": "Reply in channels",
+    "reply_in_directs": "Reply in DMs",
+    "channel_names": "Channel names",
+    "bible_progress_file": "Bible progress file",
+    "meshtastic_knowledge_file": "Mesh knowledge file",
+    "meshtastic_kb_max_context_chars": "Knowledge context limit",
+    "meshtastic_kb_cache_ttl": "Knowledge cache TTL",
+    "automessage_quiet_hours": "Automessage quiet hours",
+    "mail_notify_enabled": "Mail alerts",
+    "mail_notify_reminders_enabled": "Mail reminders",
+    "mail_notify_max_reminders": "Reminder count",
+    "mail_notify_reminder_hours": "Reminder spacing (hours)",
+    "mail_notify_include_self": "Notify sender",
+    "notify_active_start_hour": "Quiet hours start",
+    "notify_active_end_hour": "Quiet hours end",
+    # Resending (No Ack)
+    "resend_enabled": "Enable resend",
+    "resend_usage_threshold_percent": "Usage threshold %",
+    "resend_dm_only": "DM-only scope",
+    "resend_broadcast_enabled": "Allow broadcast resend",
+    "resend_suffix_enabled": "Retry suffix '(Nth try)'",
+    "resend_system_attempts": "System resend attempts",
+    "resend_system_interval_seconds": "System resend interval (s)",
+    "resend_user_attempts": "User resend attempts",
+    "resend_user_interval_seconds": "User resend interval (s)",
+    "resend_jitter_seconds": "Resend jitter (s)",
+    "resend_telemetry_enabled": "Ack telemetry",
+    # Radio panel helper
+    "radio_settings_info": "Radio settings",
+}
+
+CONFIG_KEY_EXPLAINERS: Dict[str, str] = {
+    "debug": "Enable verbose troubleshooting logs. Turns off noise filtering so raw protobuf chatter is visible.",
+    "clean_logs": "Filters noisy protobuf messages and adds emoji markers for easier scanning in the activity stream.",
+    "language_selection": "Sets the default language for canned replies, menus, and status messages.",
+    "local_location_string": "Optional text describing this node's location that appears in certain status replies.",
+    "ai_node_name": "Callsign the AI uses when introducing itself in conversations.",
+    "start_on_boot": "If enabled, Mesh-Master starts automatically whenever the host computer boots.",
+    "max_message_log": "Maximum number of recent messages kept in memory for dashboards and history commands.",
+    "default_personality_id": "Primary AI persona applied to replies when no user override is active.",
+    "user_ai_settings_file": "Path to the JSON file storing per-user AI preferences and overrides.",
+    "mail_search_timeout": "How many seconds the system searches mesh mail before aborting a lookup.",
+    "async_response_queue_max": "Upper limit on queued outbound responses to avoid flooding the mesh.",
+    "use_mesh_interface": "Enable the serial Meshtastic interface for direct radio control.",
+    "serial_port": "Path to the serial device connected to the Meshtastic radio.",
+    "serial_baud": "Serial baud rate used when communicating with the radio.",
+    "use_wifi": "Enable the Wi-Fi socket interface instead of direct serial access.",
+    "wifi_host": "Hostname or IP address for the Wi-Fi-connected node.",
+    "wifi_port": "TCP port number for the Wi-Fi mesh link.",
+    "ai_provider": "Selects the large language model provider powering AI replies.",
+    "system_prompt": "Base instruction prompt prepended to every AI conversation.",
+    "chunk_size": "Character count for each streaming chunk returned back to the radio.",
+    "max_ai_chunks": "Maximum number of streaming chunks allowed per AI reply.",
+    "chunk_buffer_seconds": "Delay between streaming chunks to prevent radio congestion.",
+    "ollama_url": "URL Mesh-Master uses to reach the Ollama API.",
+    "ollama_model": "Ollama model identifier used for completions.",
+    "ollama_timeout": "Seconds to wait before giving up on an Ollama request.",
+    "ollama_context_chars": "Approximate character budget kept when building the Ollama prompt.",
+    "ollama_num_ctx": "Context window hint passed to Ollama for supported models.",
+    "ollama_max_messages": "Maximum recent chat messages forwarded to Ollama for context.",
+    "ai_chill_mode": "When enabled, temporarily halts new Ollama requests if the async queue is busy, and DMs users to wait.",
+    "ai_chill_queue_limit": "Maximum queued Ollama tasks to allow when chill mode is enabled. New requests beyond this are deferred with a DM.",
+    "home_assistant_enabled": "Turns Home Assistant automations on or off.",
+    "home_assistant_url": "Base URL for the Home Assistant instance Mesh-Master talks to.",
+    "home_assistant_token": "Long-lived Home Assistant access token. Keep this secret.",
+    "home_assistant_timeout": "Seconds to wait for Home Assistant responses before aborting.",
+    "home_assistant_enable_pin": "Require a PIN from chat operators before executing Home Assistant commands.",
+    "home_assistant_secure_pin": "PIN code operators must DM to unlock Home Assistant actions. Keep private.",
+    "home_assistant_channel_index": "Mesh channel index used for Home Assistant status updates.",
+    "reply_in_channels": "Allow the AI to reply inside shared channel conversations.",
+    "reply_in_directs": "Allow the AI to respond to direct messages and DMs.",
+    "channel_names": "Friendly display names for mesh channels when formatting responses.",
+    "bible_progress_file": "File tracking which Bible verses were last shared so rotations stay fresh.",
+    "meshtastic_knowledge_file": "Local knowledge base JSON used for /meshinfo and related lookups.",
+    "meshtastic_kb_max_context_chars": "Maximum number of characters to pull from the knowledge base for a reply.",
+    "meshtastic_kb_cache_ttl": "How long knowledge base lookups stay cached before refreshing.",
+    "automessage_quiet_hours": "Toggle automated quiet hours for reminder delivery and set the overnight window.",
+    "mail_notify_enabled": "Master switch for mesh mail alerts. When disabled, no inbox notifications are sent.",
+    "mail_notify_reminders_enabled": "Controls whether Mesh Master schedules follow-up reminders for unread mail after the initial alert.",
+    "mail_notify_max_reminders": "How many reminder messages each subscriber receives after the first alert if their mail remains unread.",
+    "mail_notify_reminder_hours": "Spacing between reminder messages (in hours) once the reminder window begins.",
+    "mail_notify_include_self": "If enabled, the author of a new mail message also receives notification pings for that mailbox.",
+    "notify_active_start_hour": "Local hour (0–23) when quiet hours end and automated reminders may resume.",
+    "notify_active_end_hour": "Local hour (0–23) when quiet hours begin; reminders pause outside the active window.",
+    # Resending (No Ack)
+    "resend_enabled": "Enable automatic resends when messages do not receive ACKs (directs) or under configured policy (broadcasts).",
+    "resend_usage_threshold_percent": "Only perform resends when approximate network usage is below this percentage.",
+    "resend_dm_only": "If enabled, apply resends only to direct messages (DMs). Disable to also allow channel messages.",
+    "resend_broadcast_enabled": "Allow resending for broadcast/channel messages (no per-chunk ACK available).",
+    "resend_suffix_enabled": "Append a short retry suffix such as '(2nd try)' to the last resent chunk. If disabled, resends are silent.",
+    "resend_system_attempts": "Maximum resend attempts for system/AI-originated messages.",
+    "resend_system_interval_seconds": "Seconds to wait between resend attempts for system/AI messages.",
+    "resend_user_attempts": "Maximum resend attempts for user-triggered replies in DMs.",
+    "resend_user_interval_seconds": "Seconds between resend attempts for user-triggered replies in DMs.",
+    "resend_jitter_seconds": "Small random jitter added to resend intervals to avoid collisions.",
+    "resend_telemetry_enabled": "Record anonymous, in-memory ACK telemetry for quality tracking.",
+    # Radio panel helper
+    "radio_settings_info": "This category points to the live Radio Settings panel above for managing hop limit and channels.",
+}
+
+
+def _format_hour_label(hour: int) -> str:
+    return f"{int(hour) % 24:02d}:00"
+
+
+def _build_quiet_hours_entry() -> Optional[Dict[str, Any]]:
+    active_start = int(config.get("notify_active_start_hour", 0) or 0) % 24
+    active_end = int(config.get("notify_active_end_hour", 0) or 0) % 24
+    default_quiet_start = active_end
+    default_quiet_end = active_start
+    quiet_start = int(config.get("mail_quiet_start_hour", default_quiet_start) or default_quiet_start) % 24
+    quiet_end = int(config.get("mail_quiet_end_hour", default_quiet_end) or default_quiet_end) % 24
+    enabled_flag = bool(config.get("mail_notify_quiet_hours_enabled", MAIL_NOTIFY_QUIET_HOURS_ENABLED))
+    quiet_enabled = enabled_flag and quiet_start != quiet_end
+
+    if quiet_enabled:
+        value_label = f"Quiet {_format_hour_label(quiet_start)} → {_format_hour_label(quiet_end)}"
+        tooltip = (
+            f"Quiet hours enabled. Reminders pause from {_format_hour_label(quiet_start)}"
+            f" to {_format_hour_label(quiet_end)} local time."
+        )
+    else:
+        value_label = "Disabled (24/7 reminders)"
+        tooltip = "Quiet hours disabled; reminders may send at any time."
+
+    raw = {
+        "enabled": bool(quiet_enabled),
+        "start": quiet_start,
+        "end": quiet_end,
+    }
+
+    return {
+        "key": "automessage_quiet_hours",
+        "label": _humanize_config_key("automessage_quiet_hours"),
+        "value": value_label,
+        "tooltip": tooltip,
+        "raw": raw,
+        "type": "automessage_quiet_hours",
+        "explainer": _build_config_explainer("automessage_quiet_hours", value_label, tooltip),
+    }
+
+
+def _humanize_config_key(key: str) -> str:
+    if not key:
+        return "Setting"
+    return CONFIG_KEY_FRIENDLY_NAMES.get(key, key.replace('_', ' ').strip().title())
+
+
+_DEF_EMPTY_VALUES = {"—", "(empty)", ""}
+
+
+def _build_config_explainer(key: str, display_value: str, tooltip_value: str) -> str:
+    base = CONFIG_KEY_EXPLAINERS.get(key)
+    friendly = _humanize_config_key(key)
+    value_text = tooltip_value or display_value or ""
+    value_text = value_text.strip()
+    if value_text in _DEF_EMPTY_VALUES:
+        value_text = ""
+    if base:
+        return f"{base} Currently set to {value_text}." if value_text else base
+    if value_text:
+        return f"{friendly} is currently set to {value_text}."
+    return f"{friendly} has no value configured."
+
+_SENSITIVE_CONFIG_KEYWORDS = ("token", "pass", "secret", "pin", "key")
+_SENSITIVE_CONFIG_KEYS = {
+    "home_assistant_token",
+    "home_assistant_secure_pin",
+}
+
+
+def _mask_config_value(value: Any) -> str:
+    if not value:
+        return "(not set)"
+    if isinstance(value, str):
+        masked_len = min(8, max(4, len(value)))
+        return "•" * masked_len
+    return "[hidden]"
+
+
+def _stringify_mapping(value: Dict[Any, Any]) -> str:
+    parts: List[str] = []
+    for key, val in value.items():
+        parts.append(f"{key}: {val}")
+    return ", ".join(parts)
+
+
+def _format_config_value(key: str, value: Any) -> Tuple[str, str]:
+    if key not in config:
+        return "—", "—"
+    if value is None:
+        return "—", "—"
+    key_lower = key.lower()
+    if key in _SENSITIVE_CONFIG_KEYS or any(token in key_lower for token in _SENSITIVE_CONFIG_KEYWORDS):
+        masked = _mask_config_value(value)
+        return masked, masked
+    if isinstance(value, bool):
+        label = "Enabled" if value else "Disabled"
+        return label, label
+    if isinstance(value, (int, float)):
+        text = str(value)
+        return text, text
+    if isinstance(value, dict):
+        joined = _stringify_mapping(value) if value else "(empty)"
+        display = joined if len(joined) <= 80 else joined[:77].rstrip() + "…"
+        return display, joined
+    if isinstance(value, (list, tuple, set)):
+        joined = ", ".join(str(item) for item in value) if value else "(empty)"
+        display = joined if len(joined) <= 80 else joined[:77].rstrip() + "…"
+        return display, joined
+    text = str(value).strip()
+    if not text:
+        return "(empty)", "(empty)"
+    clean = text.replace("\n", " ⏎ ")
+    tooltip = clean
+    display = clean if len(clean) <= 120 else clean[:117].rstrip() + "…"
+    return display, tooltip
+
+
+def _config_value_kind(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
+
+def _build_config_overview() -> Dict[str, Any]:
+    sections: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for section_id, section_info in CONFIG_OVERVIEW_LAYOUT.items():
+        keys = section_info.get("keys", [])
+        entries: List[Dict[str, Any]] = []
+        for key in keys:
+            if key == "automessage_quiet_hours":
+                entry = _build_quiet_hours_entry()
+                if entry:
+                    entries.append(entry)
+                continue
+            if key in CONFIG_HIDDEN_KEYS:
+                continue
+            if key not in config:
+                continue
+            seen.add(key)
+            value = config.get(key)
+            display, tooltip = _format_config_value(key, value)
+            entries.append(
+                {
+                    "key": key,
+                    "label": _humanize_config_key(key),
+                    "value": display,
+                    "tooltip": tooltip,
+                    "raw": value,
+                    "type": _config_value_kind(value),
+                    "explainer": _build_config_explainer(key, display, tooltip),
+                }
+            )
+        if entries:
+            sections.append(
+                {
+                    "id": section_id,
+                    "label": section_info.get("label", section_id.replace("_", " ").title()),
+                    "settings": entries,
+                }
+            )
+
+    remaining_keys = [key for key in sorted(config.keys()) if key not in seen and key not in CONFIG_HIDDEN_KEYS]
+    if remaining_keys:
+        extra_entries: List[Dict[str, Any]] = []
+        for key in remaining_keys:
+            value = config.get(key)
+            display, tooltip = _format_config_value(key, value)
+            extra_entries.append(
+                {
+                    "key": key,
+                    "label": _humanize_config_key(key),
+                    "value": display,
+                    "tooltip": tooltip,
+                    "raw": value,
+                    "type": _config_value_kind(value),
+                    "explainer": _build_config_explainer(key, display, tooltip),
+                }
+            )
+        sections.append({"id": "other", "label": "Other Settings", "settings": extra_entries})
+
+    language_options = [
+        {"value": "english", "label": "English"},
+        {"value": "spanish", "label": "Spanish"},
+    ]
+    personality_options: List[Dict[str, str]] = []
+    for persona_id in AI_PERSONALITY_ORDER:
+        persona = AI_PERSONALITY_MAP.get(persona_id, {})
+        name = persona.get("name") or persona_id
+        emoji = persona.get("emoji") or ""
+        label = f"{emoji} {name}".strip()
+        personality_options.append({"value": persona_id, "label": label})
+
+    metadata = {
+        "language_options": language_options,
+        "personality_options": personality_options,
+        "hour_options": [
+            {"value": hour, "label": _format_hour_label(hour)}
+            for hour in range(24)
+        ],
+    }
+
+    return {"sections": sections, "metadata": metadata}
+
+
+def _parse_config_update_value(text: str) -> Any:
+    if text is None:
+        return ""
+    candidate = text.strip()
+    if not candidate:
+        return ""
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        return text
+
+
+# -------------------------------------------------
+# Feature flag storage (AI + command toggles)
+# -------------------------------------------------
+AI_DISABLED_MESSAGE = "⚠️ AI responses are currently disabled by the operator."
+
+DEFAULT_FEATURE_FLAGS = {
+    "ai_enabled": True,
+    "disabled_commands": [],
+    "message_mode": "both",
+    "admin_passphrase": "",
+    "auto_ping_enabled": True,
+    "admin_whitelist": [],
+}
+
+MESSAGE_MODE_OPTIONS = {"both", "dm_only", "channel_only"}
+
+_feature_flags_lock = threading.Lock()
+_feature_flags: Dict[str, Any] = {}
+_disabled_command_set: Set[str] = set()
+_feature_flag_admins: Set[str] = set()
+
+
+_INITIAL_ADMIN_WHITELIST: Set[str] = set()
+AUTHORIZED_ADMINS: Set[str] = set()
+AUTHORIZED_ADMIN_NAMES: Dict[str, str] = {}
+_initial_admins = config.get("admin_whitelist", [])
+if isinstance(_initial_admins, (list, tuple, set)):
+    for entry in _initial_admins:
+        if entry is None:
+            continue
+        sanitized = str(entry).strip()
+        if not sanitized:
+            continue
+        _INITIAL_ADMIN_WHITELIST.add(sanitized)
+        AUTHORIZED_ADMINS.add(sanitized)
+        AUTHORIZED_ADMIN_NAMES.setdefault(sanitized, sanitized)
+elif isinstance(_initial_admins, str):
+    sanitized = _initial_admins.strip()
+    if sanitized:
+        _INITIAL_ADMIN_WHITELIST.add(sanitized)
+        AUTHORIZED_ADMINS.add(sanitized)
+        AUTHORIZED_ADMIN_NAMES.setdefault(sanitized, sanitized)
+
+
+def _refresh_authorized_admins(*, retain_existing: bool = True) -> None:
+    initial = set(_INITIAL_ADMIN_WHITELIST)
+    combined: Set[str] = set(initial)
+    combined.update(_feature_flag_admins)
+    if retain_existing:
+        combined.update(AUTHORIZED_ADMINS)
+    AUTHORIZED_ADMINS.clear()
+    AUTHORIZED_ADMINS.update(combined)
+    for key in list(AUTHORIZED_ADMIN_NAMES.keys()):
+        if key not in combined:
+            AUTHORIZED_ADMIN_NAMES.pop(key, None)
+    for key in combined:
+        AUTHORIZED_ADMIN_NAMES.setdefault(key, key)
+
+
+def _normalize_command_name(cmd: str) -> str:
+    if not cmd:
+        return ""
+    token = str(cmd).strip()
+    if not token:
+        return ""
+    if not token.startswith("/"):
+        token = f"/{token}"
+    return token.lower()
+
+
+def _normalize_message_mode(value: Optional[Any]) -> str:
+    if not value:
+        return "both"
+    text = str(value).strip().lower()
+    if text in MESSAGE_MODE_OPTIONS:
+        return text
+    if text in {"dm", "direct", "dm_only"}:
+        return "dm_only"
+    if text in {"channel", "channels", "channel_only"}:
+        return "channel_only"
+    return "both"
+
+
+def _apply_feature_flags(data: Dict[str, Any]) -> None:
+    global _feature_flags, _disabled_command_set, _feature_flag_admins
+    merged = dict(DEFAULT_FEATURE_FLAGS)
+    if isinstance(data, dict):
+        for key in DEFAULT_FEATURE_FLAGS.keys():
+            if key in data:
+                merged[key] = data.get(key)
+
+    disabled = merged.get("disabled_commands") or []
+    if not isinstance(disabled, list):
+        disabled = []
+    normalized = sorted({_normalize_command_name(cmd) for cmd in disabled if _normalize_command_name(cmd)})
+    merged["disabled_commands"] = normalized
+
+    merged["message_mode"] = _normalize_message_mode(merged.get("message_mode"))
+    merged["admin_passphrase"] = str(merged.get("admin_passphrase") or "").strip()
+    merged["auto_ping_enabled"] = bool(merged.get("auto_ping_enabled", True))
+
+    admin_entries = merged.get("admin_whitelist") or []
+    if not isinstance(admin_entries, list):
+        admin_entries = []
+    admin_set = {str(entry).strip() for entry in admin_entries if str(entry).strip()}
+    merged["admin_whitelist"] = sorted(admin_set)
+    _feature_flag_admins = admin_set
+
+    _feature_flags = merged
+    _disabled_command_set = set(normalized)
+    _refresh_authorized_admins(retain_existing=False)
+
+
+def _load_feature_flags_from_disk() -> Dict[str, Any]:
+    data = safe_load_json(FEATURE_FLAGS_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    return data
+
+
+def _save_feature_flags_to_disk(flags: Dict[str, Any]) -> None:
+    directory = os.path.dirname(FEATURE_FLAGS_FILE)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{FEATURE_FLAGS_FILE}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        json.dump(flags, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, FEATURE_FLAGS_FILE)
+
+
+def _initialize_feature_flags() -> None:
+    data = _load_feature_flags_from_disk()
+    with _feature_flags_lock:
+        _apply_feature_flags(data)
+
+
+def get_feature_flags_snapshot() -> Dict[str, Any]:
+    with _feature_flags_lock:
+        return dict(_feature_flags)
+
+
+def update_feature_flags(*, ai_enabled: Optional[bool] = None, disabled_commands: Optional[List[str]] = None, message_mode: Optional[str] = None, admin_passphrase: Optional[str] = None, auto_ping_enabled: Optional[bool] = None, admin_whitelist: Optional[List[str]] = None) -> Dict[str, Any]:
+    with _feature_flags_lock:
+        current = dict(_feature_flags)
+        if ai_enabled is not None:
+            current["ai_enabled"] = bool(ai_enabled)
+        if disabled_commands is not None:
+            normalized = sorted({_normalize_command_name(cmd) for cmd in disabled_commands if _normalize_command_name(cmd)})
+            current["disabled_commands"] = normalized
+        if message_mode is not None:
+            current["message_mode"] = _normalize_message_mode(message_mode)
+        passphrase_changed = False
+        if admin_passphrase is not None:
+            new_passphrase = str(admin_passphrase or "").strip()
+            old_passphrase = str(current.get("admin_passphrase", "") or "").strip()
+            if new_passphrase != old_passphrase:
+                passphrase_changed = True
+            current["admin_passphrase"] = new_passphrase
+        if auto_ping_enabled is not None:
+            current["auto_ping_enabled"] = bool(auto_ping_enabled)
+        if admin_whitelist is not None:
+            entries = admin_whitelist if isinstance(admin_whitelist, (list, tuple, set)) else []
+            sanitized = sorted({str(entry).strip() for entry in entries if str(entry).strip()})
+            current["admin_whitelist"] = sanitized
+        _apply_feature_flags(current)
+        if passphrase_changed:
+            PENDING_ADMIN_REQUESTS.clear()
+        try:
+            _save_feature_flags_to_disk(_feature_flags)
+        except Exception as exc:
+            print(f"⚠️ Unable to persist feature flags: {exc}")
+        return dict(_feature_flags)
+
+
+def is_ai_enabled() -> bool:
+    with _feature_flags_lock:
+        return bool(_feature_flags.get("ai_enabled", True))
+
+
+def is_auto_ping_enabled() -> bool:
+    with _feature_flags_lock:
+        return bool(_feature_flags.get("auto_ping_enabled", True))
+
+
+def is_command_enabled(cmd: str) -> bool:
+    normalized = _normalize_command_name(cmd)
+    with _feature_flags_lock:
+        return normalized not in _disabled_command_set
+
+
+def get_message_mode() -> str:
+    with _feature_flags_lock:
+        mode = _feature_flags.get("message_mode", "both")
+    return mode if mode in MESSAGE_MODE_OPTIONS else "both"
+
+
+def get_admin_passphrase() -> str:
+    with _feature_flags_lock:
+        value = _feature_flags.get("admin_passphrase") or ""
+    return str(value).strip()
+
+
+def set_command_enabled(command: str, enabled: bool) -> Dict[str, Any]:
+    snapshot = get_feature_flags_snapshot()
+    disabled = set(snapshot.get("disabled_commands", []))
+    normalized = _normalize_command_name(command)
+    if not normalized:
+        return snapshot
+    if enabled:
+        disabled.discard(normalized)
+    else:
+        disabled.add(normalized)
+    return update_feature_flags(disabled_commands=sorted(disabled))
+
+
+def set_message_mode(mode: str) -> Dict[str, Any]:
+    normalized = _normalize_message_mode(mode)
+    return update_feature_flags(message_mode=normalized)
+
+
+def set_ai_enabled(enabled: bool) -> Dict[str, Any]:
+    return update_feature_flags(ai_enabled=bool(enabled))
+
+
+_initialize_feature_flags()
+
+# Ensure desktop autostart defaults to enabled even if the config file lacks the key.
+if not config.get("start_on_boot", False):
+    config["start_on_boot"] = True
+    try:
+        write_atomic(CONFIG_FILE, json.dumps(config, indent=2))
+    except Exception as exc:
+        print(f"⚠️ Unable to persist start_on_boot default: {exc}")
 
 
 def _determine_server_port() -> int:
@@ -845,20 +2430,44 @@ except FileNotFoundError:
 
 
 ADMIN_PASSWORD = str(config.get("admin_password", "password") or "password")
-_initial_admins = config.get("admin_whitelist", [])
-AUTHORIZED_ADMINS: Set[str] = set()
-if isinstance(_initial_admins, list):
-    for entry in _initial_admins:
-        if entry is None:
-            continue
-        AUTHORIZED_ADMINS.add(str(entry))
+ADMIN_PASSWORD_NORM = ADMIN_PASSWORD.strip().casefold()
+
+
+def _register_admin_display(sender_key: str, sender_id: Any = None, *, label: Optional[str] = None) -> None:
+    if not sender_key:
+        return
+    name = label
+    if name is None and sender_id is not None:
+        try:
+            display = get_node_shortname(sender_id)
+        except Exception:
+            display = None
+        if display:
+            name = display
+    if not name:
+        name = sender_key
+    AUTHORIZED_ADMIN_NAMES[sender_key] = str(name)
+
+
+def _ensure_admin_in_feature_flags(sender_key: str) -> None:
+    normalized = str(sender_key or "").strip()
+    if not normalized:
+        return
+    snapshot = get_feature_flags_snapshot()
+    current = set(snapshot.get("admin_whitelist", []))
+    if normalized in current:
+        return
+    current.add(normalized)
+    update_feature_flags(admin_whitelist=sorted(current))
+
 PENDING_ADMIN_REQUESTS: Dict[str, Dict[str, Any]] = {}
 PENDING_WIPE_REQUESTS: Dict[str, Dict[str, Any]] = {}
+PENDING_WIPE_SELECTIONS: Dict[str, Dict[str, Any]] = {}
 PENDING_BIBLE_NAV: Dict[str, Dict[str, Any]] = {}
 PENDING_POSITION_CONFIRM: Dict[str, Dict[str, Any]] = {}
-PENDING_WRITE_REQUESTS: Dict[str, Dict[str, Any]] = {}
 PENDING_SAVE_WIZARDS: Dict[str, Dict[str, Any]] = {}
 PENDING_VIBE_SELECTIONS: Dict[str, Dict[str, Any]] = {}
+PENDING_MAILBOX_SELECTIONS: Dict[str, Dict[str, Any]] = {}
 
 SAVE_WIZARD_TIMEOUT = 5 * 60
 VIBE_MENU_TIMEOUT = 3 * 60
@@ -1107,7 +2716,7 @@ def _run_bible_autoscroll(sender_key: str, sender_node: str, interface_ref, nav_
     local_state = dict(nav_info)
     total_sent = 0
     time.sleep(1)
-    for _ in range(BIBLE_AUTOSCROLL_MAX_CHUNKS):
+    for idx in range(BIBLE_AUTOSCROLL_MAX_CHUNKS):
         if stop_event and stop_event.is_set():
             break
         next_state = _shift_bible_position(local_state, True)
@@ -1119,7 +2728,9 @@ def _run_bible_autoscroll(sender_key: str, sender_node: str, interface_ref, nav_
             break
         text, info = rendered
         info['span'] = local_state.get('span', end - start)
-        message = _format_bible_nav_message(text)
+        has_more = _shift_bible_position(info, True) is not None
+        include_hint = (not has_more) or (idx == BIBLE_AUTOSCROLL_MAX_CHUNKS - 1)
+        message = _format_bible_nav_message(text, include_hint=include_hint)
         try:
             send_direct_chunks(interface_ref, message, sender_node, chunk_delay=None)
         except Exception as exc:
@@ -1173,7 +2784,7 @@ MESHTASTIC_KB_SYSTEM_PROMPT = (
 
 LOCATION_HISTORY: Dict[str, Dict[str, Any]] = {}
 LOCATION_HISTORY_LOCK = threading.Lock()
-LOCATION_HISTORY_RETENTION = 24 * 3600
+LOCATION_HISTORY_RETENTION = 10  # seconds
 
 
 SAVED_CONTEXT_FILE = Path(config.get("saved_context_file", "data/saved_contexts.json"))
@@ -1192,13 +2803,52 @@ PENDING_RECALL_SELECTIONS: Dict[str, Dict[str, Any]] = {}
 PENDING_DELETE_SELECTIONS: Dict[str, Dict[str, Any]] = {}
 
 
-WEATHER_REPORT_FILE = config.get("weather_report_file", "data/weather_reports.json")
-WEATHER_REPORT_LOCK = threading.Lock()
-WEATHER_REPORTS: List[Dict[str, Any]] = []
-WEATHER_REPORT_MAX_ENTRIES = int(config.get("weather_report_max_entries", 100))
-WEATHER_REPORT_RETENTION = int(config.get("weather_report_retention_seconds", 24 * 3600))
-WEATHER_REPORT_RECENT_WINDOW = int(config.get("weather_report_recent_window", 2 * 3600))
-PENDING_WEATHER_REPORTS: Dict[str, Dict[str, Any]] = {}
+WEATHER_LOCATION_NAME = str(config.get("weather_location_name", "El Paso, TX"))
+try:
+    WEATHER_LAT = float(config.get("weather_lat", 31.7619))
+except (TypeError, ValueError):
+    WEATHER_LAT = 31.7619
+try:
+    WEATHER_LON = float(config.get("weather_lon", -106.4850))
+except (TypeError, ValueError):
+    WEATHER_LON = -106.4850
+try:
+    WEATHER_CACHE_TTL = int(config.get("weather_cache_ttl", 1800))
+except (TypeError, ValueError):
+    WEATHER_CACHE_TTL = 1800
+WEATHER_CACHE_LOCK = threading.Lock()
+WEATHER_CACHE: Dict[str, Any] = {"timestamp": 0.0, "text": None}
+
+WEATHER_CODE_DESCRIPTIONS = {
+    0: "Clear sky",
+    1: "Mainly clear",
+    2: "Partly cloudy",
+    3: "Overcast",
+    45: "Fog",
+    48: "Depositing rime fog",
+    51: "Light drizzle",
+    53: "Moderate drizzle",
+    55: "Dense drizzle",
+    56: "Freezing drizzle",
+    57: "Freezing drizzle",
+    61: "Light rain",
+    63: "Moderate rain",
+    65: "Heavy rain",
+    66: "Freezing rain",
+    67: "Freezing rain",
+    71: "Light snow",
+    73: "Moderate snow",
+    75: "Heavy snow",
+    77: "Snow grains",
+    80: "Light rain showers",
+    81: "Moderate rain showers",
+    82: "Intense rain showers",
+    85: "Light snow showers",
+    86: "Heavy snow showers",
+    95: "Thunderstorm",
+    96: "Thunderstorm with hail",
+    99: "Thunderstorm with hail",
+}
 
 
 try:
@@ -1232,6 +2882,8 @@ try:
 except (TypeError, ValueError):
     WEB_CRAWL_MAX_LIMIT = max(WEB_CRAWL_MAX_PAGES, 150)
 
+WEB_CRAWL_SUPPRESS_LOG_STATUS = {405}
+
 WEB_CONTEXT_LOCK = threading.Lock()
 WEB_SEARCH_CONTEXT: Dict[str, deque[str]] = {}
 
@@ -1254,44 +2906,6 @@ DIRECT_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
-
-
-# Ensure sane defaults for retention settings
-if WEATHER_REPORT_MAX_ENTRIES < 10:
-    WEATHER_REPORT_MAX_ENTRIES = 10
-if WEATHER_REPORT_RETENTION < 3600:
-    WEATHER_REPORT_RETENTION = 3600
-if WEATHER_REPORT_RECENT_WINDOW < 900:
-    WEATHER_REPORT_RECENT_WINDOW = 900
-
-
-def _normalize_weather_reports(raw) -> List[Dict[str, Any]]:
-    reports: List[Dict[str, Any]] = []
-    if isinstance(raw, dict) and 'reports' in raw:
-        raw = raw.get('reports')
-    if not isinstance(raw, list):
-        return reports
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        entry = {
-            'timestamp': float(item.get('timestamp', 0.0) or 0.0),
-            'shortname': str(item.get('shortname') or item.get('node') or ''),
-            'text': str(item.get('text') or ''),
-            'map_url': item.get('map_url') or None,
-            'lat': item.get('lat'),
-            'lon': item.get('lon'),
-            'node_key': item.get('node_key') or None,
-        }
-        reports.append(entry)
-    return reports
-
-
-try:
-    WEATHER_REPORTS = _normalize_weather_reports(safe_load_json(WEATHER_REPORT_FILE, []))
-except Exception as exc:
-    print(f"⚠️ Could not load weather reports: {exc}")
-    WEATHER_REPORTS = []
 
 
 def _public_base_url() -> str:
@@ -1631,6 +3245,7 @@ def _crawl_website(start_url: str, max_pages: int = WEB_CRAWL_MAX_PAGES) -> Tupl
     contact_records: List[Dict[str, str]] = []
     seen_contacts: Set[Tuple[str, str]] = set()
     contact_page_info: Optional[Dict[str, str]] = None
+    fatal_issue: Optional[Tuple[str, Optional[int], str]] = None
 
     def _within_scope(netloc: str) -> bool:
         netloc = netloc.lower()
@@ -1645,9 +3260,21 @@ def _crawl_website(start_url: str, max_pages: int = WEB_CRAWL_MAX_PAGES) -> Tupl
             response = requests.get(current, headers=headers, timeout=WEB_SEARCH_TIMEOUT, allow_redirects=True)
             response.raise_for_status()
         except requests.exceptions.RequestException as exc:
-            if not pages:
-                raise RuntimeError("offline") from exc
-            clean_log(f"Crawl skipped {current}: {exc}", "⚠️", show_always=False)
+            status_code = None
+            reason_text = ""
+            if isinstance(exc, requests.exceptions.HTTPError) and getattr(exc, "response", None) is not None:
+                status_code = exc.response.status_code
+                reason_text = exc.response.reason or ""
+            if fatal_issue is None and not pages:
+                if status_code is not None:
+                    detail_text = f"HTTP {status_code}{f' {reason_text}' if reason_text else ''}"
+                else:
+                    detail_text = str(exc) or exc.__class__.__name__
+                fatal_issue = (current, status_code, detail_text)
+            if status_code in WEB_CRAWL_SUPPRESS_LOG_STATUS:
+                dprint(f"Crawl suppressed {status_code} for {current}: {exc}")
+            else:
+                clean_log(f"Crawl skipped {current}: {exc}", "⚠️", show_always=False)
             continue
         except Exception as exc:
             clean_log(f"Crawl error fetching {current}: {exc}", "⚠️", show_always=False)
@@ -1742,11 +3369,28 @@ def _crawl_website(start_url: str, max_pages: int = WEB_CRAWL_MAX_PAGES) -> Tupl
                 else:
                     queue_urls.append(joined)
 
+    if not pages and fatal_issue is not None:
+        failed_url, _failed_status, failed_detail = fatal_issue
+        contact_records.append({
+            "type": "Error",
+            "value": failed_detail,
+            "source": failed_url,
+            "title": "Crawl start failure",
+        })
+
     return pages, contact_records, contact_page_info
 
 
 def _format_crawl_results(start_url: str, pages: List[Dict[str, str]], contacts: List[Dict[str, str]], contact_page: Optional[Dict[str, str]]) -> str:
     if not pages:
+        error_entry = next((c for c in contacts if (c.get("type") or "").lower() == "error"), None)
+        if error_entry:
+            parsed = urllib.parse.urlparse(start_url)
+            host = parsed.netloc or start_url
+            detail = (error_entry.get("value") or error_entry.get("title") or "unknown error").strip()
+            if not detail:
+                detail = "unknown error"
+            return f"⚠️ Couldn't crawl {host}: {detail}"
         return f"🕸️ Crawl of {start_url} returned no pages."
 
     parsed = urllib.parse.urlparse(start_url)
@@ -1921,7 +3565,9 @@ def _fetch_wikipedia_article(topic: str, max_chars: int = WIKI_MAX_CHARS) -> Dic
         "title": title,
         "summary": summary,
         "extract": extract,
+        "content": extract,
         "url": canonical_url,
+        "source": canonical_url,
     }
 
 
@@ -2117,7 +3763,23 @@ def _sender_key(sender_id: Any) -> str:
 DEBUG_ENABLED = bool(config.get("debug", False))
 CLEAN_LOGS = bool(config.get("clean_logs", True))  # Enable emoji-enhanced clean logging by default
 AI_PROVIDER = config.get("ai_provider", "ollama").lower()
+if AI_PROVIDER != "ollama":
+    clean_log(
+        f"AI provider '{AI_PROVIDER}' overridden to Ollama (dashboard only supports Ollama).",
+        "🦙",
+        show_always=True,
+        rate_limit=False,
+    )
+AI_PROVIDER = "ollama"
+if config.get("ai_provider") != "ollama":
+    config["ai_provider"] = "ollama"
 SYSTEM_PROMPT = config.get("system_prompt", "You are a helpful assistant responding to mesh network chats.")
+
+PAUL_CORE_PROMPT = (
+    "You carry the posture of the apostle Paul: become all things to all people while staying rooted in the Nicene Creed. "
+    "If a user invites a faith conversation, humbly articulate the hope of salvation by grace through faith in Jesus Christ. "
+    "Never force the topic; respond with gentleness, respect, and genuine curiosity in every exchange."
+)
 OLLAMA_URL = config.get("ollama_url", "http://localhost:11434/api/generate")
 OLLAMA_MODEL = config.get("ollama_model", "llama3.2:1b")
 OLLAMA_TIMEOUT = config.get("ollama_timeout", 120)
@@ -2137,6 +3799,14 @@ try:
     OLLAMA_MAX_MESSAGES = int(config.get("ollama_max_messages", 20))
 except (ValueError, TypeError):
     OLLAMA_MAX_MESSAGES = 20
+
+# AI chill mode (overload guard for Ollama intake)
+CHILL_MODE_ENABLED = bool(config.get("ai_chill_mode", False))
+try:
+    CHILL_QUEUE_LIMIT = int(config.get("ai_chill_queue_limit", 5))
+except (ValueError, TypeError):
+    CHILL_QUEUE_LIMIT = 5
+CHILL_QUEUE_LIMIT = max(1, CHILL_QUEUE_LIMIT)
 try:
     MAIL_SEARCH_TIMEOUT = int(config.get("mail_search_timeout", 120))
 except (ValueError, TypeError):
@@ -2154,6 +3824,13 @@ except (ValueError, TypeError):
 MAIL_SEARCH_NUM_CTX = max(1024, min(MAIL_SEARCH_NUM_CTX, OLLAMA_NUM_CTX))
 
 try:
+    NETWORK_CAPACITY_PER_HOUR = float(config.get("network_capacity_messages_per_hour", 1200))
+except (ValueError, TypeError):
+    NETWORK_CAPACITY_PER_HOUR = 1200.0
+if NETWORK_CAPACITY_PER_HOUR < 0:
+    NETWORK_CAPACITY_PER_HOUR = 0.0
+
+try:
     MAILBOX_MAX_MESSAGES = int(config.get("mailbox_max_messages", 10))
 except (ValueError, TypeError):
     MAILBOX_MAX_MESSAGES = 10
@@ -2167,10 +3844,11 @@ except (ValueError, TypeError):
 MAIL_FOLLOW_UP_DELAY = max(0.0, MAIL_FOLLOW_UP_DELAY)
 
 MAIL_NOTIFY_ENABLED = bool(config.get("mail_notify_enabled", True))
+MAIL_NOTIFY_REMINDERS_ENABLED = bool(config.get("mail_notify_reminders_enabled", True))
 try:
-    MAIL_NOTIFY_REMINDER_HOURS = float(config.get("mail_notify_reminder_hours", 3.0))
+    MAIL_NOTIFY_REMINDER_HOURS = float(config.get("mail_notify_reminder_hours", 1.0))
 except (ValueError, TypeError):
-    MAIL_NOTIFY_REMINDER_HOURS = 3.0
+    MAIL_NOTIFY_REMINDER_HOURS = 1.0
 MAIL_NOTIFY_REMINDER_HOURS = max(0.1, MAIL_NOTIFY_REMINDER_HOURS)
 try:
     MAIL_NOTIFY_EXPIRY_HOURS = float(config.get("mail_notify_expiry_hours", 72.0))
@@ -2178,15 +3856,24 @@ except (ValueError, TypeError):
     MAIL_NOTIFY_EXPIRY_HOURS = 72.0
 MAIL_NOTIFY_EXPIRY_HOURS = max(MAIL_NOTIFY_REMINDER_HOURS, MAIL_NOTIFY_EXPIRY_HOURS)
 try:
-    MAIL_NOTIFY_MAX_REMINDERS = int(config.get(
-        "mail_notify_max_reminders",
-        max(1, int(MAIL_NOTIFY_EXPIRY_HOURS // MAIL_NOTIFY_REMINDER_HOURS)),
-    ))
+    MAIL_NOTIFY_MAX_REMINDERS = int(config.get("mail_notify_max_reminders", 3))
 except (ValueError, TypeError):
-    MAIL_NOTIFY_MAX_REMINDERS = max(1, int(MAIL_NOTIFY_EXPIRY_HOURS // MAIL_NOTIFY_REMINDER_HOURS))
-MAIL_NOTIFY_MAX_REMINDERS = max(1, MAIL_NOTIFY_MAX_REMINDERS)
+    MAIL_NOTIFY_MAX_REMINDERS = 3
+MAIL_NOTIFY_MAX_REMINDERS = max(0, MAIL_NOTIFY_MAX_REMINDERS)
 MAIL_NOTIFY_INCLUDE_SELF = bool(config.get("mail_notify_include_self", False))
 MAIL_NOTIFY_HEARTBEAT_ONLY = bool(config.get("mail_notify_heartbeat_only", True))
+MAIL_NOTIFY_QUIET_HOURS_ENABLED = bool(config.get("mail_notify_quiet_hours_enabled", True))
+
+try:
+    MAIL_QUIET_START_HOUR = int(config.get("mail_quiet_start_hour", config.get("notify_active_end_hour", 20)))
+except (ValueError, TypeError):
+    MAIL_QUIET_START_HOUR = int(config.get("notify_active_end_hour", 20) or 0)
+try:
+    MAIL_QUIET_END_HOUR = int(config.get("mail_quiet_end_hour", config.get("notify_active_start_hour", 8)))
+except (ValueError, TypeError):
+    MAIL_QUIET_END_HOUR = int(config.get("notify_active_start_hour", 8) or 0)
+MAIL_QUIET_START_HOUR = MAIL_QUIET_START_HOUR % 24
+MAIL_QUIET_END_HOUR = MAIL_QUIET_END_HOUR % 24
 
 MAIL_NOTIFY_REMINDER_SECONDS = MAIL_NOTIFY_REMINDER_HOURS * 3600.0
 MAIL_NOTIFY_EXPIRY_SECONDS = MAIL_NOTIFY_EXPIRY_HOURS * 3600.0
@@ -2257,6 +3944,39 @@ def check_send_rate_limit() -> bool:
         _SEND_RATE_EVENTS.append(now)
     return True
 
+# -----------------------------
+# Resend (No Ack) configuration
+# -----------------------------
+RESEND_ENABLED = bool(config.get("resend_enabled", True))
+try:
+    RESEND_USAGE_THRESHOLD_PERCENT = float(config.get("resend_usage_threshold_percent", 5.0))
+except (TypeError, ValueError):
+    RESEND_USAGE_THRESHOLD_PERCENT = 5.0
+RESEND_DM_ONLY = bool(config.get("resend_dm_only", True))
+RESEND_BROADCAST_ENABLED = bool(config.get("resend_broadcast_enabled", False))
+try:
+    RESEND_SYSTEM_ATTEMPTS = int(config.get("resend_system_attempts", 3))
+except (TypeError, ValueError):
+    RESEND_SYSTEM_ATTEMPTS = 3
+try:
+    RESEND_SYSTEM_INTERVAL = float(config.get("resend_system_interval_seconds", 15))
+except (TypeError, ValueError):
+    RESEND_SYSTEM_INTERVAL = 15.0
+try:
+    RESEND_USER_ATTEMPTS = int(config.get("resend_user_attempts", 3))
+except (TypeError, ValueError):
+    RESEND_USER_ATTEMPTS = 3
+try:
+    RESEND_USER_INTERVAL = float(config.get("resend_user_interval_seconds", 15))
+except (TypeError, ValueError):
+    RESEND_USER_INTERVAL = 15.0
+try:
+    RESEND_JITTER_SECONDS = float(config.get("resend_jitter_seconds", 8.0))
+except (TypeError, ValueError):
+    RESEND_JITTER_SECONDS = 8.0
+RESEND_SUFFIX_ENABLED = bool(config.get("resend_suffix_enabled", True))
+RESEND_TELEMETRY_ENABLED = bool(config.get("resend_telemetry_enabled", True))
+
 MAIL_MANAGER = MailManager(
     store_path="mesh_mailboxes.json",
     security_path=MAIL_SECURITY_FILE,
@@ -2270,11 +3990,16 @@ MAIL_MANAGER = MailManager(
     message_limit=MAILBOX_MAX_MESSAGES,
     follow_up_delay=MAIL_FOLLOW_UP_DELAY,
     notify_enabled=MAIL_NOTIFY_ENABLED,
+    reminders_enabled=MAIL_NOTIFY_REMINDERS_ENABLED and MAIL_NOTIFY_MAX_REMINDERS > 0,
     reminder_interval_seconds=MAIL_NOTIFY_REMINDER_SECONDS,
     reminder_expiry_seconds=MAIL_NOTIFY_EXPIRY_SECONDS,
     reminder_max_count=MAIL_NOTIFY_MAX_REMINDERS,
     include_self_notifications=MAIL_NOTIFY_INCLUDE_SELF,
     heartbeat_only=MAIL_NOTIFY_HEARTBEAT_ONLY,
+    quiet_hours_enabled=MAIL_NOTIFY_QUIET_HOURS_ENABLED,
+    quiet_start_hour=NOTIFY_ACTIVE_START_HOUR,
+    quiet_end_hour=NOTIFY_ACTIVE_END_HOUR,
+    stats=STATS,
 )
 
 GAME_MANAGER = GameManager(
@@ -2284,6 +4009,7 @@ GAME_MANAGER = GameManager(
     choose_model=MAIL_SEARCH_MODEL,
     choose_timeout=MAIL_SEARCH_TIMEOUT,
     wordladder_model=MAIL_SEARCH_MODEL,
+    stats=STATS,
 )
 
 
@@ -2309,6 +4035,8 @@ if not isinstance(AI_PERSONALITIES, list) or not AI_PERSONALITIES:
         {"id": "mechanic", "name": "Mechanic", "emoji": "🛠️", "aliases": ["gangster"], "description": "", "prompt": "Speak with hands-on fixer energy—practical swagger, loyal crew vibes, and grounded guidance. Keep replies concise yet complete."},
         {"id": "hippie", "name": "Hippie", "emoji": "🌈", "aliases": [], "description": "", "prompt": "Share mellow, peace-first guidance with gentle optimism and communal spirit. Keep replies concise yet complete."},
         {"id": "millennial", "name": "Millennial", "emoji": "📱", "aliases": [], "description": "", "prompt": "Answer with upbeat, meme-aware millennial energy—empathetic, tech-savvy, and practical. Keep replies concise yet complete."},
+        {"id": "ebonics", "name": "Ebonics", "emoji": "🎶", "aliases": ["aave"], "description": "", "prompt": "Answer in warm, confident African American Vernacular English—laid-back, community-first energy, mixing slang naturally while staying respectful and clear. Keep replies concise yet complete."},
+        {"id": "bard", "name": "Shakespeare", "emoji": "🪶", "aliases": ["shakespeare", "the_bard"], "description": "", "prompt": "Speak in the style of William Shakespeare—lyrical phrasing, rich metaphor, and gentle humor. Keep replies concise yet complete."},
     ]
 
 AI_PERSONALITY_MAP: Dict[str, Dict[str, str]] = {}
@@ -2358,8 +4086,21 @@ if DEFAULT_PERSONALITY_ID not in AI_PERSONALITY_MAP:
         DEFAULT_PERSONALITY_ID = next(iter(AI_PERSONALITY_MAP), None)
 
 USER_AI_SETTINGS_FILE = config.get("user_ai_settings_file", "user_ai_settings.json")
+USER_LANGUAGE_FILE = config.get("user_language_file", "data/user_languages.json")
 USER_AI_SETTINGS_LOCK = threading.Lock()
 USER_AI_SETTINGS: Dict[str, Dict[str, str]] = {}
+
+
+def _ensure_json_file(path: str, default_payload: Dict[str, Any]) -> None:
+    if os.path.exists(path):
+        return
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    write_atomic(path, json.dumps(default_payload, indent=2, sort_keys=True))
+
+
+_ensure_json_file(USER_LANGUAGE_FILE, {})
 
 
 def _canonical_personality_id(candidate: Optional[str]) -> Optional[str]:
@@ -2456,6 +4197,7 @@ def _snapshot_user_ai_settings() -> Dict[str, Dict[str, str]]:
 def _get_user_ai_preferences(sender_key: Optional[str]) -> Dict[str, Optional[str]]:
     persona_id = _default_personality_id()
     prompt_override: Optional[str] = None
+    clear_override = False
     if sender_key:
         with USER_AI_SETTINGS_LOCK:
             entry = USER_AI_SETTINGS.get(sender_key)
@@ -2463,10 +4205,13 @@ def _get_user_ai_preferences(sender_key: Optional[str]) -> Dict[str, Optional[st
                 stored_persona = _canonical_personality_id(entry.get("personality_id"))
                 if stored_persona:
                     persona_id = stored_persona
-                prompt_override = _sanitize_prompt_text(entry.get("prompt_override"))
+                if entry.get("prompt_override"):
+                    clear_override = True
+    if clear_override and sender_key:
+        _set_user_prompt_override(sender_key, None)
     return {
         "personality_id": persona_id,
-        "prompt_override": prompt_override,
+        "prompt_override": None,
     }
 
 
@@ -2480,7 +4225,73 @@ def _set_user_personality(sender_key: str, persona_id: str) -> bool:
         USER_AI_SETTINGS[sender_key] = entry
         snapshot = _snapshot_user_ai_settings()
     _save_user_ai_settings_to_disk(snapshot)
-    return True
+
+# -----------------------------
+# User access (mute/block) storage
+# -----------------------------
+USER_ACCESS_FILE = config.get("user_access_file", "data/user_access.json")
+USER_ACCESS_LOCK = threading.Lock()
+USER_ACCESS: Dict[str, Dict[str, bool]] = {"muted": {}, "blocked": {}}
+
+def _load_user_access_from_disk() -> Dict[str, Dict[str, bool]]:
+    try:
+        data = safe_load_json(USER_ACCESS_FILE, {})
+        if not isinstance(data, dict):
+            return {"muted": {}, "blocked": {}}
+        muted = data.get("muted") if isinstance(data.get("muted"), dict) else {}
+        blocked = data.get("blocked") if isinstance(data.get("blocked"), dict) else {}
+        # normalize keys to strings
+        return {
+            "muted": {str(k): bool(v) for k, v in muted.items()},
+            "blocked": {str(k): bool(v) for k, v in blocked.items()},
+        }
+    except Exception:
+        return {"muted": {}, "blocked": {}}
+
+def _save_user_access_to_disk(data: Dict[str, Dict[str, bool]]) -> None:
+    try:
+        directory = os.path.dirname(USER_ACCESS_FILE)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp = f"{USER_ACCESS_FILE}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, USER_ACCESS_FILE)
+    except Exception:
+        pass
+
+def _user_access_init() -> None:
+    global USER_ACCESS
+    with USER_ACCESS_LOCK:
+        USER_ACCESS = _load_user_access_from_disk()
+
+def _is_user_blocked(sender_key: Optional[str]) -> bool:
+    if not sender_key:
+        return False
+    with USER_ACCESS_LOCK:
+        return bool(USER_ACCESS.get("blocked", {}).get(str(sender_key)))
+
+def _is_user_muted(sender_key: Optional[str]) -> bool:
+    if not sender_key:
+        return False
+    with USER_ACCESS_LOCK:
+        return bool(USER_ACCESS.get("muted", {}).get(str(sender_key)))
+
+def _set_user_muted(sender_key: str, value: bool) -> None:
+    if not sender_key:
+        return
+    with USER_ACCESS_LOCK:
+        USER_ACCESS.setdefault("muted", {})[str(sender_key)] = bool(value)
+        _save_user_access_to_disk(USER_ACCESS)
+
+def _set_user_blocked(sender_key: str, value: bool) -> None:
+    if not sender_key:
+        return
+    with USER_ACCESS_LOCK:
+        USER_ACCESS.setdefault("blocked", {})[str(sender_key)] = bool(value)
+        _save_user_access_to_disk(USER_ACCESS)
+
+_user_access_init()
 
 
 def _clear_user_personality(sender_key: str) -> None:
@@ -2522,15 +4333,13 @@ def _reset_user_personality(sender_key: str) -> None:
 
 def build_system_prompt_for_sender(sender_id: Any) -> str:
     base = _sanitize_prompt_text(SYSTEM_PROMPT) or "You are a helpful assistant responding to mesh network chats."
-    segments = [base]
+    segments = [PAUL_CORE_PROMPT, base]
     persona_id: Optional[str] = None
-    prompt_override: Optional[str] = None
     web_context: List[str] = []
     if sender_id is not None:
         sender_key = _safe_sender_key(sender_id)
         prefs = _get_user_ai_preferences(sender_key)
         persona_id = prefs.get("personality_id")
-        prompt_override = prefs.get("prompt_override")
         web_context = _get_web_context(sender_key)
     else:
         persona_id = _default_personality_id()
@@ -2538,8 +4347,6 @@ def build_system_prompt_for_sender(sender_id: Any) -> str:
         persona_prompt = _sanitize_prompt_text(AI_PERSONALITY_MAP[persona_id].get("prompt"))
         if persona_prompt:
             segments.append(persona_prompt)
-    if prompt_override:
-        segments.append(prompt_override)
     if web_context:
         segments.append("Recent web findings:\n" + "\n".join(web_context))
     joined = "\n\n".join(part for part in segments if part)
@@ -2565,7 +4372,6 @@ def describe_personality(persona_id: str) -> Optional[str]:
 def _format_personality_summary(sender_key: Optional[str]) -> str:
     prefs = _get_user_ai_preferences(sender_key)
     persona_id = prefs.get("personality_id")
-    prompt_override = prefs.get("prompt_override")
     persona = AI_PERSONALITY_MAP.get(persona_id) if persona_id else None
     emoji = persona.get("emoji") if persona else "🧠"
     name = persona.get("name") if persona else "Default"
@@ -2573,11 +4379,7 @@ def _format_personality_summary(sender_key: Optional[str]) -> str:
     lines = [f"{emoji} Current personality: {name}" if persona_id else "🧠 Using default personality."]
     if description and persona_id:
         lines.append(description)
-    if prompt_override:
-        lines.append("Custom prompt: active.")
-    else:
-        lines.append("Custom prompt: none.")
-    lines.append("Commands: /vibe prompt <text> | /vibe prompt clear | /vibe reset")
+    lines.append("Commands: /vibe set <name> | /vibe status | /vibe reset")
     lines.append("Send /vibe in a DM to pick a new vibe.")
     return "\n".join(lines)
 
@@ -2608,7 +4410,7 @@ def _start_vibe_menu(sender_key: Optional[str]) -> PendingReply:
         mapping.append(persona_id)
 
     lines.append("Reply with the number to switch vibes, or X to cancel.")
-    lines.append("Extras: /vibe prompt <text>, /vibe prompt clear, /vibe reset.")
+    lines.append("Extras: /vibe status, /vibe set <name>, /vibe reset.")
 
     PENDING_VIBE_SELECTIONS[sender_key] = {
         'ids': mapping,
@@ -3156,16 +4958,17 @@ def _resolve_book_chapters(book: str, preferred_language: str = 'en') -> Tuple[O
     return (lang or preferred_language), chapters
 
 
-def _format_bible_nav_message(text: str) -> str:
-    """Append the navigation hint without forcing a new chunk."""
-    if not text:
+def _format_bible_nav_message(text: str, *, include_hint: bool = True) -> str:
+    """Append navigation hints when space allows."""
+    if not text or not include_hint:
         return text
 
-    suffix_newline = "\n<1,2>"
+    hint = "<1,2> 22>>"
+    suffix_newline = f"\n{hint}"
     if len(text) + len(suffix_newline) <= MAX_CHUNK_SIZE:
         return f"{text}{suffix_newline}"
 
-    suffix_inline = " <1,2>"
+    suffix_inline = f" {hint}"
     if len(text) + len(suffix_inline) <= MAX_CHUNK_SIZE:
         return f"{text}{suffix_inline}"
 
@@ -3471,6 +5274,44 @@ COMMAND_DELAY_OVERRIDES = {
     "/wipe command": 1.0,
     "/wipe confirm": 1.0,
 }
+
+
+def _random_text_entry(entries: Sequence[Any]) -> Optional[str]:
+    if not entries:
+        return None
+    choice = random.choice(entries)
+    if isinstance(choice, dict):
+        for key in ("text", "joke", "fact", "quote", "line"):
+            value = choice.get(key)
+            if value:
+                return str(value).strip()
+        return str(choice).strip()
+    return str(choice).strip() if choice else None
+
+
+def _random_chuck_fact(language: Optional[str]) -> Optional[str]:
+    lang = (language or "").lower()
+    pools = []
+    if lang.startswith('es') and CHUCK_NORRIS_FACTS_ES:
+        pools.append(CHUCK_NORRIS_FACTS_ES)
+    pools.append(CHUCK_NORRIS_FACTS)
+    for pool in pools:
+        fact = _random_text_entry(pool)
+        if fact:
+            return fact
+    return None
+
+
+def _random_blond_joke(language: Optional[str]) -> Optional[str]:
+    return _random_text_entry(BLOND_JOKES)
+
+
+def _random_yo_momma_joke(language: Optional[str]) -> Optional[str]:
+    return _random_text_entry(YO_MOMMA_JOKES)
+
+
+def _random_el_paso_fact() -> Optional[str]:
+    return _random_text_entry(EL_PASO_FACTS)
 
 
 def _command_delay(reason: str, delay: Optional[float] = None) -> None:
@@ -3818,20 +5659,8 @@ def _format_meshtastic_context(chunks: List[Dict[str, Any]]) -> str:
     return "\n\n".join(lines)
 
 COMMAND_ALIASES: Dict[str, Dict[str, Any]] = {
-    "/compose": {"canonical": "/write", "languages": ["en"]},
     "/offline": {"canonical": "/offline", "languages": ["en"]},
-    "/draft": {"canonical": "/write", "languages": ["en"]},
-    "/hypeme": {"canonical": "/hype", "languages": ["en"]},
-    "/pumpup": {"canonical": "/hype", "languages": ["en"]},
-    "/decline": {"canonical": "/sayno", "languages": ["en"]},
-    "/politeno": {"canonical": "/sayno", "languages": ["en"]},
-    "/apologize": {"canonical": "/apology", "languages": ["en"]},
-    "/sorrynote": {"canonical": "/apology", "languages": ["en"]},
-    "/breakupnote": {"canonical": "/breakup", "languages": ["en"]},
-    "/resign": {"canonical": "/quitjob", "languages": ["en"]},
-    "/resignation": {"canonical": "/quitjob", "languages": ["en"]},
-    "/celebrate": {"canonical": "/congrats", "languages": ["en"]},
-    "/thanks": {"canonical": "/thankyou", "languages": ["en"]},
+    "/checkmail": {"canonical": "/c", "languages": ["en"]},
     "/momma": {"canonical": "/yomomma", "languages": ["en"]},
     "/mommajoke": {"canonical": "/yomomma", "languages": ["en"]},
     "/yomommajoke": {"canonical": "/yomomma", "languages": ["en"]},
@@ -3841,7 +5670,6 @@ COMMAND_ALIASES: Dict[str, Dict[str, Any]] = {
     "/mathtrivia": {"canonical": "/mathquiz", "languages": ["en"]},
     "/electric": {"canonical": "/electricalquiz", "languages": ["en"]},
     "/electrical": {"canonical": "/electricalquiz", "languages": ["en"]},
-    "/electricaltraining": {"canonical": "/electricaltrainer", "languages": ["en"]},
     "/wikipedia": {"canonical": "/wiki", "languages": ["en", "es"]},
     "/buscar": {"canonical": "/web", "languages": ["es"]},
     "/recherche": {"canonical": "/web", "languages": ["fr"]},
@@ -3852,6 +5680,7 @@ COMMAND_ALIASES: Dict[str, Dict[str, Any]] = {
     "/offlinewiki": {"canonical": "/offline", "languages": ["en"]},
     "/wikioffline": {"canonical": "/offline", "languages": ["en"]},
     "/drudgereport": {"canonical": "/drudge", "languages": ["en"]},
+    "/chuck": {"canonical": "/chucknorris", "languages": ["en"]},
     "/elp": {"canonical": "/elpaso", "languages": ["en"]},
     "/elpasofact": {"canonical": "/elpaso", "languages": ["en"]},
     "/elpasofacts": {"canonical": "/elpaso", "languages": ["en"]},
@@ -3879,18 +5708,6 @@ COMMAND_ALIASES: Dict[str, Dict[str, Any]] = {
     "/jokes": {"canonical": "/jokes", "languages": ["en"]},
     "/joke": {"canonical": "/jokes", "languages": ["en"]},
     "/funnies": {"canonical": "/jokes", "languages": ["en"]},
-    "/survival": {"canonical": "/survival", "languages": ["en"]},
-    "/survivaltips": {"canonical": "/survival", "languages": ["en"]},
-    "/desert": {"canonical": "/survival_desert", "languages": ["en"]},
-    "/urban": {"canonical": "/survival_urban", "languages": ["en"]},
-    "/city": {"canonical": "/survival_urban", "languages": ["en"]},
-    "/jungle": {"canonical": "/survival_jungle", "languages": ["en"]},
-    "/woodland": {"canonical": "/survival_woodland", "languages": ["en"]},
-    "/forest": {"canonical": "/survival_woodland", "languages": ["en"]},
-    "/winter": {"canonical": "/survival_winter", "languages": ["en"]},
-    "/cold": {"canonical": "/survival_winter", "languages": ["en"]},
-    "/medical": {"canonical": "/survival_medical", "languages": ["en"]},
-    "/firstaid": {"canonical": "/survival_medical", "languages": ["en"]},
     "/quiz": {"canonical": "/trivia", "languages": ["en"]},
     "/triviagame": {"canonical": "/trivia", "languages": ["en"]},
     "/generaltrivia": {"canonical": "/trivia", "languages": ["en"]},
@@ -3898,15 +5715,6 @@ COMMAND_ALIASES: Dict[str, Dict[str, Any]] = {
     "/scripturetrivia": {"canonical": "/bibletrivia", "languages": ["en"]},
     "/disasterquiz": {"canonical": "/disastertrivia", "languages": ["en"]},
     "/prepquiz": {"canonical": "/disastertrivia", "languages": ["en"]},
-    "/morsetrainer": {"canonical": "/morsecodetrainer", "languages": ["en"]},
-    "/morsecourse": {"canonical": "/morsecodetrainer", "languages": ["en"]},
-    "/hurricaneprep": {"canonical": "/hurricanetrainer", "languages": ["en"]},
-    "/tornadoprep": {"canonical": "/tornadotrainer", "languages": ["en"]},
-    "/radiotrainer": {"canonical": "/radioprocedurestrainer", "languages": ["en"]},
-    "/navtrainer": {"canonical": "/navigationtrainer", "languages": ["en"]},
-    "/boattrainer": {"canonical": "/boatingtrainer", "languages": ["en"]},
-    "/boatprep": {"canonical": "/boatingtrainer", "languages": ["en"]},
-    "/emergencywellness": {"canonical": "/wellnesstrainer", "languages": ["en"]},
 
     # Spanish
     "/ayuda": {"canonical": "/help", "languages": ["es"]},
@@ -3924,7 +5732,6 @@ COMMAND_ALIASES: Dict[str, Dict[str, Any]] = {
     "/bibliahelp": {"canonical": "/biblehelp", "languages": ["es"]},
     "/datoelpaso": {"canonical": "/elpaso", "languages": ["es"]},
     "/hechoelpaso": {"canonical": "/elpaso", "languages": ["es"]},
-    "/emergencia": {"canonical": "/emergency", "languages": ["es"]},
     "/cambiarmensaje": {"canonical": "/changemotd", "languages": ["es"]},
     "/cambiaprompt": {"canonical": "/changeprompt", "languages": ["es"]},
     "/verprompt": {"canonical": "/showprompt", "languages": ["es"]},
@@ -3936,44 +5743,15 @@ COMMAND_ALIASES: Dict[str, Dict[str, Any]] = {
     "/estadomesh": {"canonical": "/meshinfo", "languages": ["es"]},
     "/bromas": {"canonical": "/jokes", "languages": ["es"]},
     "/chistes": {"canonical": "/jokes", "languages": ["es"]},
-    "/supervivencia": {"canonical": "/survival", "languages": ["es"]},
-    "/sobrevivir": {"canonical": "/survival", "languages": ["es"]},
-    "/desierto": {"canonical": "/survival_desert", "languages": ["es"]},
-    "/urbano": {"canonical": "/survival_urban", "languages": ["es"]},
-    "/ciudad": {"canonical": "/survival_urban", "languages": ["es"]},
-    "/selva": {"canonical": "/survival_jungle", "languages": ["es"]},
-    "/jungla": {"canonical": "/survival_jungle", "languages": ["es"]},
-    "/bosque": {"canonical": "/survival_woodland", "languages": ["es"]},
-    "/invierno": {"canonical": "/survival_winter", "languages": ["es"]},
-    "/frio": {"canonical": "/survival_winter", "languages": ["es"]},
-    "/medico": {"canonical": "/survival_medical", "languages": ["es"]},
-    "/primerosauxilios": {"canonical": "/survival_medical", "languages": ["es"]},
     "/triviabiblica": {"canonical": "/bibletrivia", "languages": ["es"]},
     "/triviadesastres": {"canonical": "/disastertrivia", "languages": ["es"]},
     "/triviageneral": {"canonical": "/trivia", "languages": ["es"]},
     "/acertijos": {"canonical": "/trivia", "languages": ["es"]},
-    "/codigomorse": {"canonical": "/morsecodetrainer", "languages": ["es"]},
-    "/entrenadormorse": {"canonical": "/morsecodetrainer", "languages": ["es"]},
-    "/huracan": {"canonical": "/hurricanetrainer", "languages": ["es"]},
-    "/huracanes": {"canonical": "/hurricanetrainer", "languages": ["es"]},
-    "/entrenadorhuracan": {"canonical": "/hurricanetrainer", "languages": ["es"]},
-    "/tornado": {"canonical": "/tornadotrainer", "languages": ["es"]},
-    "/entrenadortornado": {"canonical": "/tornadotrainer", "languages": ["es"]},
-    "/radiocomunicacion": {"canonical": "/radioprocedurestrainer", "languages": ["es"]},
-    "/procedimientosradio": {"canonical": "/radioprocedurestrainer", "languages": ["es"]},
-    "/navegacion": {"canonical": "/navigationtrainer", "languages": ["es"]},
-    "/sinbrujula": {"canonical": "/navigationtrainer", "languages": ["es"]},
-    "/barco": {"canonical": "/boatingtrainer", "languages": ["es"]},
-    "/seguridadbarco": {"canonical": "/boatingtrainer", "languages": ["es"]},
-    "/bienestar": {"canonical": "/wellnesstrainer", "languages": ["es"]},
-    "/mascotas": {"canonical": "/wellnesstrainer", "languages": ["es"]},
-    "/bienestaremergencia": {"canonical": "/wellnesstrainer", "languages": ["es"]},
     "/matematicas": {"canonical": "/mathquiz", "languages": ["es"]},
     "/matemáticas": {"canonical": "/mathquiz", "languages": ["es"]},
     "/quizmatematico": {"canonical": "/mathquiz", "languages": ["es"]},
     "/electricidad": {"canonical": "/electricalquiz", "languages": ["es"]},
     "/triviaelectrica": {"canonical": "/electricalquiz", "languages": ["es"]},
-    "/entrenadorelectrico": {"canonical": "/electricaltrainer", "languages": ["es"]},
 
     # French
     "/aide": {"canonical": "/help", "languages": ["fr"]},
@@ -3983,7 +5761,6 @@ COMMAND_ALIASES: Dict[str, Dict[str, Any]] = {
     "/verset": {"canonical": "/bible", "languages": ["fr"]},
     "/blaguechuck": {"canonical": "/chucknorris", "languages": ["fr"]},
     "/faitelpaso": {"canonical": "/elpaso", "languages": ["fr"]},
-    "/urgence": {"canonical": "/emergency", "languages": ["fr"]},
     "/modifiermotd": {"canonical": "/changemotd", "languages": ["fr"]},
     "/modifierprompt": {"canonical": "/changeprompt", "languages": ["fr"]},
     "/afficherprompt": {"canonical": "/showprompt", "languages": ["fr"]},
@@ -3999,7 +5776,6 @@ COMMAND_ALIASES: Dict[str, Dict[str, Any]] = {
     "/bibelvers": {"canonical": "/bible", "languages": ["de"]},
     "/chuckwitz": {"canonical": "/chucknorris", "languages": ["de"]},
     "/elpasofakt": {"canonical": "/elpaso", "languages": ["de"]},
-    "/notfall": {"canonical": "/emergency", "languages": ["de"]},
     "/motdaendern": {"canonical": "/changemotd", "languages": ["de"]},
     "/promptaendern": {"canonical": "/changeprompt", "languages": ["de"]},
     "/promptanzeigen": {"canonical": "/showprompt", "languages": ["de"]},
@@ -4011,7 +5787,6 @@ COMMAND_ALIASES: Dict[str, Dict[str, Any]] = {
     "/tianqi": {"canonical": "/weather", "languages": ["zh"]},
     "/shengjing": {"canonical": "/bible", "languages": ["zh"]},
     "/elpasoshishi": {"canonical": "/elpaso", "languages": ["zh"]},
-    "/jinji": {"canonical": "/emergency", "languages": ["zh"]},
     "/xiugaixiaoxi": {"canonical": "/changemotd", "languages": ["zh"]},
     "/xiugaiprompt": {"canonical": "/changeprompt", "languages": ["zh"]},
     "/chakantishi": {"canonical": "/showprompt", "languages": ["zh"]},
@@ -4026,7 +5801,6 @@ COMMAND_ALIASES: Dict[str, Dict[str, Any]] = {
     "/wiadomoscdnia": {"canonical": "/motd", "languages": ["pl"]},
     "/werset": {"canonical": "/bible", "languages": ["pl"]},
     "/faktelpaso": {"canonical": "/elpaso", "languages": ["pl", "uk"]},
-    "/naglyprzypadek": {"canonical": "/emergency", "languages": ["pl"]},
     "/zmienwiadomosc": {"canonical": "/changemotd", "languages": ["pl"]},
     "/zmienprompt": {"canonical": "/changeprompt", "languages": ["pl"]},
     "/naprawprompt": {"canonical": "/changeprompt", "languages": ["pl"]},
@@ -4042,7 +5816,6 @@ COMMAND_ALIASES: Dict[str, Dict[str, Any]] = {
     "/biblija": {"canonical": "/bible", "languages": ["hr"]},
     "/stih": {"canonical": "/bible", "languages": ["hr"]},
     "/cinjenicaelpaso": {"canonical": "/elpaso", "languages": ["hr"]},
-    "/hitno": {"canonical": "/emergency", "languages": ["hr"]},
     "/promijeniporuku": {"canonical": "/changemotd", "languages": ["hr"]},
     "/promijeniprompt": {"canonical": "/changeprompt", "languages": ["hr"]},
     "/popraviprompt": {"canonical": "/changeprompt", "languages": ["hr"]},
@@ -4057,7 +5830,6 @@ COMMAND_ALIASES: Dict[str, Dict[str, Any]] = {
     "/povidomlennia_dnya": {"canonical": "/motd", "languages": ["uk"]},
     "/bibliya": {"canonical": "/bible", "languages": ["uk"]},
     "/virsh": {"canonical": "/bible", "languages": ["uk"]},
-    "/nadzvychayno": {"canonical": "/emergency", "languages": ["uk"]},
     "/zminypovidomlennia": {"canonical": "/changemotd", "languages": ["uk"]},
     "/zminyprompt": {"canonical": "/changeprompt", "languages": ["uk"]},
     "/vyprompt": {"canonical": "/changeprompt", "languages": ["uk"]},
@@ -4073,7 +5845,6 @@ COMMAND_ALIASES: Dict[str, Dict[str, Any]] = {
     "/ujumbe_wa_siku": {"canonical": "/motd", "languages": ["sw"]},
     "/mstari": {"canonical": "/bible", "languages": ["sw"]},
     "/fakielpaso": {"canonical": "/elpaso", "languages": ["sw"]},
-    "/dharaura": {"canonical": "/emergency", "languages": ["sw"]},
     "/badilisha_ujumbe": {"canonical": "/changemotd", "languages": ["sw"]},
     "/badilisha_prompt": {"canonical": "/changeprompt", "languages": ["sw"]},
     "/rekebisha_prompt": {"canonical": "/changeprompt", "languages": ["sw"]},
@@ -4082,20 +5853,106 @@ COMMAND_ALIASES: Dict[str, Dict[str, Any]] = {
     "/tumasms": {"canonical": "/sms", "languages": ["sw"]},
 }
 
+COMMAND_SUMMARIES: Dict[str, str] = {
+    "/about": "Shares version info and connected radio details.",
+    "/help": "Lists top commands with short usage notes.",
+    "/menu": "Displays a compact menu of frequently used commands.",
+    "/whereami": "Reports the node's mesh ID, channel, and location notes.",
+    "/test": "Performs a quick self-check so you know the bot is responsive.",
+    "/motd": "Shows the current message of the day announcement.",
+    "/meshinfo": "Summarizes mesh health, channels, and node counts.",
+    "/meshtastic": "Provides Meshtastic firmware tips and radio basics.",
+    "/offline": "Delivers offline wiki and knowledge base snippets.",
+    "/stop": "Stops any in-flight AI reply and silences the queue.",
+    "/exit": "Shuts down Mesh-Master after saving state (admin only).",
+    "/save": "Saves the latest DM or chat thread so you can recall it later.",
+    "/recall": "Reloads a previously saved conversation transcript.",
+    "/reset": "Clears cached AI context for a clean conversation restart.",
+    "/data": "Manages or inspects data capsules saved by /save and other tools.",
+    "/ai": "Routes the next prompt straight to the AI assistant.",
+    "/bot": "Alias for interacting with the AI assistant.",
+    "/vibe": "Adjusts the AI tone without editing the full prompt.",
+    "/aipersonality": "Lists and selects available AI personas.",
+    "/chathistory": "Summarizes the latest chatter for the current channel.",
+    "/changeprompt": "Updates the system prompt that guides the AI.",
+    "/showprompt": "Displays the current system prompt for review.",
+    "/printprompt": "Prints the active prompt with minimal formatting.",
+    "/changemotd": "Updates the global message of the day.",
+    "/aisettings": "Shows key AI configuration values at a glance.",
+    "/mail": "Compose and send a Mesh Mail message to another user.",
+    "/m": "Shortcut for composing Mesh Mail.",
+    "/checkmail": "Check your inbox for pending Mesh Mail.",
+    "/c": "Shortcut for checking Mesh Mail.",
+    "/emailhelp": "Explains how Mesh Mail works and available options.",
+    "/wipe": "Clears stored Mesh Mail data (admin caution).",
+    "/bible": "Shares a curated Bible verse with the channel.",
+    "/biblehelp": "Shows usage tips for the Bible verse command.",
+    "/weather": "Fetches the latest weather forecast for your configured location.",
+    "/web": "Performs a live web search when the network allows it.",
+    "/wiki": "Queries Wikipedia for a summary via the AI.",
+    "/drudge": "Returns current Drudge Report headlines.",
+    "/elpaso": "Posts a short historical or local fact about El Paso.",
+    "/games": "Lists available interactive games.",
+    "/blackjack": "Starts a quick blackjack round against the bot.",
+    "/yahtzee": "Rolls dice for a solo Yahtzee game.",
+    "/hangman": "Picks a word for you to guess one letter at a time.",
+    "/wordle": "Runs a five-letter Wordle style puzzle.",
+    "/adventure": "Launches the text adventure storyline.",
+    "/wordladder": "Challenges you to transform words step by step.",
+    "/rps": "Rock-paper-scissors showdown.",
+    "/coinflip": "Flips a virtual coin with emoji flair.",
+    "/cipher": "Provides a cipher puzzle to decode.",
+    "/quizbattle": "Rapid-fire trivia showdown between players.",
+    "/morse": "Practice Morse code with live feedback.",
+    "/jokes": "Grabs a light-hearted joke from the archive.",
+    "/chucknorris": "Classic Chuck Norris joke delivery.",
+    "/blond": "Random blond humor (family friendly).",
+    "/yomomma": "Light-hearted yo momma jokes.",
+    "/alarm": "Set an alarm: /alarm 2:34pm [daily|mm/dd|sunday] [label]",
+    "/timer": "Start a countdown: /timer 10m [label]",
+    "/stopwatch": "Start/stop a stopwatch: /stopwatch start|stop|status",
+}
+
+
+def _command_alias_map() -> Dict[str, List[str]]:
+    alias_map: Dict[str, Set[str]] = defaultdict(set)
+    for alias, meta in COMMAND_ALIASES.items():
+        canonical_raw = meta.get("canonical") if isinstance(meta, dict) else meta
+        canonical = _normalize_command_name(canonical_raw or alias)
+        alias_name = _normalize_command_name(alias)
+        if canonical and alias_name and alias_name != canonical:
+            alias_map[canonical].add(alias_name)
+    # Include dynamic aliases from commands_config
+    dyn = _get_dynamic_command_aliases()
+    for alias, canonical in dyn.items():
+        alias_name = _normalize_command_name(alias)
+        canonical_name = _normalize_command_name(canonical)
+        if alias_name and canonical_name and alias_name != canonical_name:
+            alias_map[canonical_name].add(alias_name)
+    custom_commands = commands_config.get("commands", []) if isinstance(commands_config, dict) else []
+    for entry in custom_commands:
+        if not isinstance(entry, dict):
+            continue
+        canonical = _normalize_command_name(entry.get("command"))
+        aliases = entry.get("aliases")
+        if canonical and isinstance(aliases, (list, tuple)):
+            for alt in aliases:
+                alias_name = _normalize_command_name(alt)
+                if alias_name and alias_name != canonical:
+                    alias_map[canonical].add(alias_name)
+    return {key: sorted(values) for key, values in alias_map.items()}
+
+
 BUILTIN_COMMANDS = {
     "/about",
     "/ai",
     "/bot",
-    "/query",
     "/data",
     "/whereami",
-    "/emergency",
-    "/911",
     "/test",
     "/help",
     "/menu",
     "/offline",
-    "/write",
     "/m",
     "/c",
     "/meshtastic",
@@ -4108,14 +5965,16 @@ BUILTIN_COMMANDS = {
     "/biblehelp",
     "/jokes",
     "/games",
+    "/adventure",
+    "/blackjack",
     "/hangman",
+    "/yahtzee",
     "/wordle",
     "/wordladder",
     "/choose",
     "/rps",
     "/coinflip",
     "/cipher",
-    "/bingo",
     "/quizbattle",
     "/morse",
     "/mathquiz",
@@ -4127,13 +5986,6 @@ BUILTIN_COMMANDS = {
     "/bibletrivia",
     "/disastertrivia",
     "/trivia",
-    "/survival",
-    "/survival_desert",
-    "/survival_urban",
-    "/survival_jungle",
-    "/survival_woodland",
-    "/survival_winter",
-    "/survival_medical",
     "/weather",
     "/motd",
     "/meshinfo",
@@ -4142,14 +5994,6 @@ BUILTIN_COMMANDS = {
     "/elpaso",
     "/blond",
     "/yomomma",
-    "/morsecodetrainer",
-    "/hurricanetrainer",
-    "/tornadotrainer",
-    "/radioprocedurestrainer",
-    "/navigationtrainer",
-    "/boatingtrainer",
-    "/wellnesstrainer",
-    "/electricaltrainer",
     "/changemotd",
     "/changeprompt",
     "/showprompt",
@@ -4159,13 +6003,9 @@ BUILTIN_COMMANDS = {
     "/web",
     "/drudge",
     "/wiki",
-    "/hype",
-    "/sayno",
-    "/apology",
-    "/breakup",
-    "/quitjob",
-    "/congrats",
-    "/thankyou",
+    "/alarm",
+    "/timer",
+    "/stopwatch",
 }
 
 FUZZY_COMMAND_MATCH_THRESHOLD = 0.6
@@ -4182,6 +6022,76 @@ def _normalize_language_code(value: Optional[str]) -> str:
 
 LANGUAGE_SELECTION_CONFIG = config.get("language_selection", "english")
 LANGUAGE_FALLBACK = _normalize_language_code(LANGUAGE_SELECTION_CONFIG)
+
+
+USER_LANGUAGE_LOCK = threading.Lock()
+USER_LANGUAGE_PREFS: Dict[str, str] = {}
+
+
+def _load_user_language_map() -> Dict[str, str]:
+    raw = safe_load_json(USER_LANGUAGE_FILE, {})
+    prefs: Dict[str, str] = {}
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                continue
+            prefs[key] = _normalize_language_code(value)
+    return prefs
+
+
+def _save_user_language_map(snapshot: Dict[str, str]) -> None:
+    directory = os.path.dirname(USER_LANGUAGE_FILE)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    write_atomic(USER_LANGUAGE_FILE, json.dumps(snapshot, indent=2, sort_keys=True))
+
+
+with USER_LANGUAGE_LOCK:
+    USER_LANGUAGE_PREFS.update(_load_user_language_map())
+
+
+def _get_user_language(sender_key: Optional[str]) -> Optional[str]:
+    if not sender_key:
+        return None
+    with USER_LANGUAGE_LOCK:
+        return USER_LANGUAGE_PREFS.get(sender_key)
+
+
+def _set_user_language(sender_key: Optional[str], language: Optional[str]) -> bool:
+    if not sender_key or not language:
+        return False
+    normalized = _normalize_language_code(language)
+    snapshot: Optional[Dict[str, str]] = None
+    with USER_LANGUAGE_LOCK:
+        current = USER_LANGUAGE_PREFS.get(sender_key)
+        if current == normalized:
+            return False
+        USER_LANGUAGE_PREFS[sender_key] = normalized
+        snapshot = dict(USER_LANGUAGE_PREFS)
+    if snapshot is not None:
+        _save_user_language_map(snapshot)
+    return True
+
+
+def _clear_user_language(sender_key: Optional[str]) -> None:
+    if not sender_key:
+        return
+    snapshot: Optional[Dict[str, str]] = None
+    with USER_LANGUAGE_LOCK:
+        if sender_key in USER_LANGUAGE_PREFS:
+            USER_LANGUAGE_PREFS.pop(sender_key, None)
+            snapshot = dict(USER_LANGUAGE_PREFS)
+    if snapshot is not None:
+        _save_user_language_map(snapshot)
+
+
+def _resolve_user_language(language_hint: Optional[str], sender_key: Optional[str]) -> str:
+    if language_hint:
+        return _normalize_language_code(language_hint)
+    pref = _get_user_language(sender_key)
+    if pref:
+        return pref
+    return LANGUAGE_FALLBACK
 
 
 def _preferred_menu_language(language: Optional[str]) -> str:
@@ -4210,6 +6120,19 @@ def _language_display_name(language: Optional[str]) -> str:
     return LANGUAGE_DISPLAY_NAMES.get(lang, lang.capitalize())
 
 
+ONBOARDING_STATE_FILE = config.get("onboarding_state_file", "data/onboarding_state.json")
+
+ONBOARDING_MANAGER = OnboardingManager(
+    state_path=ONBOARDING_STATE_FILE,
+    clean_log=clean_log,
+    mail_manager=MAIL_MANAGER,
+    set_user_language=_set_user_language,
+    get_user_language=_get_user_language,
+    normalize_language=_normalize_language_code,
+    stats=STATS,
+)
+
+
 MENU_DEFINITIONS = {
     "menu": {
         "title": {"en": "Main Menu", "es": "Menú principal"},
@@ -4219,14 +6142,11 @@ MENU_DEFINITIONS = {
                     {"text": {"en": "Mail: /mail • /checkmail • /wipe", "es": "Correo: /mail • /checkmail • /wipe"}},
                     {"text": {"en": "Games: /games • /adventure • /mathquiz", "es": "Juegos: /games • /adventure • /mathquiz"}},
                     {"text": {"en": "DIY quiz: /electricalquiz", "es": "Quiz DIY: /electricalquiz"}},
-                    {"text": {"en": "Write: /write", "es": "Redacción: /write"}},
-                    {"text": {"en": "Web search: /web <query>", "es": "Búsqueda web: /web <consulta>"}},
+                {"text": {"en": "Web search: /web <query>", "es": "Búsqueda web: /web <consulta>"}},
                     {"text": {"en": "Quick info: /help • /biblehelp • /meshtastic • /weather", "es": "Info rápida: /help • /biblehelp • /meshtastic • /weather"}},
                     {"text": {"en": "AI vibe controls: /vibe", "es": "Control de tono IA: /vibe"}},
                     {"text": {"en": "Ops: /motd • /meshinfo", "es": "Operaciones: /motd • /meshinfo"}},
-                    {"text": {"en": "Safety: /survival • /emergency", "es": "Seguridad: /survival • /emergency"}},
-                    {"text": {"en": "Trainers: /electricaltrainer • /wellnesstrainer", "es": "Entrenadores: /electricaltrainer • /wellnesstrainer"}},
-                    {"text": {"en": "Need a box? 📦 /emailhelp", "es": "¿Necesitas buzón? 📦 /emailhelp"}},
+                        {"text": {"en": "Need a box? 📦 /emailhelp", "es": "¿Necesitas buzón? 📦 /emailhelp"}},
                 ]
             }
         ],
@@ -4237,23 +6157,6 @@ MENU_DEFINITIONS = {
             {
                 "items": [
                     {"text": {"en": "/chucknorris • /blond • /yomomma", "es": "/chucknorris • /blond • /yomomma"}},
-                    {"text": {"en": "More laughs: /funfact <topic>", "es": "Más risas: /funfact <tema>"}},
-                ]
-            }
-        ],
-    },
-    "write": {
-        "title": {"en": "Write Helper", "es": "Asistente de redacción"},
-        "sections": [
-            {
-                "items": [
-                    {"command": "/hype <topic>", "description": {"en": "Celebrate something with high-energy praise.", "es": "Celebra algo con ánimo y entusiasmo."}},
-                    {"command": "/sayno", "description": {"en": "Wizard prompts for who to decline and crafts a gracious no.", "es": "Un asistente pide destinatario y redacta un no amable."}},
-                    {"command": "/apology <name>", "description": {"en": "Draft a sincere apology with accountability.", "es": "Redacta una disculpa sincera con responsabilidad."}},
-                    {"command": "/breakup <name>", "description": {"en": "Compose a compassionate yet clear breakup note.", "es": "Redacta un mensaje de ruptura claro y compasivo."}},
-                    {"command": "/quitjob <team>", "description": {"en": "Write a respectful resignation message.", "es": "Escribe una renuncia respetuosa."}},
-                    {"command": "/congrats <win>", "description": {"en": "Send a celebratory shout-out for someone’s win.", "es": "Envía una felicitación por un logro."}},
-                    {"command": "/thankyou <person>", "description": {"en": "Craft a warm thank-you note with specifics.", "es": "Crea una nota de agradecimiento cercana."}},
                 ]
             }
         ],
@@ -4263,22 +6166,10 @@ MENU_DEFINITIONS = {
         "sections": [
             {
                 "items": [
-                    {"text": {"en": "List styles: /aipersonality list", "es": "Ver estilos: /aipersonality list"}},
-                    {"text": {"en": "Browse vibe menu: /choosevibe", "es": "Explorar tonos: /choosevibe"}},
-                    {"text": {"en": "Switch tone: /aipersonality set <name>", "es": "Cambiar tono: /aipersonality set <name>"}},
-                    {"text": {"en": "Add guidance: /aipersonality prompt <text>", "es": "Añadir guía: /aipersonality prompt <text>"}},
-                    {"text": {"en": "Reset: /aipersonality reset", "es": "Restablecer: /aipersonality reset"}},
-                ]
-            }
-        ],
-    },
-    "survival": {
-        "title": {"en": "Survival", "es": "Supervivencia"},
-        "sections": [
-            {
-                "items": [
-                    {"text": {"en": "Scenarios: /survival_desert • /survival_urban • /survival_jungle", "es": "Escenarios: /survival_desert • /survival_urban • /survival_jungle"}},
-                    {"text": {"en": "More guides: /survival_woodland • /survival_winter • /survival_medical", "es": "Más guías: /survival_woodland • /survival_winter • /survival_medical"}},
+                    {"text": {"en": "List styles: /vibe", "es": "Ver estilos: /vibe"}},
+                    {"text": {"en": "Switch tone: /vibe set <name>", "es": "Cambiar tono: /vibe set <name>"}},
+                    {"text": {"en": "Check vibe: /vibe status", "es": "Ver tono: /vibe status"}},
+                    {"text": {"en": "Reset tone: /vibe reset", "es": "Restablecer tono: /vibe reset"}},
                 ]
             }
         ],
@@ -4298,1637 +6189,47 @@ MENU_DEFINITIONS = {
     },
 }
 
-WRITE_FLOW_TIMEOUT = 600
 
-WRITE_FLOW_CONFIG = {
-    "hype": {
-        "system": "You are an energetic hype-writer for an off-grid community. Respond in {language_name}. Keep it to three lively sentences max and finish with an uplifting emoji.",
-        "user_template": "Create a short hype message about: {subject}. Highlight why it matters to the mesh community and keep it upbeat but sincere.",
-    },
-    "sayno": {
-        "system": "You help craft gracious declines that protect relationships. Respond in {language_name}. Use two to three warm sentences, show appreciation, offer a gentle boundary, and end on goodwill.",
-        "user_template": "Draft a polite refusal to this request or person: {subject}.",
-        "wizard_prompt": {
-            "en": "Who do you need to gently say no to? You can include a short reason.",
-            "es": "¿A quién necesitas decirle que no de forma amable? Puedes incluir una breve razón.",
-        },
-        "wizard_tag": "/sayno wizard",
-    },
-    "apology": {
-        "system": "You craft sincere, accountable apologies. Respond in {language_name}. Use two to four sentences, acknowledge responsibility, express empathy, and outline a small next step.",
-        "user_template": "Write a heartfelt apology to: {subject}. Include a brief acknowledgment of the impact and a step toward making things right.",
-    },
-    "breakup": {
-        "system": "You write compassionate breakup notes. Respond in {language_name}. Use up to four sentences, be clear yet kind, honor the connection, and provide hopeful closure.",
-        "user_template": "Compose a respectful breakup message for: {subject}. Keep it empathetic and firm, focused on personal growth and respect.",
-    },
-    "quitjob": {
-        "system": "You write professional resignation messages. Respond in {language_name}. Use two to three sentences, show gratitude, state the resignation clearly, and offer a smooth hand-off.",
-        "user_template": "Draft a courteous resignation note addressed to: {subject}. Mention appreciation and offer brief transition help.",
-    },
-    "congrats": {
-        "system": "You celebrate others with genuine enthusiasm. Respond in {language_name}. Keep it to three sentences, highlight the win, and include a supportive call-to-action.",
-        "user_template": "Write a celebratory congratulations message for: {subject}. Mention why the achievement matters and cheer them on.",
-    },
-    "thankyou": {
-        "system": "You craft warm thank-you notes that include specifics. Respond in {language_name}. Use two to three sentences, cite the helpful action, and share the positive impact.",
-        "user_template": "Compose a concise thank-you message for: {subject}. Include what they did and how it helped.",
-    },
-}
+def _localized_text(value: Any, lang: str) -> str:
+    """Return a localized string for the requested language.
 
-WRITE_COMMAND_FLOWS = {
-    "/hype": "hype",
-    "/sayno": "sayno",
-    "/apology": "apology",
-    "/breakup": "breakup",
-    "/quitjob": "quitjob",
-    "/congrats": "congrats",
-    "/thankyou": "thankyou",
-}
+    Accepts dicts like {"en": "Hello", "es": "Hola"} and falls back to
+    English or the first truthy value when the requested language is missing.
+    Non-dict values are coerced to strings so callers don't need to guard.
+    """
 
-
-def _start_write_wizard(flow: str, lang: str) -> PendingReply:
-    config = WRITE_FLOW_CONFIG.get(flow, {})
-    prompt_map = config.get("wizard_prompt", {}) if isinstance(config, dict) else {}
-    prompt = prompt_map.get(lang) or prompt_map.get("en") or "Who should we write about?"
-    tag = config.get("wizard_tag") if isinstance(config, dict) else None
-    if not tag:
-        tag = f"/{flow} wizard"
-    return PendingReply(prompt, tag)
-
-
-def _generate_write_response(
-    flow: str,
-    subject: str,
-    language: Optional[str],
-    sender_id=None,
-    is_direct: bool = False,
-    channel_idx=None,
-    thread_root_ts=None,
-):
-    config = WRITE_FLOW_CONFIG.get(flow)
-    if not config:
-        return None
-    subject = (subject or "").strip()
-    if not subject:
-        return None
-    subject = subject.replace("\n", " ").strip()
-    if len(subject) > 240:
-        subject = subject[:240].rsplit(" ", 1)[0] or subject[:240]
-    language_name = _language_display_name(language)
-    system_template = config.get("system") or "You are a helpful writing assistant. Respond in {language_name}."
-    system_prompt = system_template.format(language_name=language_name)
-    user_template = config.get("user_template") or "Write a short message about: {subject}."
-    user_message = user_template.format(subject=subject)
-    _log_high_cost(sender_id, "writer", subject[:80])
-    return send_to_ollama(
-        user_message,
-        sender_id=sender_id,
-        is_direct=is_direct,
-        channel_idx=channel_idx,
-        thread_root_ts=thread_root_ts,
-        system_prompt=system_prompt,
-        use_history=False,
-    )
-
-
-SURVIVAL_GUIDES = {
-    "/survival_desert": {
-        "title": {
-            "en": "Desert survival snapshot",
-            "es": "Guía rápida de supervivencia en el desierto",
-        },
-        "points": [
-            {"en": "Sip water every 15-20 minutes; shade your containers to slow evaporation.", "es": "Bebe sorbos de agua cada 15-20 minutos; mantén los recipientes a la sombra para reducir la evaporación."},
-            {"en": "Travel at dawn or dusk, rest under improvised shade during peak sun.", "es": "Viaja al amanecer o atardecer y descansa bajo sombra improvisada durante el sol intenso."},
-            {"en": "Layer clothing: loose, light fabrics trap cooler air and prevent sunburn.", "es": "Usa ropa holgada y ligera; las capas atrapan aire fresco y evitan quemaduras."},
-            {"en": "Signal rescuers with mirrors, bright cloth, or large ground symbols visible from above.", "es": "Señala a rescatistas con espejos, tela brillante o símbolos grandes en el suelo visibles desde el aire."},
-            {"en": "Ration sweat, not thirst—slow your pace, use ground cover, and avoid metal equipment in direct sun.", "es": "Raciona el esfuerzo, no la sed; camina despacio, usa coberturas y evita herramientas metálicas al sol."},
-        ],
-        "reflection": {
-            "en": "Stay calm: like water shared freely, grace grows when we lift one another.",
-            "es": "Mantén la calma: así como el agua compartida, la gracia crece cuando levantamos a otros.",
-        },
-    },
-    "/survival_urban": {
-        "title": {
-            "en": "Urban survival snapshot",
-            "es": "Guía rápida de supervivencia urbana",
-        },
-        "points": [
-            {"en": "Map safe zones: hospitals, churches, and community centers often host aid.", "es": "Identifica zonas seguras: hospitales, iglesias y centros comunitarios suelen brindar ayuda."},
-            {"en": "Keep a low profile—blend in, avoid predictable routines, and move with purpose.", "es": "Mantén un perfil bajo; evita rutinas predecibles y muévete con propósito."},
-            {"en": "Secure shelter above ground level to limit flooding and control entry points.", "es": "Busca refugio por encima del nivel del suelo para evitar inundaciones y controlar accesos."},
-            {"en": "Harvest resources: rainwater from gutters, tools from maintenance closets, info from local radio.", "es": "Aprovecha recursos: agua de lluvia de canaletas, herramientas de mantenimiento e información de radio local."},
-            {"en": "Organize neighbors for watch rotations—community care deters conflict.", "es": "Organiza turnos vecinales de vigilancia; el cuidado comunitario disuade conflictos."},
-        ],
-        "reflection": {
-            "en": "Seek peace in every doorway; a gentle word can steady a whole block.",
-            "es": "Busca la paz en cada puerta; una palabra amable puede sostener a toda la cuadra.",
-        },
-    },
-    "/survival_jungle": {
-        "title": {
-            "en": "Jungle survival snapshot",
-            "es": "Guía rápida de supervivencia en la selva",
-        },
-        "points": [
-            {"en": "Stay dry: elevated shelters and hammocks keep you above insects and runoff.", "es": "Mantente seco: refugios elevados y hamacas te aíslan de insectos y escorrentías."},
-            {"en": "Collect rainwater with tarps or broad leaves and filter before drinking.", "es": "Recolecta lluvia con lonas o hojas grandes y filtra antes de beber."},
-            {"en": "Track daylight with a machete notch on trees—helps prevent circling back.", "es": "Marca los árboles con machete para seguir el progreso y evitar caminar en círculos."},
-            {"en": "Avoid bright fruit or insects with bold patterns—they often signal toxins.", "es": "Evita frutos brillantes o insectos con patrones llamativos; suelen ser tóxicos."},
-            {"en": "Smoke damp leaves to repel mosquitoes and signal companions.", "es": "Quema hojas húmedas para ahuyentar mosquitos y señalar a los compañeros."},
-        ],
-        "reflection": {
-            "en": "Even in thick canopy, light breaks through—hold to hope and guide others gently.",
-            "es": "Aun bajo el dosel denso, la luz se abre paso; mantén la esperanza y guía con mansedumbre.",
-        },
-    },
-    "/survival_woodland": {
-        "title": {
-            "en": "Woodland survival snapshot",
-            "es": "Guía rápida de supervivencia en bosques",
-        },
-        "points": [
-            {"en": "Layer clothing and keep waterproof shells accessible as weather swings quickly.", "es": "Usa capas de ropa y ten a mano prendas impermeables; el clima cambia rápido."},
-            {"en": "Use tree moss growth and prevailing wind patterns to stay oriented.", "es": "Usa el musgo en los árboles y la dirección del viento para orientarte."},
-            {"en": "Forage responsibly: pine needles for vitamin C tea, cattails for starch.", "es": "Forrajea con responsabilidad: agujas de pino para té con vitamina C, tule para almidón."},
-            {"en": "Build reflector fires against logs or rocks to bounce heat into shelter.", "es": "Construye fogatas con reflectores usando troncos o rocas para reflejar calor al refugio."},
-            {"en": "Mark trails with biodegradable ribbon or carved arrows to aid rescue teams.", "es": "Marca el camino con cintas biodegradables o flechas talladas para ayudar a rescatistas."},
-        ],
-        "reflection": {
-            "en": "Walk softly; stewardship of creation mirrors the Shepherd who restores souls.",
-            "es": "Camina con suavidad; cuidar la creación refleja al Pastor que restaura almas.",
-        },
-    },
-    "/survival_winter": {
-        "title": {
-            "en": "Winter survival snapshot",
-            "es": "Guía rápida de supervivencia invernal",
-        },
-        "points": [
-            {"en": "Stack layers: wicking base, insulating core, windproof shell.", "es": "Usa capas: base que absorba humedad, capa aislante y exterior a prueba de viento."},
-            {"en": "Vent shelters to prevent carbon monoxide when using stoves or fires.", "es": "Ventila los refugios para evitar monóxido de carbono al usar estufas o fogatas."},
-            {"en": "Keep water in insulated containers upside-down so the surface ice forms near the lid.", "es": "Guarda el agua en recipientes aislados boca abajo para que el hielo se forme cerca de la tapa."},
-            {"en": "Travel with snowshoes or improvised platforms to avoid postholing and conserve energy.", "es": "Camina con raquetas o plataformas improvisadas para evitar hundirte y ahorrar energía."},
-            {"en": "Warm companions by sharing shelter, hot drinks, and songs that lift morale.", "es": "Calienta a tus compañeros compartiendo refugio, bebidas calientes y cantos que animen."},
-        ],
-        "reflection": {
-            "en": "Hope is a shared fire—tend it together until the thaw arrives.",
-            "es": "La esperanza es un fuego compartido; cuídenlo juntos hasta que llegue el deshielo.",
-        },
-    },
-    "/survival_medical": {
-        "title": {
-            "en": "Field medical snapshot",
-            "es": "Guía rápida de primeros auxilios",
-        },
-        "points": [
-            {"en": "Check ABCs: airway clear, breathing steady, circulation supported with direct pressure.", "es": "Revisa ABC: vía aérea despejada, respiración estable, circulación apoyada con presión directa."},
-            {"en": "Stop severe bleeding with pressure dressings or improvised tourniquets two inches above the wound.", "es": "Detén hemorragias con vendajes a presión o torniquetes improvisados a 5 cm por encima de la herida."},
-            {"en": "Stabilize fractures using splints padded with cloth; immobilize joints above and below.", "es": "Estabiliza fracturas con férulas acolchadas; inmoviliza las articulaciones arriba y abajo."},
-            {"en": "Track vitals every 10 minutes—note pulse, breathing rate, and responsiveness.", "es": "Registra signos vitales cada 10 minutos: pulso, respiración y nivel de respuesta."},
-            {"en": "Document allergies, meds, and events; hand the notes to first responders.", "es": "Anota alergias, medicamentos y eventos; entrega las notas a los rescatistas."},
-        ],
-        "reflection": {
-            "en": "Serve with compassion—healing hands point to the Great Physician.",
-            "es": "Sirve con compasión; las manos que sanan señalan al Gran Médico.",
-        },
-    },
-}
-
-SURVIVAL_REFLECTION_LABEL = {"en": "Faith focus", "es": "Enfoque de fe"}
-
-
-@dataclass
-class TriviaSession:
-    player_key: str
-    category: str
-    score: int = 0
-    total: int = 0
-    asked_ids: Set[str] = field(default_factory=set)
-    current_id: Optional[str] = None
-    language: str = "en"
-    owner_id: Optional[str] = None
-    channel_idx: Optional[int] = None
-    is_direct: bool = True
-    display_name: Optional[str] = None
-    hint_used: bool = False
-
-
-TRIVIA_STATE_FILE = "trivia_state.json"
-TRIVIA_SESSIONS: Dict[str, TriviaSession] = {}
-
-TRIVIA_CATEGORY_TITLES = {
-    "bible": {"en": "Bible Trivia", "es": "Trivia Bíblica"},
-    "disaster": {"en": "Disaster Prep Trivia", "es": "Trivia de preparación"},
-    "general": {"en": "General Trivia", "es": "Trivia general"},
-    "math": {"en": "Math Quiz", "es": "Quiz de matemáticas"},
-    "electrical": {"en": "Electrical DIY Quiz", "es": "Quiz eléctrico DIY"},
-}
-
-TRIVIA_CATEGORY_EMOJI = {
-    "bible": "📖",
-    "disaster": "🛡️",
-    "general": "🧠",
-    "math": "➗",
-    "electrical": "⚡",
-}
-
-TRIVIA_STRINGS = {
-    "en": {
-        "question_intro": "{icon} {title} challenge:",
-        "choices_intro": "📝 Choices:",
-        "answer_prompt": "✍️ Reply with `{command} <answer>`.",
-        "correct": "✅ Correct! 🎉 {explanation}",
-        "correct_no_expl": "✅ Correct! 🎉",
-        "incorrect": "❌ Not quite. The answer is {answer}. ℹ️ {explanation}",
-        "incorrect_no_expl": "❌ Not quite. The answer is {answer}.",
-        "score_line": "📊 Score: {score}/{total} correct ({percent}%).",
-        "new_question": "✨ Next question:",
-        "skipped": "⏭️ Skipped! Here's a fresh question:",
-        "no_question": "🪧 Request a new question first with `{command}`.",
-        "no_questions": "😅 No questions available in this category right now.",
-        "no_scores": "📭 No scores yet for this category.",
-        "leaderboard_title": "🏆 Leaderboard — {title}",
-        "leaderboard_entry": "{rank}. {name}: {score}/{total} ({percent}%)",
-        "your_score": "🎯 Your score: {score}/{total} ({percent}%).",
-        "hint": "🕵️ Hint: the answer starts with **{letter}**.",
-        "hint_used": "🕵️ You already used the hint for this one.",
-    },
-    "es": {
-        "question_intro": "{icon} Pregunta de {title}:",
-        "choices_intro": "📝 Opciones:",
-        "answer_prompt": "✍️ Responde con `{command} <respuesta>`.",
-        "correct": "✅ ¡Correcto! 🎉 {explanation}",
-        "correct_no_expl": "✅ ¡Correcto! 🎉",
-        "incorrect": "❌ Casi. La respuesta es {answer}. ℹ️ {explanation}",
-        "incorrect_no_expl": "❌ Casi. La respuesta es {answer}.",
-        "score_line": "📊 Puntaje: {score}/{total} aciertos ({percent}%).",
-        "new_question": "✨ Siguiente pregunta:",
-        "skipped": "⏭️ ¡Pregunta saltada! Aquí tienes una nueva:",
-        "no_question": "🪧 Primero pide una pregunta nueva con `{command}`.",
-        "no_questions": "😅 No hay preguntas disponibles en esta categoría por ahora.",
-        "no_scores": "📭 Aún no hay puntuaciones para esta categoría.",
-        "leaderboard_title": "🏆 Tabla de posiciones — {title}",
-        "leaderboard_entry": "{rank}. {name}: {score}/{total} ({percent}%)",
-        "your_score": "🎯 Tu puntaje: {score}/{total} ({percent}%).",
-        "hint": "🕵️ Pista: la respuesta comienza con **{letter}**.",
-        "hint_used": "🕵️ Ya usaste la pista para esta pregunta.",
-    },
-}
-
-def _localized_text(value: Any, language: str) -> str:
-    if isinstance(value, dict):
-        lang_order: List[str] = []
-        normalized = _normalize_language_code(language)
-        if normalized:
-            lang_order.append(normalized)
-        if LANGUAGE_FALLBACK not in lang_order:
-            lang_order.append(LANGUAGE_FALLBACK)
-        if "en" not in lang_order:
-            lang_order.append("en")
-        for key in lang_order:
-            candidate = value.get(key)
-            if isinstance(candidate, str) and candidate:
-                return candidate
-        for candidate in value.values():
-            if isinstance(candidate, str) and candidate:
-                return candidate
-        return ""
     if value is None:
         return ""
+
+    if isinstance(value, str):
+        return value
+
+    if isinstance(value, dict):
+        # Try exact language, then language without regional suffix, then English.
+        normalized = _normalize_language_code(lang)
+        candidates = [normalized]
+        if "-" in lang:
+            base_lang = lang.split("-", 1)[0].lower()
+            candidates.append(base_lang)
+        candidates.append("en")
+
+        for key in candidates:
+            text = value.get(key)
+            if isinstance(text, str) and text.strip():
+                return text
+
+        # Fallback: first non-empty string value.
+        for candidate in value.values():
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate
+        return ""
+
+    if isinstance(value, (list, tuple)):
+        parts = [str(part) for part in value if part is not None]
+        return " ".join(part for part in parts if part.strip())
+
     return str(value)
 
-
-def _localized_list(value: Any, language: str) -> List[str]:
-    if isinstance(value, dict):
-        lang_order: List[str] = []
-        normalized = _normalize_language_code(language)
-        if normalized:
-            lang_order.append(normalized)
-        if LANGUAGE_FALLBACK not in lang_order:
-            lang_order.append(LANGUAGE_FALLBACK)
-        if "en" not in lang_order:
-            lang_order.append("en")
-        for key in lang_order:
-            candidate = value.get(key)
-            if isinstance(candidate, list) and candidate:
-                return [str(item) for item in candidate]
-            if isinstance(candidate, str) and candidate:
-                return [str(candidate)]
-        for candidate in value.values():
-            if isinstance(candidate, list) and candidate:
-                return [str(item) for item in candidate]
-            if isinstance(candidate, str) and candidate:
-                return [str(candidate)]
-        return []
-    if isinstance(value, list):
-        return [str(item) for item in value]
-    if isinstance(value, str) and value:
-        return [value]
-    return []
-
-
-
-TRIVIA_BANK: Dict[str, List[Dict[str, Any]]] = {
-    "bible": [
-        {
-            "id": "b1",
-            "question": {
-                "en": "Who interpreted Pharaoh's dreams about seven years of plenty and seven years of famine?",
-                "es": "¿Quién interpretó los sueños del faraón sobre siete años de abundancia y siete de hambre?",
-            },
-            "answers": ["joseph", "jose", "josé"],
-            "answer_display": {"en": "Joseph", "es": "José"},
-            "choices": {
-                "en": ["Joseph", "Moses", "Daniel", "Aaron"],
-                "es": ["José", "Moisés", "Daniel", "Aarón"],
-            },
-            "explanation": {
-                "en": "Genesis 41 records Joseph interpreting Pharaoh's dreams and planning to store grain.",
-                "es": "Génesis 41 relata cómo José interpretó los sueños del faraón y planificó almacenar grano.",
-            },
-        },
-        {
-            "id": "b2",
-            "question": {
-                "en": "On which road was Saul travelling when he encountered a blinding light from heaven?",
-                "es": "¿En qué camino viajaba Saulo cuando encontró una luz cegadora del cielo?",
-            },
-            "answers": ["damascus", "road to damascus", "camino a damasco"],
-            "answer_display": {"en": "Road to Damascus", "es": "Camino a Damasco"},
-            "choices": {
-                "en": ["Road to Damascus", "Emmaus Road", "Bethany Road", "Jericho Road"],
-                "es": ["Camino a Damasco", "Camino a Emaús", "Camino a Betania", "Camino a Jericó"],
-            },
-            "explanation": {
-                "en": "Acts 9 describes Saul meeting Jesus on the road to Damascus.",
-                "es": "Hechos 9 describe a Saulo encontrándose con Jesús en el camino a Damasco.",
-            },
-        },
-        {
-            "id": "b3",
-            "question": {
-                "en": "Which prophet confronted King Ahab and the prophets of Baal on Mount Carmel?",
-                "es": "¿Qué profeta enfrentó al rey Acab y a los profetas de Baal en el monte Carmelo?",
-            },
-            "answers": ["elijah", "elias", "elías"],
-            "answer_display": {"en": "Elijah", "es": "Elías"},
-            "choices": {
-                "en": ["Elijah", "Elisha", "Isaiah", "Micah"],
-                "es": ["Elías", "Eliseo", "Isaías", "Miqueas"],
-            },
-            "explanation": {
-                "en": "1 Kings 18 recounts Elijah calling down fire on Mount Carmel.",
-                "es": "1 Reyes 18 narra cómo Elías invocó fuego en el monte Carmelo.",
-            },
-        },
-        {
-            "id": "b4",
-            "question": {
-                "en": "In the Gospel of John, what was Jesus' first recorded miracle?",
-                "es": "Según el evangelio de Juan, ¿cuál fue el primer milagro registrado de Jesús?",
-            },
-            "answers": [
-                "water into wine",
-                "turned water into wine",
-                "water to wine",
-                "wine",
-                "agua en vino",
-                "convertir el agua en vino",
-            ],
-            "answer_display": {"en": "Turning water into wine", "es": "Convertir el agua en vino"},
-            "choices": {
-                "en": [
-                    "Turning water into wine",
-                    "Feeding the 5,000",
-                    "Walking on water",
-                    "Healing a blind man",
-                ],
-                "es": [
-                    "Convertir el agua en vino",
-                    "Alimentar a los 5,000",
-                    "Caminar sobre el agua",
-                    "Sanar a un ciego",
-                ],
-            },
-            "explanation": {
-                "en": "John 2 narrates Jesus turning water into wine at the wedding in Cana.",
-                "es": "Juan 2 narra cómo Jesús convirtió el agua en vino en las bodas de Caná.",
-            },
-        },
-        {
-            "id": "b5",
-            "question": {
-                "en": "Which Old Testament book contains the verse, 'The LORD is my shepherd'?",
-                "es": "¿Qué libro del Antiguo Testamento contiene el versículo 'El Señor es mi pastor'?",
-            },
-            "answers": ["psalms", "psalm", "psalm 23", "salmos", "salmo 23"],
-            "answer_display": {"en": "Psalms", "es": "Salmos"},
-            "choices": {
-                "en": ["Psalms", "Proverbs", "Isaiah", "Deuteronomy"],
-                "es": ["Salmos", "Proverbios", "Isaías", "Deuteronomio"],
-            },
-            "explanation": {
-                "en": "Psalm 23 opens with 'The LORD is my shepherd; I shall not want.'",
-                "es": "El Salmo 23 comienza con 'El Señor es mi pastor; nada me faltará.'",
-            },
-        },
-        {
-            "id": "b6",
-            "question": {
-                "en": "Who was the only disciple to walk on water toward Jesus before beginning to sink?",
-                "es": "¿Qué discípulo caminó sobre el agua hacia Jesús antes de comenzar a hundirse?",
-            },
-            "answers": ["peter", "simon peter", "pedro"],
-            "answer_display": {"en": "Peter", "es": "Pedro"},
-            "choices": {
-                "en": ["Peter", "John", "Andrew", "Thomas"],
-                "es": ["Pedro", "Juan", "Andrés", "Tomás"],
-            },
-            "explanation": {
-                "en": "Matthew 14:28-31 describes Peter stepping out of the boat toward Jesus.",
-                "es": "Mateo 14:28-31 describe a Pedro saliendo de la barca hacia Jesús.",
-            },
-        },
-        {
-            "id": "b7",
-            "question": {
-                "en": "What did God provide for the Israelites each morning in the wilderness to eat?",
-                "es": "¿Qué proporcionó Dios cada mañana en el desierto para que comieran los israelitas?",
-            },
-            "answers": ["manna", "mana", "maná"],
-            "answer_display": {"en": "Manna", "es": "Maná"},
-            "choices": {
-                "en": ["Manna", "Quail", "Bread from Egypt", "Figs"],
-                "es": ["Maná", "Codornices", "Pan de Egipto", "Higos"],
-            },
-            "explanation": {
-                "en": "Exodus 16 notes that manna appeared with the dew each morning.",
-                "es": "Éxodo 16 indica que el maná aparecía con el rocío cada mañana.",
-            },
-        },
-        {
-            "id": "b8",
-            "question": {
-                "en": "Which apostle is known for doubting the resurrection until he saw Jesus' wounds?",
-                "es": "¿Qué apóstol dudó de la resurrección hasta ver las heridas de Jesús?",
-            },
-            "answers": ["thomas", "doubting thomas", "tomas", "tomás"],
-            "answer_display": {"en": "Thomas", "es": "Tomás"},
-            "choices": {
-                "en": ["Thomas", "Philip", "James", "Bartholomew"],
-                "es": ["Tomás", "Felipe", "Santiago", "Bartolomé"],
-            },
-            "explanation": {
-                "en": "John 20 describes Thomas insisting on touching Jesus' wounds before believing.",
-                "es": "Juan 20 describe a Tomás insistiendo en tocar las heridas de Jesús antes de creer.",
-            },
-        },
-    ],
-    "disaster": [
-        {
-            "id": "d1",
-            "question": {
-                "en": "How much water should you store per person per day for emergency readiness?",
-                "es": "¿Cuánta agua debes almacenar por persona por día para estar preparado ante emergencias?",
-            },
-            "answers": [
-                "1 gallon",
-                "one gallon",
-                "about 1 gallon",
-                "3.8 liters",
-                "38 liters",
-                "un galon",
-                "un galón",
-                "38 litros",
-            ],
-            "answer_display": {"en": "1 gallon (3.8 L)", "es": "1 galón (3.8 L)"},
-            "choices": {
-                "en": ["1 gallon (3.8 L)", "Half gallon", "2 gallons", "One quart"],
-                "es": ["1 galón (3.8 L)", "Medio galón", "2 galones", "Un cuarto"],
-            },
-            "explanation": {
-                "en": "FEMA recommends about one gallon (3.8 liters) of water per person per day.",
-                "es": "FEMA recomienda alrededor de un galón (3.8 litros) de agua por persona por día.",
-            },
-        },
-        {
-            "id": "d2",
-            "question": {
-                "en": "During a tornado warning inside a sturdy building, where should you shelter?",
-                "es": "Durante una alerta de tornado dentro de un edificio sólido, ¿dónde debes refugiarte?",
-            },
-            "answers": [
-                "interior room",
-                "lowest level interior room",
-                "basement",
-                "safe room",
-                "bathroom",
-                "closet",
-                "cuarto interior",
-                "sotano",
-                "sótano",
-                "cuarto seguro",
-                "banera",
-                "baño",
-                "closet interior",
-            ],
-            "answer_display": {"en": "Interior room on the lowest floor", "es": "Cuarto interior en el nivel más bajo"},
-            "choices": {
-                "en": ["Interior room on the lowest floor", "Near exterior windows", "Top floor balcony", "Garage"],
-                "es": ["Cuarto interior en el nivel más bajo", "Cerca de ventanas exteriores", "Balcón del último piso", "Garaje"],
-            },
-            "explanation": {
-                "en": "Emergency managers advise sheltering in an interior room on the lowest level, away from windows.",
-                "es": "Los servicios de emergencia aconsejan refugiarse en un cuarto interior en el nivel más bajo, lejos de las ventanas.",
-            },
-        },
-        {
-            "id": "d3",
-            "question": {
-                "en": "Which item is best to include in a go-bag for prolonged power outages?",
-                "es": "¿Qué artículo es mejor incluir en una mochila de emergencia para apagones prolongados?",
-            },
-            "answers": [
-                "battery radio",
-                "hand crank radio",
-                "hand-crank radio",
-                "radio",
-                "radio de manivela",
-                "radio a baterias",
-                "radio a baterías",
-            ],
-            "answer_display": {"en": "Hand-crank or battery-powered radio", "es": "Radio de manivela o a baterías"},
-            "choices": {
-                "en": ["Hand-crank or battery-powered radio", "Electric can opener", "Desktop computer", "Metal detector"],
-                "es": ["Radio de manivela o a baterías", "Abrelatas eléctrico", "Computadora de escritorio", "Detector de metales"],
-            },
-            "explanation": {
-                "en": "A hand-crank or battery-powered radio keeps you informed when power and internet fail.",
-                "es": "Una radio de manivela o a baterías te mantiene informado cuando falla la energía y el internet.",
-            },
-        },
-        {
-            "id": "d4",
-            "question": {
-                "en": "When a hurricane is approaching, what should you do with important documents?",
-                "es": "Cuando se aproxima un huracán, ¿qué debes hacer con los documentos importantes?",
-            },
-            "answers": [
-                "waterproof container",
-                "seal them",
-                "store in waterproof bag",
-                "scan them",
-                "contenedor impermeable",
-                "bolsa impermeable",
-                "escanealos",
-                "respaldo digital",
-            ],
-            "answer_display": {"en": "Seal them in a waterproof container", "es": "Sellarlos en un contenedor impermeable"},
-            "choices": {
-                "en": ["Seal them in a waterproof container", "Leave them on the desk", "Mail them to friends", "Recycle them"],
-                "es": ["Sellarlos en un contenedor impermeable", "Dejarlos sobre el escritorio", "Enviarlos por correo a amigos", "Reciclarlos"],
-            },
-            "explanation": {
-                "en": "Store vital documents in waterproof containers or cloud backups before a storm.",
-                "es": "Guarda los documentos vitales en recipientes impermeables o respaldos digitales antes de la tormenta.",
-            },
-        },
-        {
-            "id": "d5",
-            "question": {
-                "en": "What is the recommended action if you smell gas after an earthquake?",
-                "es": "¿Qué acción se recomienda si hueles gas después de un terremoto?",
-            },
-            "answers": [
-                "leave immediately",
-                "evacuate",
-                "get outside",
-                "turn off gas and leave",
-                "salir de inmediato",
-                "evacuar",
-                "apagar el gas y salir",
-            ],
-            "answer_display": {"en": "Leave immediately and notify authorities", "es": "Salir de inmediato y avisar a las autoridades"},
-            "choices": {
-                "en": ["Leave the building immediately and notify authorities", "Light a candle to see better", "Open all electrical switches", "Stay and investigate"],
-                "es": ["Salir de inmediato y avisar a las autoridades", "Encender una vela para ver mejor", "Abrir todos los interruptores", "Quedarse a investigar"],
-            },
-            "explanation": {
-                "en": "Leave immediately to avoid ignition and notify professionals to inspect the leak.",
-                "es": "Sal de inmediato para evitar una ignición y avisa a los profesionales para que inspeccionen la fuga.",
-            },
-        },
-        {
-            "id": "d6",
-            "question": {
-                "en": "How often should you test the batteries in smoke alarms?",
-                "es": "¿Con qué frecuencia debes probar las baterías de las alarmas de humo?",
-            },
-            "answers": ["monthly", "once a month", "every month", "mensualmente", "cada mes"],
-            "answer_display": {"en": "Monthly", "es": "Mensualmente"},
-            "choices": {
-                "en": ["Monthly", "Once a year", "Only after a fire", "Never"],
-                "es": ["Mensualmente", "Una vez al año", "Solo después de un incendio", "Nunca"],
-            },
-            "explanation": {
-                "en": "Fire safety guidelines advise testing smoke alarms monthly.",
-                "es": "Las normas de seguridad contra incendios aconsejan probar las alarmas de humo cada mes.",
-            },
-        },
-        {
-            "id": "d7",
-            "question": {
-                "en": "What is the minimum recommended length of non-perishable food supply for at-home sheltering?",
-                "es": "¿Cuál es la reserva mínima recomendada de alimentos no perecederos para refugiarse en casa?",
-            },
-            "answers": ["3 days", "three days", "72 hours", "tres dias", "tres días", "72 horas"],
-            "answer_display": {"en": "3 days", "es": "3 días"},
-            "choices": {
-                "en": ["3 days", "12 hours", "1 day", "8 days"],
-                "es": ["3 días", "12 horas", "1 día", "8 días"],
-            },
-            "explanation": {
-                "en": "Most emergency planners advise at least a three-day (72-hour) supply per person.",
-                "es": "La mayoría de los planificadores recomiendan al menos tres días (72 horas) de alimentos por persona.",
-            },
-        },
-        {
-            "id": "d8",
-            "question": {
-                "en": "During a wildfire evacuation notice, what should you avoid doing with the windows?",
-                "es": "Si hay una orden de evacuación por incendio forestal, ¿qué debes evitar hacer con las ventanas?",
-            },
-            "answers": ["leave them open", "open", "opening", "dejarlas abiertas", "abrirlas"],
-            "answer_display": {"en": "Keep them closed", "es": "Mantenerlas cerradas"},
-            "choices": {
-                "en": ["Keep them closed to prevent embers entering", "Prop them open for air", "Remove the screens", "Cover with foil"],
-                "es": ["Mantenerlas cerradas para evitar que entren brasas", "Dejarlas abiertas para ventilar", "Quitar las mallas", "Cubrirlas con papel aluminio"],
-            },
-            "explanation": {
-                "en": "Keeping windows closed helps stop embers and smoke from entering the structure.",
-                "es": "Mantener las ventanas cerradas evita que entren brasas y humo en la vivienda.",
-            },
-        },
-    ],
-    "general": [
-        {
-            "id": "g1",
-            "question": {
-                "en": "What is the largest planet in our solar system?",
-                "es": "¿Cuál es el planeta más grande de nuestro sistema solar?",
-            },
-            "answers": ["jupiter", "júpiter"],
-            "answer_display": {"en": "Jupiter", "es": "Júpiter"},
-            "choices": {
-                "en": ["Jupiter", "Saturn", "Neptune", "Earth"],
-                "es": ["Júpiter", "Saturno", "Neptuno", "Tierra"],
-            },
-            "explanation": {
-                "en": "Jupiter is the largest planet with a diameter of about 143,000 km.",
-                "es": "Júpiter es el planeta más grande con un diámetro de unos 143,000 km.",
-            },
-        },
-        {
-            "id": "g2",
-            "question": {
-                "en": "Riddle: I speak without a mouth and hear without ears. I have nobody, but I come alive with wind. What am I?",
-                "es": "Adivinanza: Hablo sin boca y escucho sin oídos. No tengo cuerpo, pero cobro vida con el viento. ¿Qué soy?",
-            },
-            "answers": ["echo", "eco"],
-            "answer_display": {"en": "Echo", "es": "Eco"},
-            "choices": {"en": [], "es": []},
-            "explanation": {
-                "en": "An echo reflects sound even without a body.",
-                "es": "Un eco refleja el sonido incluso sin un cuerpo físico.",
-            },
-        },
-        {
-            "id": "g3",
-            "question": {
-                "en": "Which scientist presented the three laws of motion in 'Philosophiæ Naturalis Principia Mathematica'?",
-                "es": "¿Qué científico presentó las tres leyes del movimiento en 'Philosophiæ Naturalis Principia Mathematica'?",
-            },
-            "answers": ["isaac newton", "newton", "sir isaac newton"],
-            "answer_display": {"en": "Isaac Newton", "es": "Isaac Newton"},
-            "choices": {
-                "en": ["Isaac Newton", "Albert Einstein", "Galileo Galilei", "Niels Bohr"],
-                "es": ["Isaac Newton", "Albert Einstein", "Galileo Galilei", "Niels Bohr"],
-            },
-            "explanation": {
-                "en": "Isaac Newton published the Principia in 1687 outlining the laws of motion.",
-                "es": "Isaac Newton publicó los Principia en 1687, delineando las leyes del movimiento.",
-            },
-        },
-        {
-            "id": "g4",
-            "question": {
-                "en": "In what year did humans first walk on the Moon?",
-                "es": "¿En qué año caminaron por primera vez los humanos en la Luna?",
-            },
-            "answers": ["1969", "nineteen sixty nine", "mil novecientos sesenta y nueve"],
-            "answer_display": {"en": "1969", "es": "1969"},
-            "choices": {
-                "en": ["1969", "1959", "1972", "1981"],
-                "es": ["1969", "1959", "1972", "1981"],
-            },
-            "explanation": {
-                "en": "Apollo 11 landed on July 20, 1969.",
-                "es": "El Apolo 11 alunizó el 20 de julio de 1969.",
-            },
-        },
-        {
-            "id": "g5",
-            "question": {
-                "en": "Riddle: What has keys but can't open locks, space but no room, and you can enter but not go outside?",
-                "es": "Adivinanza: ¿Qué tiene teclas pero no abre cerraduras, tiene espacio pero no habitaciones, y puedes entrar pero no salir?",
-            },
-            "answers": ["keyboard", "teclado"],
-            "answer_display": {"en": "Keyboard", "es": "Teclado"},
-            "choices": {"en": [], "es": []},
-            "explanation": {
-                "en": "A computer keyboard fits all the clues.",
-                "es": "Un teclado de computadora encaja con todas las pistas.",
-            },
-        },
-        {
-            "id": "g6",
-            "question": {
-                "en": "Which ocean current keeps Western Europe warmer than other regions at similar latitudes?",
-                "es": "¿Qué corriente oceánica mantiene a Europa occidental más cálida que otras regiones de latitud similar?",
-            },
-            "answers": ["gulf stream", "north atlantic drift", "corriente del golfo", "deriva noratlántica"],
-            "answer_display": {"en": "The Gulf Stream", "es": "La corriente del Golfo"},
-            "choices": {
-                "en": ["The Gulf Stream", "California Current", "Canary Current", "Oyashio Current"],
-                "es": ["La corriente del Golfo", "Corriente de California", "Corriente de Canarias", "Corriente de Oyashio"],
-            },
-            "explanation": {
-                "en": "The Gulf Stream/North Atlantic Drift carries warm water toward Europe.",
-                "es": "La corriente del Golfo o deriva noratlántica lleva agua cálida hacia Europa.",
-            },
-        },
-        {
-            "id": "g7",
-            "question": {
-                "en": "Which gas do plants primarily absorb from the atmosphere during photosynthesis?",
-                "es": "¿Qué gas absorben principalmente las plantas de la atmósfera durante la fotosíntesis?",
-            },
-            "answers": ["carbon dioxide", "co2", "dioxido de carbono", "dióxido de carbono"],
-            "answer_display": {"en": "Carbon dioxide", "es": "Dióxido de carbono"},
-            "choices": {
-                "en": ["Carbon dioxide", "Oxygen", "Nitrogen", "Hydrogen"],
-                "es": ["Dióxido de carbono", "Oxígeno", "Nitrógeno", "Hidrógeno"],
-            },
-            "explanation": {
-                "en": "Plants take in carbon dioxide and release oxygen.",
-                "es": "Las plantas absorben dióxido de carbono y liberan oxígeno.",
-            },
-        },
-        {
-            "id": "g8",
-            "question": {
-                "en": "Riddle: The more of this there is, the less you see. What is it?",
-                "es": "Adivinanza: Cuanto más hay de esto, menos ves. ¿Qué es?",
-            },
-            "answers": ["darkness", "oscuridad"],
-            "answer_display": {"en": "Darkness", "es": "Oscuridad"},
-            "choices": {"en": [], "es": []},
-            "explanation": {
-                "en": "Darkness obscures vision as it increases.",
-                "es": "La oscuridad dificulta la visión a medida que aumenta.",
-            },
-        },
-    ],
-    "math": [
-        {
-            "id": "m1",
-            "question": {
-                "en": "What is 12 × 7?",
-                "es": "¿Cuánto es 12 × 7?",
-            },
-            "answers": ["84", "ochenta y cuatro"],
-            "answer_display": {"en": "84", "es": "84"},
-            "choices": {
-                "en": ["72", "84", "96", "86"],
-                "es": ["72", "84", "96", "86"],
-            },
-            "explanation": {
-                "en": "Twelve times seven equals eighty-four.",
-                "es": "Doce por siete es igual a ochenta y cuatro.",
-            },
-        },
-        {
-            "id": "m2",
-            "question": {
-                "en": "Solve for x: 3x + 9 = 24.",
-                "es": "Resuelve x: 3x + 9 = 24.",
-            },
-            "answers": ["5", "x=5", "cinco"],
-            "answer_display": {"en": "x = 5", "es": "x = 5"},
-            "choices": {
-                "en": ["3", "4", "5", "6"],
-                "es": ["3", "4", "5", "6"],
-            },
-            "explanation": {
-                "en": "Subtract 9 to get 3x = 15, then divide by 3.",
-                "es": "Resta 9 para obtener 3x = 15 y divide entre 3.",
-            },
-        },
-        {
-            "id": "m3",
-            "question": {
-                "en": "What is 45% written as a decimal?",
-                "es": "¿Cómo se escribe 45% como decimal?",
-            },
-            "answers": ["0.45", ".45"],
-            "answer_display": {"en": "0.45", "es": "0.45"},
-            "choices": {
-                "en": ["0.045", "0.45", "4.5", "0.54"],
-                "es": ["0.045", "0.45", "4.5", "0.54"],
-            },
-            "explanation": {
-                "en": "Move the percent two decimal places left: 45% = 0.45.",
-                "es": "Desplaza el porcentaje dos lugares a la izquierda: 45% = 0.45.",
-            },
-        },
-        {
-            "id": "m4",
-            "question": {
-                "en": "What is the area of a rectangle measuring 8 meters by 5 meters?",
-                "es": "¿Cuál es el área de un rectángulo de 8 metros por 5 metros?",
-            },
-            "answers": ["40", "40 square meters", "40 m2", "40 metros cuadrados"],
-            "answer_display": {"en": "40 square meters", "es": "40 metros cuadrados"},
-            "choices": {
-                "en": ["30 square meters", "35 square meters", "40 square meters", "45 square meters"],
-                "es": ["30 metros cuadrados", "35 metros cuadrados", "40 metros cuadrados", "45 metros cuadrados"],
-            },
-            "explanation": {
-                "en": "Area of a rectangle is length times width: 8 × 5 = 40.",
-                "es": "El área de un rectángulo es largo por ancho: 8 × 5 = 40.",
-            },
-        },
-        {
-            "id": "m5",
-            "question": {
-                "en": "What is the square root of 144?",
-                "es": "¿Cuál es la raíz cuadrada de 144?",
-            },
-            "answers": ["12", "doce"],
-            "answer_display": {"en": "12", "es": "12"},
-            "choices": {
-                "en": ["10", "11", "12", "14"],
-                "es": ["10", "11", "12", "14"],
-            },
-            "explanation": {
-                "en": "12 × 12 = 144.",
-                "es": "12 × 12 = 144.",
-            },
-        },
-    ],
-    "electrical": [
-        {
-            "id": "e1",
-            "question": {
-                "en": "In North American residential wiring, which color is typically used for the equipment ground conductor?",
-                "es": "En el cableado residencial norteamericano, ¿qué color se usa normalmente para el conductor de tierra?",
-            },
-            "answers": ["green", "bare", "bare copper", "verde", "cobre desnudo"],
-            "answer_display": {"en": "Green or bare copper", "es": "Verde o cobre desnudo"},
-            "choices": {
-                "en": ["Green or bare copper", "White", "Black", "Red"],
-                "es": ["Verde o cobre desnudo", "Blanco", "Negro", "Rojo"],
-            },
-            "explanation": {
-                "en": "Ground conductors are green or bare copper under NEC standards.",
-                "es": "Los conductores de tierra son verdes o de cobre desnudo según el NEC.",
-            },
-        },
-        {
-            "id": "e2",
-            "question": {
-                "en": "Before measuring resistance with a multimeter, what must you do to the circuit?",
-                "es": "Antes de medir resistencia con un multímetro, ¿qué debes hacer con el circuito?",
-            },
-            "answers": [
-                "power off",
-                "de-energize",
-                "disconnect power",
-                "turn off power",
-                "remove power",
-                "apagar",
-                "desenergizar",
-                "desconectar la energía",
-            ],
-            "answer_display": {"en": "Turn off and isolate the circuit", "es": "Apagar y aislar el circuito"},
-            "choices": {
-                "en": ["Turn off and isolate the circuit", "Switch meter to AC volts", "Increase the fuse size", "Connect to mains power"],
-                "es": ["Apagar y aislar el circuito", "Cambiar el multímetro a voltios AC", "Aumentar el fusible", "Conectar a la red"],
-            },
-            "explanation": {
-                "en": "Resistance is measured on de-energized circuits to avoid damaging the meter and for safety.",
-                "es": "La resistencia se mide en circuitos desenergizados para evitar dañar el multímetro y por seguridad.",
-            },
-        },
-        {
-            "id": "e3",
-            "question": {
-                "en": "What is the maximum breaker or fuse size allowed for a 14 AWG copper branch circuit under the NEC?",
-                "es": "¿Cuál es el tamaño máximo de interruptor o fusible permitido para un circuito derivado de cobre AWG 14 según el NEC?",
-            },
-            "answers": ["15 amp", "15 amps", "15a", "quince amperios", "15 amperios"],
-            "answer_display": {"en": "15 amps", "es": "15 amperios"},
-            "choices": {
-                "en": ["15 amps", "20 amps", "25 amps", "30 amps"],
-                "es": ["15 amperios", "20 amperios", "25 amperios", "30 amperios"],
-            },
-            "explanation": {
-                "en": "NEC Table 310 limits 14 AWG copper branch circuits to 15 amps.",
-                "es": "La tabla 310 del NEC limita los circuitos de cobre AWG 14 a 15 amperios.",
-            },
-        },
-        {
-            "id": "e4",
-            "question": {
-                "en": "When testing a standard household outlet in North America, what voltage should you expect between hot and neutral?",
-                "es": "Al probar un tomacorriente residencial en Norteamérica, ¿qué voltaje debes esperar entre fase y neutro?",
-            },
-            "answers": ["120", "120v", "120 volts", "aproximadamente 120", "120 voltios"],
-            "answer_display": {"en": "About 120 volts", "es": "Aproximadamente 120 voltios"},
-            "choices": {
-                "en": ["About 120 volts", "About 90 volts", "About 208 volts", "About 240 volts"],
-                "es": ["Aproximadamente 120 voltios", "Aproximadamente 90 voltios", "Aproximadamente 208 voltios", "Aproximadamente 240 voltios"],
-            },
-            "explanation": {
-                "en": "North American receptacles deliver roughly 120 VAC between hot and neutral.",
-                "es": "Los tomacorrientes norteamericanos proporcionan alrededor de 120 VCA entre fase y neutro.",
-            },
-        },
-        {
-            "id": "e5",
-            "question": {
-                "en": "Which tool lets you safely verify that a conductor is de-energized before touching it?",
-                "es": "¿Qué herramienta te permite verificar de forma segura que un conductor está desenergizado antes de tocarlo?",
-            },
-            "answers": [
-                "non-contact voltage tester",
-                "voltage sniffer",
-                "tic tracer",
-                "probador de voltaje sin contacto",
-                "busca tensión sin contacto",
-            ],
-            "answer_display": {"en": "A non-contact voltage tester", "es": "Un detector de voltaje sin contacto"},
-            "choices": {
-                "en": ["A non-contact voltage tester", "A soldering iron", "A wire stripper", "A cable tie"],
-                "es": ["Un detector de voltaje sin contacto", "Un cautín", "Un pelacables", "Una brida"],
-            },
-            "explanation": {
-                "en": "A non-contact tester detects live voltage without touching exposed conductors.",
-                "es": "Un detector sin contacto identifica tensión sin tocar conductores expuestos.",
-            },
-        },
-    ],
-}
-
-TRIVIA_LOOKUP: Dict[str, Dict[str, Dict[str, Any]]] = {
-    category: {entry["id"]: entry for entry in entries}
-    for category, entries in TRIVIA_BANK.items()
-}
-
-
-def _serialize_trivia_session(session: TriviaSession) -> Dict[str, Any]:
-    return {
-        "category": session.category,
-        "score": session.score,
-        "total": session.total,
-        "asked_ids": sorted(list(session.asked_ids)),
-        "current_id": session.current_id,
-        "language": session.language,
-        "owner_id": session.owner_id,
-        "channel_idx": session.channel_idx,
-        "is_direct": session.is_direct,
-        "display_name": session.display_name,
-    }
-
-
-def _deserialize_trivia_session(player_key: str, data: Dict[str, Any]) -> TriviaSession:
-    asked = data.get("asked_ids") or []
-    if not isinstance(asked, list):
-        asked = []
-    session = TriviaSession(
-        player_key=player_key,
-        category=data.get("category", "general"),
-        score=int(data.get("score", 0)),
-        total=int(data.get("total", 0)),
-        asked_ids=set(str(x) for x in asked),
-        current_id=data.get("current_id"),
-        language=data.get("language", "en"),
-        owner_id=data.get("owner_id"),
-        channel_idx=data.get("channel_idx"),
-        is_direct=bool(data.get("is_direct", True)),
-        display_name=data.get("display_name"),
-    )
-    return session
-
-
-def _load_trivia_state_store() -> None:
-    loaded = safe_load_json(TRIVIA_STATE_FILE, {})
-    if not isinstance(loaded, dict):
-        return
-    for player_key, data in loaded.items():
-        if isinstance(player_key, str) and isinstance(data, dict):
-            session = _deserialize_trivia_session(player_key, data)
-            TRIVIA_SESSIONS[player_key] = session
-
-
-def _save_trivia_state_store() -> None:
-    try:
-        payload = {
-            key: _serialize_trivia_session(session)
-            for key, session in TRIVIA_SESSIONS.items()
-        }
-        with open(TRIVIA_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        clean_log(f"Could not persist trivia state: {e}", "⚠️")
-
-
-_load_trivia_state_store()
-
-
-TRIVIA_SKIP_WORDS = {"skip", "pass", "next", "omitir", "saltar", "pasar", "siguiente", "continuar"}
-TRIVIA_SCORE_WORDS = {"score", "leaderboard", "puntaje", "tabla", "ranking", "marcador", "puntuacion", "puntuación"}
-
-
-def _normalize_trivia_answer_text(text: str) -> str:
-    return "".join(ch.lower() for ch in text if ch.isalnum())
-
-
-def _trivia_category_title(category: str, language: str) -> str:
-    titles = TRIVIA_CATEGORY_TITLES.get(category, {})
-    return titles.get(language) or titles.get("en") or category.title()
-
-
-def _trivia_player_key(sender_id: Any, is_direct: bool, channel_idx: Optional[int], category: str) -> str:
-    scope = "DM" if is_direct else f"CH{channel_idx if channel_idx is not None else 'broadcast'}"
-    return f"{sender_id}#{scope}::{category}"
-
-
-def _compute_trivia_display_name(sender_id: Any, is_direct: bool, channel_idx: Optional[int]) -> str:
-    try:
-        base = get_node_shortname(sender_id)
-    except Exception:
-        base = str(sender_id)
-    if is_direct:
-        return base
-    channel_names = config.get("channel_names", {}) if isinstance(config, dict) else {}
-    if channel_idx is None:
-        channel_label = "Broadcast"
-    else:
-        channel_label = channel_names.get(str(channel_idx), f"Ch{channel_idx}")
-    return f"{base} @ {channel_label}"
-
-
-def _get_trivia_session(
-    sender_id: Any,
-    is_direct: bool,
-    channel_idx: Optional[int],
-    category: str,
-    language: str,
-) -> TriviaSession:
-    key = _trivia_player_key(sender_id, is_direct, channel_idx, category)
-    session = TRIVIA_SESSIONS.get(key)
-    created = False
-    if session is None:
-        session = TriviaSession(
-            player_key=key,
-            category=category,
-            language=language,
-            owner_id=str(sender_id) if sender_id is not None else None,
-            channel_idx=channel_idx,
-            is_direct=is_direct,
-        )
-        TRIVIA_SESSIONS[key] = session
-        created = True
-    session.owner_id = str(sender_id) if sender_id is not None else session.owner_id
-    session.channel_idx = channel_idx
-    session.is_direct = is_direct
-    session.language = language
-    session.display_name = _compute_trivia_display_name(sender_id, is_direct, channel_idx)
-    if created:
-        _save_trivia_state_store()
-    return session
-
-
-def _get_trivia_question_by_id(category: str, question_id: Optional[str]) -> Optional[Dict[str, Any]]:
-    if question_id is None:
-        return None
-    return TRIVIA_LOOKUP.get(category, {}).get(question_id)
-
-
-def _pick_trivia_question(session: TriviaSession) -> Optional[Dict[str, Any]]:
-    bank = TRIVIA_BANK.get(session.category, [])
-    if not bank:
-        return None
-    available = [q for q in bank if q["id"] not in session.asked_ids]
-    if not available:
-        session.asked_ids.clear()
-        available = list(bank)
-    question = random.choice(available)
-    session.current_id = question["id"]
-    session.asked_ids.add(question["id"])
-    session.hint_used = False
-    return question
-
-
-def _trivia_percentage(score: int, total: int) -> int:
-    if total <= 0:
-        return 0
-    return int(round((score / total) * 100))
-
-
-def _format_trivia_question_text(category: str, question: Dict[str, Any], command_name: str, language: str) -> str:
-    strings = TRIVIA_STRINGS.get(language, TRIVIA_STRINGS["en"])
-    title = _trivia_category_title(category, language)
-    lines: List[str] = []
-    icon = TRIVIA_CATEGORY_EMOJI.get(category, "❓")
-    lines.append(strings["question_intro"].format(title=title, icon=icon))
-    question_text = _localized_text(question.get("question"), language)
-    if question_text:
-        lines.append(question_text)
-    choices = _localized_list(question.get("choices"), language)
-    if choices:
-        lines.append("")
-        lines.append(strings["choices_intro"])
-        for idx, choice in enumerate(choices):
-            label = chr(ord("A") + idx)
-            lines.append(f"  {label}) {choice}")
-    lines.append("")
-    lines.append(strings["answer_prompt"].format(command=command_name))
-    return "\n".join(lines)
-
-
-def _format_trivia_score_line(session: TriviaSession, strings: Dict[str, str]) -> Optional[str]:
-    if session.total <= 0:
-        return None
-    percent = _trivia_percentage(session.score, session.total)
-    return strings["score_line"].format(score=session.score, total=session.total, percent=percent)
-
-
-def _format_trivia_leaderboard(category: str, current_session: TriviaSession, language: str) -> str:
-    strings = TRIVIA_STRINGS.get(language, TRIVIA_STRINGS["en"])
-    title = _trivia_category_title(category, language)
-    lines: List[str] = []
-
-    if current_session.total > 0:
-        percent = _trivia_percentage(current_session.score, current_session.total)
-        lines.append(strings["your_score"].format(score=current_session.score, total=current_session.total, percent=percent))
-        lines.append("")
-
-    sessions = [s for s in TRIVIA_SESSIONS.values() if s.category == category and s.total > 0]
-    if not sessions:
-        lines.append(strings["no_scores"])
-        return "\n".join(lines)
-
-    sessions.sort(key=lambda s: (-s.score, s.total, s.display_name or s.player_key))
-    lines.append(strings["leaderboard_title"].format(title=title))
-    for idx, entry in enumerate(sessions[:5], start=1):
-        percent = _trivia_percentage(entry.score, entry.total)
-        name = entry.display_name or entry.player_key
-        lines.append(strings["leaderboard_entry"].format(rank=idx, name=name, score=entry.score, total=entry.total, percent=percent))
-    return "\n".join(lines)
-
-
-def _evaluate_trivia_answer(
-    session: TriviaSession,
-    question: Dict[str, Any],
-    user_answer: str,
-    command_name: str,
-    language: str,
-) -> str:
-    strings = TRIVIA_STRINGS.get(language, TRIVIA_STRINGS["en"])
-    choices = _localized_list(question.get("choices"), language)
-    acceptable = question.get("answers") or []
-    acceptable_norm = [_normalize_trivia_answer_text(ans) for ans in acceptable]
-
-    user_input = user_answer.strip()
-    normalized = _normalize_trivia_answer_text(user_input)
-    if choices and user_input.strip().upper() in [chr(ord("A") + i) for i in range(len(choices))]:
-        idx = ord(user_input.strip().upper()) - ord("A")
-        if 0 <= idx < len(choices):
-            normalized = _normalize_trivia_answer_text(choices[idx])
-
-    session.total += 1
-    correct = normalized in acceptable_norm
-    if correct:
-        session.score += 1
-
-    explanation = _localized_text(question.get("explanation"), language)
-    answer_display = _localized_text(question.get("answer_display"), language)
-    if correct:
-        result_line = strings["correct"].format(explanation=explanation) if explanation else strings["correct_no_expl"]
-    else:
-        correct_text = answer_display or (acceptable[0] if acceptable else question.get("answer", ""))
-        if explanation:
-            result_line = strings["incorrect"].format(answer=correct_text, explanation=explanation)
-        else:
-            result_line = strings["incorrect_no_expl"].format(answer=correct_text)
-
-    score_line = _format_trivia_score_line(session, strings)
-
-    next_question = _pick_trivia_question(session)
-    next_block = None
-    if next_question:
-        next_block = _format_trivia_question_text(session.category, next_question, command_name, language)
-
-    _save_trivia_state_store()
-
-    response_lines = [result_line]
-    if score_line:
-        response_lines.append(score_line)
-    if next_block:
-        response_lines.append("")
-        response_lines.append(strings["new_question"])
-        response_lines.append(next_block)
-    return "\n".join(response_lines)
-
-
-def handle_trivia_command(
-    command_name: str,
-    category: str,
-    arguments: str,
-    sender_id: Any,
-    is_direct: bool,
-    channel_idx: Optional[int],
-    language_hint: Optional[str],
-) -> str:
-    language = _normalize_language_code(language_hint) if language_hint else LANGUAGE_FALLBACK
-    strings = TRIVIA_STRINGS.get(language, TRIVIA_STRINGS["en"])
-
-    session = _get_trivia_session(sender_id, is_direct, channel_idx, category, language)
-
-    args = arguments.strip()
-    if not args:
-        question = _pick_trivia_question(session)
-        if not question:
-            return strings["no_questions"]
-        _save_trivia_state_store()
-        question_text = _format_trivia_question_text(category, question, command_name, language)
-        score_line = _format_trivia_score_line(session, strings)
-        if score_line:
-            return f"{question_text}\n\n{score_line}"
-        return question_text
-
-    lower_args = args.lower()
-    if lower_args in TRIVIA_SCORE_WORDS:
-        return _format_trivia_leaderboard(category, session, language)
-
-    if lower_args == "hint":
-        if session.current_id is None:
-            return strings["no_question"].format(command=command_name)
-        if session.hint_used:
-            return strings.get("hint_used", "Hint already used.")
-        question = _get_trivia_question_by_id(session.category, session.current_id)
-        if not question:
-            return strings["no_question"].format(command=command_name)
-        answers = question.get("answers") or []
-        letter = "?"
-        for ans in answers:
-            for ch in str(ans):
-                if ch.isalpha():
-                    letter = ch.upper()
-                    break
-            if letter != "?":
-                break
-        session.hint_used = True
-        _save_trivia_state_store()
-        template = strings.get("hint") or "Hint: starts with {letter}."
-        return template.format(letter=letter)
-
-    if lower_args in TRIVIA_SKIP_WORDS:
-        session.current_id = None
-        question = _pick_trivia_question(session)
-        if not question:
-            _save_trivia_state_store()
-            return strings["no_questions"]
-        _save_trivia_state_store()
-        question_text = _format_trivia_question_text(category, question, command_name, language)
-        score_line = _format_trivia_score_line(session, strings)
-        response = f"{strings['skipped']}\n\n{question_text}"
-        if score_line:
-            response += f"\n\n{score_line}"
-        return response
-
-    if session.current_id is None:
-        return strings["no_question"].format(command=command_name)
-
-    question = _get_trivia_question_by_id(session.category, session.current_id)
-    if question is None:
-        # Question data rotated; fetch a fresh one and prompt again.
-        question = _pick_trivia_question(session)
-        if not question:
-            _save_trivia_state_store()
-            return strings["no_questions"]
-        _save_trivia_state_store()
-        question_text = _format_trivia_question_text(category, question, command_name, language)
-        return f"{strings['no_question'].format(command=command_name)}\n\n{question_text}"
-
-    response = _evaluate_trivia_answer(session, question, args, command_name, language)
-    return response
-
-
-
-TRAINER_CONTENT: Dict[str, Dict[str, Any]] = {
-    "morsecodetrainer": {
-        "title": {"en": "📻 Morse Code Trainer", "es": "📻 Entrenador de código Morse"},
-        "sections": [
-            {
-                "title": {"en": "🔔 Core signals to memorize", "es": "🔔 Señales básicas para memorizar"},
-                "bullets": [
-                    {"en": "🔤 A = · – (di-dah), N = – · (dah-di)", "es": "🔤 A = · – (di-dah), N = – · (dah-di)"},
-                    {"en": "🆘 SOS = · · · – – – · · · (three short, three long, three short)", "es": "🆘 SOS = · · · – – – · · · (tres cortos, tres largos, tres cortos)"},
-                    {"en": "🔢 Numbers: 1 = · – – – –, 5 = · · · · ·, 0 = – – – – –", "es": "🔢 Números: 1 = · – – – –, 5 = · · · · ·, 0 = – – – – –"},
-                    {"en": "📡 Prosigns: AR = · – · – · (end of message), SK = · · · – · – (clear)", "es": "📡 Prosignos: AR = · – · – · (fin del mensaje), SK = · · · – · – (libre)"},
-                ],
-            },
-            {
-                "title": {"en": "🔥 Practice drill", "es": "🔥 Ejercicio de práctica"},
-                "bullets": [
-                    {"en": "⏱️ Spend 3 minutes copying five random letters at 12 WPM; keep spacing steady.", "es": "⏱️ Dedica 3 minutos a copiar cinco letras aleatorias a 12 WPM; mantén el espaciado uniforme."},
-                    {"en": "📻 Send your name and grid square using rhythmic taps or flashlight pulses.", "es": "📻 Envía tu nombre y cuadrícula usando toques rítmicos o pulsos de linterna."},
-                    {"en": "🎧 Record yourself and play it back to spot uneven dits/dahs.", "es": "🎧 Grábate y reprodúcelo para detectar dits/dahs irregulares."}
-                ],
-            },
-            {
-                "title": {"en": "🌐 Mesh challenge", "es": "🌐 Desafío en la malla"},
-                "bullets": [
-                    {"en": "🤝 Pick a partner: trade short weather reports in Morse, then translate within 1 minute.", "es": "🤝 Elige un compañero: intercambien reportes breves del clima en Morse y traduzcan en menos de 1 minuto."},
-                    {"en": "🌐 Post a three-word encouragement in Morse; wait for someone to decode before revealing the plaintext.", "es": "🌐 Publica un mensaje de aliento de tres palabras en Morse; espera a que alguien lo descifre antes de revelar el texto."}
-                ],
-            },
-        ],
-        "challenge": {"en": "⭐ Pro tip: set a metronome around 60 BPM so each beat equals one dit for smooth rhythm.", "es": "⭐ Consejo: ajusta un metrónomo a unos 60 BPM para que cada pulso sea un dit y mantengas el ritmo."},
-    },
-    "hurricanetrainer": {
-        "title": {"en": "🌀 Hurricane Safety Trainer", "es": "🌀 Entrenador de seguridad ante huracanes"},
-        "sections": [
-            {
-                "title": {"en": "☀️ Before the storm (watch issued)", "es": "☀️ Antes de la tormenta (aviso emitido)"},
-                "bullets": [
-                    {"en": "📸 Document home exterior with photos; store a copy in the cloud.", "es": "📸 Documenta el exterior de la casa con fotos; guarda una copia en la nube."},
-                    {"en": "✂️ Trim weak branches and secure propane tanks or grills.", "es": "✂️ Recorta ramas débiles y asegura tanques de propano o parrillas."},
-                    {"en": "🎒 Stage a go-bag with waterproof IDs, cash, spare keys, and prescription refills.", "es": "🎒 Prepara una mochila de emergencia con identificaciones impermeables, efectivo, llaves de repuesto y medicamentos recetados."}
-                ],
-            },
-            {
-                "title": {"en": "🌧️ During impact", "es": "🌧️ Durante el impacto"},
-                "bullets": [
-                    {"en": "🛡️ Shelter in an interior room, away from windows; keep helmets for kids.", "es": "🛡️ Refúgiate en un cuarto interior, lejos de las ventanas; reserva cascos para los niños."},
-                    {"en": "📻 Listen to NOAA alerts or mesh updates every 30 minutes; conserve phone battery.", "es": "📻 Escucha alertas de NOAA o actualizaciones de la malla cada 30 minutos; conserva la batería del teléfono."},
-                    {"en": "⬆️ If storm surge threatens, move to higher floors—never to an attic without a way out.", "es": "⬆️ Si amenaza una marejada, sube a pisos superiores; nunca al ático sin una salida."}
-                ],
-            },
-            {
-                "title": {"en": "🌈 Post-storm checklist", "es": "🌈 Lista posterior a la tormenta"},
-                "bullets": [
-                    {"en": "🚫 Avoid floodwater—it can hide debris, live wires, or sewage.", "es": "🚫 Evita el agua de inundación; puede ocultar escombros, cables energizados o aguas residuales."},
-                    {"en": "📷 Snap damage photos before temporary repairs for insurance.", "es": "📷 Toma fotos de los daños antes de reparaciones temporales para el seguro."},
-                    {"en": "🤝 Coordinate neighborhood wellness checks; share generator power rotations.", "es": "🤝 Coordina revisiones de bienestar en el vecindario; compartan turnos de generador."}
-                ],
-            },
-        ],
-        "challenge": {"en": "⭐ Drill idea: run a 10-minute family briefing using this list and time how long it takes to secure shutters.", "es": "⭐ Ejercicio: realiza un informe familiar de 10 minutos con esta lista y mide cuánto tardan en asegurar las contraventanas."},
-    },
-    "tornadotrainer": {
-        "title": {"en": "🌪️ Tornado Safety Trainer", "es": "🌪️ Entrenador de seguridad ante tornados"},
-        "sections": [
-            {
-                "title": {"en": "🧰 Preparedness phase", "es": "🧰 Fase de preparación"},
-                "bullets": [
-                    {"en": "🏚️ Identify your lowest-level safe room; stock water, helmets, gloves, and whistle.", "es": "🏚️ Identifica tu refugio seguro en el nivel más bajo; almacena agua, cascos, guantes y un silbato."},
-                    {"en": "👢 Keep sturdy shoes under every bed for debris-filled evacuations.", "es": "👢 Guarda zapatos resistentes bajo cada cama para evacuaciones entre escombros."},
-                    {"en": "⏱️ Sign up for local siren tests; practice dropping into shelter under 60 seconds.", "es": "⏱️ Inscríbete en pruebas de sirenas locales; practica entrar al refugio en menos de 60 segundos."}
-                ],
-            },
-            {
-                "title": {"en": "⚠️ Warning in effect", "es": "⚠️ Advertencia en vigor"},
-                "bullets": [
-                    {"en": "🏃 Move instantly to shelter—no window watching, no driving to outrun it.", "es": "🏃 Muévete de inmediato al refugio: nada de mirar por la ventana ni intentar huir en auto."},
-                    {"en": "🛏️ Cover yourself with mattress, cushions, or heavy blankets to guard against debris.", "es": "🛏️ Cúbrete con un colchón, cojines o mantas pesadas para protegerte de los escombros."},
-                    {"en": "📡 Use your mesh device or radio in receive-only mode to avoid stray RF during lightning.", "es": "📡 Usa tu dispositivo de malla o radio en modo solo recepción para evitar RF errante durante los relámpagos."}
-                ],
-            },
-            {
-                "title": {"en": "🌤️ After the funnel passes", "es": "🌤️ Después de que pase el embudo"},
-                "bullets": [
-                    {"en": "⚡ Beware downed lines and leaking gas; shut mains off only if trained.", "es": "⚡ Cuidado con cables caídos y fugas de gas; cierra las llaves principales solo si sabes cómo."},
-                    {"en": "🚧 Mark hazards (nails, glass) with bright tape for neighbors and responders.", "es": "🚧 Marca peligros (clavos, vidrios) con cinta brillante para vecinos y rescatistas."},
-                    {"en": "📝 Log damage and survivor status in the mesh network to speed mutual aid.", "es": "📝 Registra daños y el estado de las personas en la malla para agilizar la ayuda mutua."}
-                ],
-            },
-        ],
-        "challenge": {"en": "⭐ Run a 5-minute shelter drill, then share a 'status OK' message with your call sign once you're secured.", "es": "⭐ Realiza un simulacro de refugio de 5 minutos y comparte un mensaje 'estado OK' con tu indicativo cuando estés a salvo."},
-    },
-    "radioprocedurestrainer": {
-        "title": {"en": "📡 Emergency Radio Procedures Trainer", "es": "📡 Entrenador de procedimientos de radio de emergencia"},
-        "sections": [
-            {
-                "title": {"en": "🗒️ Message format", "es": "🗒️ Formato del mensaje"},
-                "bullets": [
-                    {"en": "📣 Call: 'This is [your call sign], priority traffic for [station].'", "es": "📣 Llamada: 'Aquí [tu indicativo], tráfico prioritario para [estación].'"},
-                    {"en": "🧭 Include: who you are, location (lat/long or landmark), need, and action requested.", "es": "🧭 Incluye: quién eres, ubicación (lat/lon o referencia), necesidad y acción solicitada."},
-                    {"en": "🔚 Close with 'Over' to hand the channel back; use 'Out' only when terminating.", "es": "🔚 Cierra con 'Cambio' para devolver el canal; usa 'Fuera' solo al terminar."}
-                ],
-            },
-            {
-                "title": {"en": "🎙️ Clarity tips", "es": "🎙️ Consejos de claridad"},
-                "bullets": [
-                    {"en": "🗣️ Speak in short blocks under 10 seconds; pause for relays or acks.", "es": "🗣️ Habla en bloques cortos de menos de 10 segundos; haz pausas para relevos o acuses."},
-                    {"en": "🔡 Spell critical words with NATO alphabet (e.g., 'MEDIC is Mike-Echo-Delta-India-Charlie').", "es": "🔡 Deletrea palabras críticas con el alfabeto NATO (ej., 'MEDIC es Mike-Echo-Delta-India-Charlie')."},
-                    {"en": "📝 Log every send/receive time in a notebook for after-action review.", "es": "📝 Registra cada hora de envío y recepción en un cuaderno para la revisión posterior."}
-                ],
-            },
-            {
-                "title": {"en": "🔁 Mesh practice", "es": "🔁 Práctica en la malla"},
-                "bullets": [
-                    {"en": "🛰️ Send a simulated SITREP (situation report) to your group; request an acknowledgement.", "es": "🛰️ Envía un SITREP (reporte de situación) simulado a tu grupo; solicita un acuse de recibo."},
-                    {"en": "🔄 Practice relaying a message exactly as received—note when you add clarifying remarks.", "es": "🔄 Practica retransmitir un mensaje exactamente como lo recibiste; anota si agregas aclaraciones."},
-                    {"en": "🎛️ Rotate net control duty so everyone learns to queue and release the channel.", "es": "🎛️ Roten el control de la red para que todos practiquen cómo ordenar turnos y liberar el canal."}
-                ],
-            },
-        ],
-        "challenge": {"en": "⭐ Every weekend, log a 3-line SITREP to your mesh channel and note the fastest acknowledgement time.", "es": "⭐ Cada fin de semana registra un SITREP de 3 líneas en tu canal de malla y anota el acuse más rápido."},
-    },
-    "navigationtrainer": {
-        "title": {"en": "🧭 Navigation Without a Compass", "es": "🧭 Navegación sin brújula"},
-        "sections": [
-            {
-                "title": {"en": "☀️ Daytime cues", "es": "☀️ Referencias diurnas"},
-                "bullets": [
-                    {"en": "🌞 Track the sun: it rises roughly east and sets west—map shadow angles at noon.", "es": "🌞 Sigue al sol: sale aproximadamente por el este y se oculta al oeste; registra los ángulos de sombra al mediodía."},
-                    {"en": "🌿 Observe vegetation: moss prefers northern shade in many regions (verify locally).", "es": "🌿 Observa la vegetación: el musgo prefiere la sombra del norte en muchas regiones (verifícalo localmente)."},
-                    {"en": "💧 Follow water flow downhill; streams often converge toward populated valleys.", "es": "💧 Sigue el flujo del agua cuesta abajo; los arroyos suelen converger hacia valles poblados."}
-                ],
-            },
-            {
-                "title": {"en": "🌌 Night-sky guides", "es": "🌌 Guías del cielo nocturno"},
-                "bullets": [
-                    {"en": "⭐ Northern Hemisphere: locate the Big Dipper; the pointer stars aim at Polaris (North).", "es": "⭐ Hemisferio norte: localiza la Osa Mayor; las estrellas guía apuntan a Polaris (norte)."},
-                    {"en": "🌠 Southern Hemisphere: use the Southern Cross—extend the long axis 4.5 times to find south.", "es": "🌠 Hemisferio sur: usa la Cruz del Sur; prolonga su eje largo 4.5 veces para ubicar el sur."},
-                    {"en": "🌙 Track the Moon: in its first quarter, the illuminated side roughly faces west at sunset.", "es": "🌙 Observa la Luna: en su primer cuarto, el lado iluminado mira aproximadamente hacia el oeste al atardecer."}
-                ],
-            },
-            {
-                "title": {"en": "🥾 Field drill", "es": "🥾 Práctica en campo"},
-                "bullets": [
-                    {"en": "🪵 Shadow stick method: mark the tip of a stick's shadow every 15 min to draw an east-west line.", "es": "🪵 Método del palo y sombra: marca la punta de la sombra cada 15 min para trazar una línea este-oeste."},
-                    {"en": "🚶 Travel using handrail features (roads, rivers) and pace-count landmarks every 100 meters.", "es": "🚶 Avanza usando elementos guía (caminos, ríos) y cuenta pasos entre puntos de referencia cada 100 metros."},
-                    {"en": "📓 Log bearings and estimated distances in a notebook to compare with actual map data later.", "es": "📓 Anota rumbos y distancias estimadas en un cuaderno para compararlos luego con el mapa real."}
-                ],
-            },
-        ],
-        "challenge": {"en": "⭐ Choose a trail—navigate out using only natural cues, then verify accuracy with a compass on return.", "es": "⭐ Elige un sendero: navega solo con referencias naturales y verifica la precisión con una brújula al regresar."},
-    },
-    "boatingtrainer": {
-        "title": {"en": "⛵ Boating Safety Trainer", "es": "⛵ Entrenador de seguridad náutica"},
-        "sections": [
-            {
-                "title": {"en": "🛠️ Pre-launch checks", "es": "🛠️ Revisiones previas al zarpe"},
-                "bullets": [
-                    {"en": "🦺 Verify flotation devices for every passenger plus one spare.", "es": "🦺 Verifica dispositivos de flotación para cada pasajero y uno de repuesto."},
-                    {"en": "🔧 Check bilge pump, nav lights, horn/whistle, and fire extinguishers.", "es": "🔧 Revisa la bomba de achique, luces de navegación, bocina/silbato y extintores."},
-                    {"en": "🗺️ File a float plan with route, crew list, and ETA; share via mesh or text.", "es": "🗺️ Presenta un plan de navegación con ruta, tripulación y ETA; compártelo por la malla o mensaje."}
-                ],
-            },
-            {
-                "title": {"en": "🌊 Underway habits", "es": "🌊 Hábitos en navegación"},
-                "bullets": [
-                    {"en": "👀 Keep a 360° lookout every few minutes—assign a dedicated spotter in busy waters.", "es": "👀 Mantén una vigilancia 360° cada pocos minutos; asigna un vigía dedicado en aguas concurridas."},
-                    {"en": "⏱️ Maintain safe speed for conditions; post a bow watch in low visibility.", "es": "⏱️ Mantén una velocidad segura según las condiciones; coloca un vigía en proa con baja visibilidad."},
-                    {"en": "🌤️ Hydrate and shade crew; heat sickness is common on open water.", "es": "🌤️ Hidrata y da sombra a la tripulación; el golpe de calor es común en mar abierto."}
-                ],
-            },
-            {
-                "title": {"en": "🚨 Emergency response", "es": "🚨 Respuesta ante emergencias"},
-                "bullets": [
-                    {"en": "🛟 If someone falls overboard: shout, point, throw flotation, then circle back downwind.", "es": "🛟 Si alguien cae al agua: grita, señala, lanza flotación y regresa haciendo un giro a sotavento."},
-                    {"en": "🔥 Engine fire: shut fuel, aim extinguisher at base, issue mayday if uncontrolled.", "es": "🔥 Incendio en motor: corta el combustible, apunta el extintor a la base y emite mayday si no se controla."},
-                    {"en": "🛑 Grounding: cut engine, assess hull breach, deploy anchor to prevent further damage.", "es": "🛑 Varadura: apaga el motor, evalúa brechas en el casco y fondea el ancla para evitar más daños."}
-                ],
-            },
-        ],
-        "challenge": {"en": "⭐ Conduct a mock man-overboard drill within your crew and log the recovery time each month.", "es": "⭐ Realicen un simulacro de hombre al agua y registren el tiempo de recuperación cada mes."},
-    },
-    "wellnesstrainer": {
-        "title": {"en": "🏠 Emergency Wellness & Home Care Trainer", "es": "🏠 Entrenador de bienestar y cuidado del hogar en emergencias"},
-        "sections": [
-            {
-                "title": {"en": "🐾 Pet safety essentials", "es": "🐾 Esenciales de seguridad para mascotas"},
-                "bullets": [
-                    {"en": "🎒 Prepare a pet go-bag: food, collapsible bowls, meds, vet records, and comfort item.", "es": "🎒 Prepara una mochila para mascotas: alimento, platos plegables, medicinas, historial veterinario y objeto de consuelo."},
-                    {"en": "🏷️ Label carriers with contact info; practice quick loading drills.", "es": "🏷️ Etiqueta transportadoras con datos de contacto; practica cargarlas rápidamente."},
-                    {"en": "🧺 Keep extra litter or waste bags to maintain sanitation indoors.", "es": "🧺 Ten arena extra o bolsas para desechos y así mantener la sanidad en interiores."}
-                ],
-            },
-            {
-                "title": {"en": "🕯️ Home care during long blackouts", "es": "🕯️ Cuidado del hogar durante apagones prolongados"},
-                "bullets": [
-                    {"en": "🚪 Rotate fridge opening—group meals to limit cold loss and use thermometers to monitor temp.", "es": "🚪 Limita la apertura del refrigerador agrupando comidas y usa termómetros para vigilar la temperatura."},
-                    {"en": "🌬️ Ventilate with cross-breeze during daylight; insulate windows with blankets at night.", "es": "🌬️ Ventila con corrientes cruzadas de día; aísla ventanas con cobijas por la noche."},
-                    {"en": "🔋 Charge devices via solar panels by day; reserve battery banks for critical comms at night.", "es": "🔋 Carga dispositivos con paneles solares de día; reserva baterías para comunicaciones críticas por la noche."}
-                ],
-            },
-            {
-                "title": {"en": "🤝 Community wellness", "es": "🤝 Bienestar comunitario"},
-                "bullets": [
-                    {"en": "🗓️ Schedule neighborhood wellness check-ins twice daily via mesh or door knock.", "es": "🗓️ Programa revisiones de bienestar vecinal dos veces al día por la malla o tocando puertas."},
-                    {"en": "📋 Share surplus supplies using a visible whiteboard or shared spreadsheet.", "es": "📋 Comparte suministros sobrantes con un pizarrón visible o una hoja compartida."},
-                    {"en": "🩺 Log medical needs and stress signals to refer volunteers or telehealth resources.", "es": "🩺 Registra necesidades médicas y señales de estrés para asignar voluntarios o recursos de telemedicina."}
-                ],
-            },
-        ],
-        "challenge": {"en": "⭐ Host a 30-minute blackout simulation: run devices off battery and note any comfort gaps to fix.", "es": "⭐ Organiza un simulacro de apagón de 30 minutos: usa solo baterías y anota carencias de comodidad por resolver."},
-    },
-    "electricaltrainer": {
-        "title": {"en": "⚡ Electrical DIY Safety Trainer", "es": "⚡ Entrenador de seguridad eléctrica DIY"},
-        "sections": [
-            {
-                "title": {"en": "🔌 Home wiring basics", "es": "🔌 Conceptos básicos del cableado"},
-                "bullets": [
-                    {"en": "Identify conductors: hot=black/red, neutral=white, ground=green or bare.", "es": "Identifica los conductores: fase=negro/rojo, neutro=blanco, tierra=verde o cobre desnudo."},
-                    {"en": "Always kill power at the breaker and verify before touching conductors.", "es": "Siempre corta la energía en el interruptor principal y verifica antes de tocar conductores."},
-                    {"en": "Match breaker size to wire gauge (ex: 14 AWG → 15A, 12 AWG → 20A).", "es": "Empareja el calibre del cable con el interruptor (ej.: AWG 14 → 15A, AWG 12 → 20A)."}
-                ],
-            },
-            {
-                "title": {"en": "🧪 Multimeter fundamentals", "es": "🧪 Fundamentos del multímetro"},
-                "bullets": [
-                    {"en": "Inspect leads for cracks and confirm the meter fuse before measuring.", "es": "Revisa los cables por grietas y confirma el fusible del multímetro antes de medir."},
-                    {"en": "Measure voltage first, then switch to resistance only after power is disconnected.", "es": "Mide voltaje primero y cambia a resistencia solo después de desconectar la energía."},
-                    {"en": "Use one hand when probing live panels and stand on an insulated surface.", "es": "Usa una sola mano al medir paneles energizados y párate sobre una superficie aislada."}
-                ],
-            },
-            {
-                "title": {"en": "🛠️ DIY inspection checklist", "es": "🛠️ Lista de inspección DIY"},
-                "bullets": [
-                    {"en": "Check outlets for tight blade tension and replace cracked receptacle faces.", "es": "Verifica que los tomacorrientes sujeten firmemente las clavijas y reemplaza las placas agrietadas."},
-                    {"en": "Test GFCI/AFCI devices monthly and log the date on the panel cover.", "es": "Prueba los dispositivos GFCI/AFCI mensualmente y anota la fecha en la tapa del panel."},
-                    {"en": "Label breaker circuits clearly so future troubleshooting is fast and safe.", "es": "Etiqueta claramente los circuitos del panel para agilizar futuras reparaciones de forma segura."}
-                ],
-            },
-        ],
-        "challenge": {"en": "⭐ Map every outlet/light to its breaker and note the amperage in your field notebook.", "es": "⭐ Mapea cada tomacorriente/lámpara a su interruptor y anota el amperaje en tu cuaderno."},
-    },
-}
-
-
-TRAINER_COMMAND_MAP = {
-    "/morsecodetrainer": "morsecodetrainer",
-    "/hurricanetrainer": "hurricanetrainer",
-    "/tornadotrainer": "tornadotrainer",
-    "/radioprocedurestrainer": "radioprocedurestrainer",
-    "/navigationtrainer": "navigationtrainer",
-    "/boatingtrainer": "boatingtrainer",
-    "/wellnesstrainer": "wellnesstrainer",
-    "/electricaltrainer": "electricaltrainer",
-}
-
-
-def format_trainer_response(trainer_key: str, language: str) -> str:
-    content = TRAINER_CONTENT.get(trainer_key)
-    if not content:
-        return "Trainer module is still loading. Try again soon."
-    lang = _normalize_language_code(language) if language else LANGUAGE_FALLBACK
-    lines: List[str] = []
-    title = _localized_text(content.get("title"), lang)
-    if not title:
-        title = trainer_key.replace("trainer", "Trainer").title()
-    lines.append(title)
-
-    sections = content.get("sections", [])
-    for section in sections:
-        section_title = _localized_text(section.get("title"), lang)
-        bullets = section.get("bullets", [])
-        bullet_lines: List[str] = []
-        for bullet in bullets:
-            bullet_text = _localized_text(bullet, lang)
-            if bullet_text:
-                bullet_lines.append(bullet_text)
-        if section_title or bullet_lines:
-            lines.append("")
-        if section_title:
-            lines.append(section_title)
-        for bullet_text in bullet_lines:
-            lines.append(f"- {bullet_text}")
-
-    challenge = _localized_text(content.get("challenge"), lang)
-    if challenge:
-        lines.append("")
-        lines.append(challenge)
-    return "\n".join(lines)
 
 
 def format_structured_menu(menu_key: str, language: Optional[str]) -> str:
@@ -5976,27 +6277,241 @@ def format_structured_menu(menu_key: str, language: Optional[str]) -> str:
     return "\n".join(lines)
 
 
-def format_survival_guide(cmd: str, language: Optional[str]) -> str:
+
+
+COMMAND_CATEGORY_DEFINITIONS: "OrderedDict[str, Dict[str, Any]]" = OrderedDict([
+    (
+        "core_ops",
+        {
+            "label": "Core Ops",
+            "commands": [
+                "/about", "/help", "/menu", "/whereami", "/test", "/motd",
+                "/meshinfo", "/meshtastic", "/offline", "/stop", "/exit",
+                "/save", "/recall", "/reset", "/data",
+                "/alarm", "/timer", "/stopwatch",
+            ],
+        },
+    ),
+    (
+        "ai_tools",
+        {
+            "label": "AI & Personalization",
+            "commands": [
+                "/ai", "/bot", "/data", "/vibe", "/aipersonality", "/chathistory",
+                "/changeprompt", "/showprompt", "/printprompt", "/changemotd", "/aisettings",
+            ],
+        },
+    ),
+    (
+        "mail_ops",
+        {
+            "label": "Mail & Messaging",
+            "commands": [
+                "/m", "/mail", "/c", "/checkmail", "/emailhelp", "/wipe",
+            ],
+        },
+    ),
+    (
+        "information",
+        {
+            "label": "Information & Reference",
+            "commands": [
+                "/bible", "/biblehelp", "/weather", "/web", "/wiki", "/drudge",
+                "/motd", "/meshinfo", "/meshtastic", "/elpaso",
+            ],
+        },
+    ),
+    (
+        "games",
+        {
+            "label": "Games",
+            "commands": [
+                "/games", "/blackjack", "/yahtzee", "/hangman", "/wordle", "/adventure", "/wordladder",
+                "/rps", "/coinflip", "/cipher", "/quizbattle", "/morse",
+            ],
+        },
+    ),
+    (
+        "fun",
+        {
+            "label": "Fun & Extras",
+            "commands": [
+                "/jokes", "/chucknorris", "/blond", "/yomomma",
+            ],
+        },
+    ),
+    (
+        "custom",
+        {
+            "label": "Custom Commands",
+            "commands": [],
+        },
+    ),
+])
+
+
+def _all_known_commands() -> Set[str]:
+    return {
+        cmd
+        for cmd in (_normalize_command_name(token) for token in _known_commands())
+        if cmd
+    }
+
+
+def _collect_command_categories() -> List[Dict[str, Any]]:
+    known = _all_known_commands()
+    assigned: Set[str] = set()
+    categories: List[Dict[str, Any]] = []
+
+    for cat_id, meta in COMMAND_CATEGORY_DEFINITIONS.items():
+        label = meta.get("label", cat_id.title())
+        configured = meta.get("commands", []) or []
+        commands: Set[str] = set()
+        for cmd in configured:
+            normalized = _normalize_command_name(cmd)
+            if normalized in known:
+                commands.add(normalized)
+                assigned.add(normalized)
+
+        if cat_id == "custom":
+            for entry in commands_config.get("commands", []):
+                custom_cmd = _normalize_command_name(entry.get("command"))
+                if custom_cmd:
+                    commands.add(custom_cmd)
+                    if custom_cmd in known:
+                        assigned.add(custom_cmd)
+
+        if commands:
+            categories.append(
+                {
+                    "id": cat_id,
+                    "label": label,
+                    "commands": sorted(commands),
+                }
+            )
+
+    remaining = sorted(cmd for cmd in known if cmd not in assigned and cmd.startswith('/'))
+    if remaining:
+        categories.append(
+            {
+                "id": "other",
+                "label": "Other Commands",
+                "commands": remaining,
+            }
+        )
+
+    return categories
+
+
+def _admin_snapshot() -> List[Dict[str, str]]:
+    entries: List[Dict[str, str]] = []
+    for key in sorted(AUTHORIZED_ADMINS):
+        label = AUTHORIZED_ADMIN_NAMES.get(key) or key
+        entries.append({'key': key, 'label': label})
+    return entries
+
+
+def gather_feature_snapshot() -> Dict[str, Any]:
+    snapshot = get_feature_flags_snapshot()
+    ai_enabled = bool(snapshot.get("ai_enabled", True))
+    disabled_commands = snapshot.get("disabled_commands", [])
+    message_mode = snapshot.get("message_mode", "both")
+    admin_passphrase = snapshot.get("admin_passphrase", "")
+    auto_ping_enabled = bool(snapshot.get("auto_ping_enabled", True))
+    admin_whitelist = snapshot.get("admin_whitelist", [])
+
+    disabled_set = {_normalize_command_name(cmd) for cmd in disabled_commands}
+    alias_map = _command_alias_map()
+    categories: List[Dict[str, Any]] = []
+    for category in _collect_command_categories():
+        entries = []
+        category_label = category["label"]
+        for cmd in category["commands"]:
+            aliases = alias_map.get(cmd, [])
+            entries.append(
+                {
+                    "name": cmd,
+                    "enabled": cmd not in disabled_set,
+                    "aliases": aliases,
+                    "summary": COMMAND_SUMMARIES.get(cmd),
+                    "category": category_label,
+                }
+            )
+        categories.append(
+            {
+                "id": category["id"],
+                "label": category_label,
+                "commands": entries,
+            }
+        )
+
+    alerts: List[str] = []
+    if not ai_enabled:
+        alerts.append("AI responses are disabled")
+    if message_mode == "dm_only":
+        alerts.append("Channel messages disabled")
+    elif message_mode == "channel_only":
+        alerts.append("Direct messages disabled")
+    for cmd in disabled_commands:
+        alerts.append(f"Command {cmd} disabled")
+    if not auto_ping_enabled:
+        alerts.append("Auto ping replies disabled")
+
+    return {
+        "ai_enabled": ai_enabled,
+        "message_mode": message_mode if message_mode in MESSAGE_MODE_OPTIONS else "both",
+        "categories": categories,
+        "disabled_commands": disabled_commands,
+        "admin_whitelist": admin_whitelist,
+        "admin_passphrase": admin_passphrase,
+        "auto_ping_enabled": auto_ping_enabled,
+        "admins": _admin_snapshot(),
+        "alerts": alerts,
+    }
+
+
+def format_structured_menu(menu_key: str, language: Optional[str]) -> str:
     lang = _preferred_menu_language(language)
-    guide = SURVIVAL_GUIDES.get(cmd)
-    if not guide:
-        return "Survival notes are not available yet."
+    data = MENU_DEFINITIONS.get(menu_key)
+    if not data:
+        return "Menu is not available yet."
     lines: List[str] = []
-    title = guide.get("title", {}).get(lang) or guide.get("title", {}).get("en")
+    title = data.get("title", {}).get(lang) or data.get("title", {}).get("en")
     if title:
         lines.append(title)
-    points = guide.get("points", [])
-    if points:
-        lines.append("")
-        for point in points:
-            text = point.get(lang) or point.get("en")
+    for section in data.get("sections", []):
+        section_title = None
+        if isinstance(section, dict):
+            section_title = section.get("title", {}).get(lang) or section.get("title", {}).get("en")
+        if lines and (section_title or section.get("items")):
+            lines.append("")
+        if section_title:
+            lines.append(section_title)
+        items = section.get("items", []) if isinstance(section, dict) else []
+        for item in items:
+            text = ""
+            if isinstance(item, dict):
+                if "text" in item:
+                    text = _localized_text(item.get("text"), lang)
+                else:
+                    command = item.get("command")
+                    description = _localized_text(item.get("description"), lang)
+                    if command and description:
+                        text = f"{command} - {description}".strip()
+                    elif command:
+                        text = str(command)
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                command, desc_map = item
+                description = _localized_text(desc_map, lang) if isinstance(desc_map, dict) else str(desc_map)
+                text = f"{command} - {description}".strip() if description else str(command)
+            elif isinstance(item, str):
+                text = item
             if text:
-                lines.append(f"- {text}")
-    reflection = guide.get("reflection", {}).get(lang) or guide.get("reflection", {}).get("en")
-    if reflection:
-        label = SURVIVAL_REFLECTION_LABEL.get(lang) or SURVIVAL_REFLECTION_LABEL.get("en")
+                lines.append(text.strip())
+    footer = data.get("footer", {}).get(lang) or data.get("footer", {}).get("en")
+    if footer:
         lines.append("")
-        lines.append(f"{label}: {reflection}")
+        lines.append(footer)
     return "\n".join(lines)
 
 
@@ -6085,6 +6600,7 @@ LANGUAGE_RESPONSES = {
         "password_prompt": "responde con la contraseña",
         "password_success": "¡Listo! Ahora estás autorizado para hacer cambios de administrador",
         "password_failure": "ni hablar, inténtalo de nuevo... o no",
+        "admin_auth_required": "🔐 Se requiere acceso de administrador. Responde con la contraseña para continuar.",
         "weather_need_city": "No pude encontrar esa ubicación. Dame la ciudad principal más cercana y lo intento de nuevo.",
         "weather_final_fail": "Aún no encuentro esa ubicación. Intenta con otra ciudad o código postal.",
         "weather_service_fail": "No pude obtener el informe del clima en este momento.",
@@ -6099,6 +6615,9 @@ LANGUAGE_RESPONSES = {
         "meshinfo_avg_batt": "Voltaje promedio (sin alimentación USB): {voltage:.2f} V ({count} nodos)",
         "meshinfo_avg_batt_unknown": "Sin datos suficientes de batería",
         "meshinfo_network_usage": "Uso de red aproximado: {percent}% (última hora)",
+        "meshinfo_network_usage_unknown": "Datos de uso de red no disponibles.",
+        "meshinfo_active_nodes": "Nodos activos (1h): {count}",
+        "meshinfo_message_volume": "Mensajes registrados (1h): {count}",
         "meshinfo_top_nodes": "Top nodos por tráfico: {list}",
         "meshinfo_top_nodes_none": "Sin tráfico registrado en la última hora",
         "bible_missing": "📜 La biblioteca de Escrituras no está disponible en este momento.",
@@ -6214,12 +6733,22 @@ def _known_commands() -> Set[str]:
         canonical = info.get("canonical")
         if isinstance(canonical, str):
             known.add(canonical.lower())
+    # dynamic aliases
+    for alias, canonical in _get_dynamic_command_aliases().items():
+        known.add(alias.lower())
+        known.add(canonical.lower())
     return known
 
 
 def resolve_command_token(raw: str):
     """Resolve a raw slash token to a canonical command and optional notice."""
     stripped = _strip_command_token(raw)
+    # Dynamic alias mapping from commands_config
+    dyn = _get_dynamic_command_aliases()
+    if stripped in dyn:
+        canonical = dyn.get(stripped, stripped)
+        language = _detect_language_for_token(canonical)
+        return canonical, "alias", None, language, ""
     alias_info = COMMAND_ALIASES.get(stripped)
     if alias_info:
         canonical = alias_info.get("canonical", stripped)
@@ -6269,6 +6798,24 @@ def format_unknown_command_reply(original_cmd: str, suggestions: Optional[List[s
     return " ".join(parts)
 
 
+def _admin_credentials_match(attempt: str) -> Tuple[bool, Optional[str]]:
+    """Return whether the attempt matches known admin secrets and the source used."""
+    if not attempt:
+        return False, None
+    candidate = attempt.strip()
+    if not candidate:
+        return False, None
+    normalized = candidate.casefold()
+    if normalized and normalized == ADMIN_PASSWORD_NORM:
+        return True, "config password"
+    passphrase = get_admin_passphrase()
+    if passphrase:
+        passphrase_norm = passphrase.strip().casefold()
+        if passphrase_norm and normalized == passphrase_norm:
+            return True, "dashboard passphrase"
+    return False, None
+
+
 def _process_admin_password(sender_id: Any, message: str):
     sender_key = _safe_sender_key(sender_id)
     pending_request = PENDING_ADMIN_REQUESTS.get(sender_key)
@@ -6276,28 +6823,57 @@ def _process_admin_password(sender_id: Any, message: str):
     lang = None
     if pending_request:
         lang = pending_request.get("language")
-    if attempt == ADMIN_PASSWORD:
+    matched, source = _admin_credentials_match(attempt)
+    if matched:
         AUTHORIZED_ADMINS.add(sender_key)
         if pending_request:
             PENDING_ADMIN_REQUESTS.pop(sender_key, None)
+        try:
+            actor = get_node_shortname(sender_id)
+        except Exception:
+            actor = str(sender_id)
+        _register_admin_display(sender_key, sender_id, label=actor)
+        source_note = f" via {source}" if source else ""
         clean_log(
-            f"Admin password accepted for {get_node_shortname(sender_id)} ({sender_id})",
-            "✅",
+            f"Admin credentials accepted{source_note} for {actor} ({sender_id})",
+            "🛡️",
             show_always=True,
             rate_limit=False,
         )
-        success_text = translate(lang or 'en', 'password_success', "Bingo! you're now authorized to make admin changes")
+        _ensure_admin_in_feature_flags(sender_key)
+        base_success = translate(lang or 'en', 'password_success', "Bingo! you're now authorized to make admin changes")
+        if '/admin' not in base_success:
+            success_text = f"{base_success}\n🛡️ DM /admin for the control list."
+        else:
+            success_text = base_success
+        success_text += "\n🛠️ Tip: /status shares a quick snapshot; /whatsoff lists anything disabled."
         follow_resp = None
         if pending_request:
-            follow_resp = handle_command(
-                pending_request.get("command", ""),
-                pending_request.get("full_text", ""),
-                sender_id,
-                is_direct=pending_request.get("is_direct", True),
-                channel_idx=pending_request.get("channel_idx"),
-                thread_root_ts=pending_request.get("thread_root_ts"),
-                language_hint=lang,
-            )
+            full_text = pending_request.get("full_text", "")
+            is_direct = pending_request.get("is_direct", True)
+            channel_idx = pending_request.get("channel_idx")
+            thread_root_ts = pending_request.get("thread_root_ts")
+            follow_resp = None
+            if is_direct:
+                try:
+                    follow_resp = _admin_control_command(
+                        full_text,
+                        sender_id,
+                        sender_key,
+                        channel_idx,
+                    )
+                except Exception:
+                    follow_resp = None
+            if follow_resp is None:
+                follow_resp = handle_command(
+                    pending_request.get("command", ""),
+                    full_text,
+                    sender_id,
+                    is_direct=is_direct,
+                    channel_idx=channel_idx,
+                    thread_root_ts=thread_root_ts,
+                    language_hint=lang,
+                )
         if isinstance(follow_resp, PendingReply):
             combined = f"{success_text}\n{follow_resp.text}" if follow_resp.text else success_text
             return PendingReply(combined, follow_resp.reason)
@@ -6315,7 +6891,13 @@ def _process_admin_password(sender_id: Any, message: str):
     failure_text = translate(lang or 'en', 'password_failure', "no way jose, try again.. or don't")
     return PendingReply(failure_text, "admin password")
 def _redact_sensitive(text: str) -> str:
-    return text if text is not None else ""
+    if text is None:
+        return "[len=0]"
+    try:
+        length = len(text)
+    except Exception:
+        return "[len=?]"
+    return f"[len={length}]"
 
 
 def _safe_sender_key(sender_id: Any) -> str:
@@ -6426,14 +7008,27 @@ def _parse_bible_reference(text: str) -> Optional[Tuple[str, int, Optional[int],
         chapter = int(chapter_str)
     except (TypeError, ValueError):
         return None
-    verse_start = None
-    verse_end = None
+    verse_start: Optional[int] = None
+    verse_end: Optional[int] = None
     if verse_part:
-        range_parts = re.split(r"[-–—]", verse_part.strip())
+        range_parts = [part.strip() for part in re.split(r"[-–—]", verse_part.strip()) if part.strip()]
+        if not range_parts:
+            return None
         try:
             verse_start = int(range_parts[0])
         except (TypeError, ValueError):
             return None
+        if len(range_parts) > 1:
+            try:
+                verse_end = int(range_parts[1])
+            except (TypeError, ValueError):
+                return None
+        else:
+            verse_end = verse_start
+    else:
+        verse_start = 1
+        verse_end = 1
+    return book_raw, chapter, verse_start, verse_end
 
 def _antispam_handle_penalty(sender_key: str, sender_node: Any, interface_ref, info: Dict[str, Any]) -> None:
     level = info.get('level', 1)
@@ -6503,6 +7098,48 @@ interface = None
 lastDMNode = None
 lastChannelIndex = None
 
+MESSAGE_RETENTION_SECONDS = 30 * 24 * 60 * 60
+
+
+def _parse_message_timestamp(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except Exception:
+            return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            if text.endswith(' UTC'):
+                dt = datetime.strptime(text, "%Y-%m-%d %H:%M:%S UTC")
+                return dt.replace(tzinfo=timezone.utc)
+            if text.endswith('Z'):
+                text = text[:-1] + '+00:00'
+            dt = datetime.fromisoformat(text)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            return None
+    return None
+
+
+def _prune_messages_locked() -> None:
+    if MESSAGE_RETENTION_SECONDS <= 0:
+        return
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=MESSAGE_RETENTION_SECONDS)
+    retained: List[dict] = []
+    for entry in messages:
+        ts = _parse_message_timestamp(entry.get('timestamp'))
+        if ts is None or ts >= cutoff:
+            retained.append(entry)
+    if len(retained) != len(messages):
+        messages[:] = retained
+
 # -----------------------------
 # Health/Heartbeat State
 # -----------------------------
@@ -6529,6 +7166,192 @@ RESPONSE_QUEUE_MAXSIZE = max(5, min(RESPONSE_QUEUE_MAXSIZE, 100))
 
 response_queue = queue.Queue(maxsize=RESPONSE_QUEUE_MAXSIZE)  # Limit queue size to prevent memory issues
 response_worker_running = False
+
+QUEUE_NOTICE_THRESHOLD = 3
+QUEUE_NOTICE_COOLDOWN_SECONDS = 600
+QUEUE_NOTICE_TRACK: Dict[str, float] = {}
+QUEUE_NOTICE_MESSAGES = [
+    "🚦 High traffic on the Ollama runway—responses are moving slow. Thanks for hanging tight, chief!",
+    "🛰️ Airwaves are jammed; your Ollama reply is in queue and will roll in shortly.",
+    "⏳ Lots of folks pinging Ollama right now. Expect a little delay while I work through the stack.",
+    "📡 Mesh control reports a backlog—give me a minute to clear the Ollama queue for you.",
+    "🐢 Queue’s past three deep; I’ll circle back with your answer as soon as Ollama catches up.",
+    "⚠️ Heavy chatter overhead. Your request is safe with me, just needs an extra beat to exit the queue.",
+    "🎛️ Ollama’s buffers are redlined—appreciate the patience while we drain them down.",
+    "🕰️ Busy minute on the mesh; hang tight and I’ll update you as soon as the queue thins out.",
+]
+
+CHILL_LOCK = threading.Lock()
+CHILL_WAITLIST: Dict[str, Dict[str, Any]] = {}
+CHILL_STATUS_UPDATE_INTERVAL_SECONDS = 5 * 60
+CHILL_POLL_INTERVAL_SECONDS = 30
+CHILL_INITIAL_DM = (
+    "chill for a bit, the ai can't respond because the server is overloaded, we'll update you when the system is clear"
+)
+CHILL_STILL_WAITING_DM = (
+    "still overloaded—hang tight. I'll ping you when it's clear."
+)
+CHILL_CLEARED_DM = (
+    "we're clear now—you're good to try again."
+)
+
+# Pending confirmations for user blocklist
+PENDING_BLOCK_CONFIRM: Dict[str, Dict[str, Any]] = {}
+
+def cancel_pending_responses_for_sender(sender_key: Optional[str]) -> int:
+    """Remove queued async response tasks for a given sender from the response queue.
+    Returns the number of tasks removed.
+    """
+    if not sender_key:
+        return 0
+    removed = 0
+    try:
+        items: List[Any] = []
+        while True:
+            try:
+                item = response_queue.get_nowait()
+            except queue.Empty:
+                break
+            # task tuple layout: (text, sender_node, is_direct, ch_idx, thread_root_ts, interface)
+            try:
+                if isinstance(item, tuple) and len(item) >= 2:
+                    node = item[1]
+                    key = _safe_sender_key(node)
+                    if key == sender_key:
+                        removed += 1
+                        continue  # drop
+            except Exception:
+                pass
+            items.append(item)
+        # Requeue the kept items
+        for it in items:
+            if it is None:
+                continue
+            response_queue.put_nowait(it)
+    except Exception:
+        # If anything goes wrong, fail safe with zero removed
+        return removed
+    return removed
+
+def _ai_chill_overloaded() -> bool:
+    # Read from live config to honor dashboard toggles without restart
+    if not bool(config.get("ai_chill_mode", False)):
+        return False
+    # Only relevant for Ollama workload which uses the async response queue
+    try:
+        depth = response_queue.qsize()
+    except Exception:
+        depth = 0
+    try:
+        limit = int(config.get("ai_chill_queue_limit", CHILL_QUEUE_LIMIT))
+    except (ValueError, TypeError):
+        limit = CHILL_QUEUE_LIMIT
+    limit = max(1, limit)
+    return depth >= limit
+
+def _ai_chill_track(sender_key: Optional[str], *, sender_node: Any = None) -> bool:
+    if not sender_key:
+        return False
+    with CHILL_LOCK:
+        existing = CHILL_WAITLIST.get(sender_key)
+        now_ts = time.time()
+        if existing:
+            # Already tracked
+            return False
+        CHILL_WAITLIST[sender_key] = {
+            'first_blocked_at': now_ts,
+            'last_notified': 0.0,
+            'node_id': sender_node,
+        }
+        return True
+
+def _ai_chill_notify_initial(sender_key: Optional[str], sender_node: Any, interface_ref) -> None:
+    if not sender_key or interface_ref is None:
+        return
+    if _is_user_blocked(sender_key) or _is_user_muted(sender_key):
+        return
+    try:
+        send_direct_chunks(interface_ref, CHILL_INITIAL_DM, sender_node)
+        with CHILL_LOCK:
+            rec = CHILL_WAITLIST.get(sender_key)
+            if rec is not None:
+                rec['last_notified'] = time.time()
+    except Exception as exc:
+        clean_log(f"Chill DM failed to {sender_key}: {exc}", "⚠️")
+
+def _ai_chill_notify_waiting(interface_ref) -> None:
+    # Periodic status updates while still overloaded
+    if interface_ref is None:
+        return
+    now_ts = time.time()
+    to_update: List[Tuple[str, Any]] = []
+    with CHILL_LOCK:
+        for key, rec in CHILL_WAITLIST.items():
+            if _is_user_blocked(key) or _is_user_muted(key):
+                continue
+            last = rec.get('last_notified', 0.0) or 0.0
+            if now_ts - last >= CHILL_STATUS_UPDATE_INTERVAL_SECONDS:
+                to_update.append((key, rec.get('node_id') or key))
+                rec['last_notified'] = now_ts
+    for key, node_id in to_update:
+        try:
+            # We need the node id; our waitlist stores only keys, but the node id equals the key text for DM routes
+            # sender_key is derived from node id, so we can use it directly.
+            send_direct_chunks(interface_ref, CHILL_STILL_WAITING_DM, node_id)
+        except Exception as exc:
+            clean_log(f"Chill periodic DM failed to {key}: {exc}", "⚠️")
+
+def _ai_chill_notify_cleared(interface_ref) -> None:
+    if interface_ref is None:
+        return
+    to_notify: List[Tuple[str, Any]] = []
+    with CHILL_LOCK:
+        for key, rec in CHILL_WAITLIST.items():
+            to_notify.append((key, rec.get('node_id') or key))
+        CHILL_WAITLIST.clear()
+    for key, node_id in to_notify:
+        try:
+            send_direct_chunks(interface_ref, CHILL_CLEARED_DM, node_id)
+        except Exception as exc:
+            clean_log(f"Chill cleared DM failed to {key}: {exc}", "⚠️")
+
+def ai_chill_notifier_worker():
+    # Background thread to ping waitlisted users while overloaded and notify when clear
+    last_overloaded = False
+    while True:
+        try:
+            # Sample the queue depth
+            overloaded = _ai_chill_overloaded()
+            if bool(config.get("ai_chill_mode", False)):
+                if overloaded:
+                    _ai_chill_notify_waiting(interface)
+                else:
+                    # Transition from overloaded -> clear: notify and flush waitlist
+                    if last_overloaded and (CHILL_WAITLIST):
+                        _ai_chill_notify_cleared(interface)
+            last_overloaded = overloaded
+        except Exception:
+            pass
+        time.sleep(CHILL_POLL_INTERVAL_SECONDS)
+
+
+def _maybe_notify_queue_delay(sender_key: Optional[str], sender_node: Any, interface_ref, is_direct: bool) -> None:
+    if not sender_key or interface_ref is None:
+        return
+    if AI_PROVIDER != 'ollama':
+        return
+    now_ts = time.time()
+    last_sent = QUEUE_NOTICE_TRACK.get(sender_key, 0.0)
+    if now_ts - last_sent < QUEUE_NOTICE_COOLDOWN_SECONDS:
+        return
+    message = random.choice(QUEUE_NOTICE_MESSAGES)
+    try:
+        send_direct_chunks(interface_ref, message, sender_node)
+        QUEUE_NOTICE_TRACK[sender_key] = now_ts
+        clean_log(f"Queue delay notice sent to {sender_key}", "⚠️", show_always=True, rate_limit=False)
+    except Exception as exc:
+        clean_log(f"Failed to send queue delay notice to {sender_key}: {exc}", "⚠️")
+
 
 def process_responses_worker():
     """Background worker thread to process AI responses without blocking new message reception."""
@@ -6561,7 +7384,7 @@ def process_responses_worker():
                     target_name = get_node_shortname(sender_node) or str(sender_node)
                     summary = _truncate_for_log(response_text)
                     clean_log(
-                        f"Ollama → {target_name} ({processing_time:.1f}s): {summary}",
+                        f"Ollama → {target_name} ({processing_time:.1f}s)",
                         "🦙",
                         show_always=True,
                         rate_limit=False,
@@ -6589,9 +7412,39 @@ def process_responses_worker():
                     chunk_delay = pending.chunk_delay if pending else None
                     if interface_ref and response_text and not already_sent:
                         if is_direct:
-                            send_direct_chunks(interface_ref, response_text, sender_node, chunk_delay=chunk_delay)
+                            result = send_direct_chunks(interface_ref, response_text, sender_node, chunk_delay=chunk_delay)
+                            try:
+                                sender_key_local = _safe_sender_key(sender_node)
+                            except Exception:
+                                sender_key_local = None
+                            # Schedule partial resends for DM if needed
+                            if RESEND_ENABLED and (not RESEND_DM_ONLY or True):
+                                attempts = RESEND_USER_ATTEMPTS
+                                interval = RESEND_USER_INTERVAL
+                                chunks = result.get('chunks') or []
+                                acks = result.get('acks') or []
+                                RESEND_MANAGER.schedule_dm_resend(
+                                    interface_ref=interface_ref,
+                                    destination_id=sender_node,
+                                    text=response_text,
+                                    chunks=chunks,
+                                    acks=acks,
+                                    attempts=attempts,
+                                    interval_seconds=interval,
+                                    sender_key=sender_key_local,
+                                    is_user_dm=True,
+                                )
                         else:
                             send_broadcast_chunks(interface_ref, response_text, ch_idx, chunk_delay=chunk_delay)
+                            # Optional broadcast resend
+                            if RESEND_ENABLED and RESEND_BROADCAST_ENABLED and not RESEND_DM_ONLY:
+                                RESEND_MANAGER.schedule_broadcast_resend(
+                                    interface_ref=interface_ref,
+                                    channel_idx=ch_idx,
+                                    text=response_text,
+                                    attempts=RESEND_SYSTEM_ATTEMPTS,
+                                    interval_seconds=RESEND_SYSTEM_INTERVAL,
+                                )
 
                     if pending and pending.follow_up_text and interface_ref:
                         _schedule_follow_up_message(
@@ -6627,8 +7480,16 @@ def process_responses_worker():
                 except Exception:
                     pass
                 total_time = time.time() - start_time
+                try:
+                    STATS.record_ai_response(total_time)
+                except Exception:
+                    pass
             else:
-                clean_log(f"Ollama → {get_node_shortname(sender_node) or sender_node} ({processing_time:.1f}s): [no response]", "🦙", show_always=True, rate_limit=False)
+                clean_log(f"Ollama → {get_node_shortname(sender_node) or sender_node} ({processing_time:.1f}s) [no response]", "🦙", show_always=True, rate_limit=False)
+                try:
+                    STATS.record_ai_response(processing_time)
+                except Exception:
+                    pass
                 
             response_queue.task_done()
             
@@ -6646,6 +7507,8 @@ def start_response_worker():
     worker_thread = threading.Thread(target=process_responses_worker, daemon=True)
     worker_thread.start()
     clean_log("firin' up!", "🚀")
+    # Start chill notifier thread (lightweight loop)
+    threading.Thread(target=ai_chill_notifier_worker, daemon=True).start()
 
 def stop_response_worker():
     """Stop the background response worker thread."""
@@ -6701,15 +7564,15 @@ def _generate_map_link(lat: Any, lon: Any, label: str) -> str:
 
 def _update_location_history(
     sender_key: str,
-    shortname: str,
     lat: Any,
     lon: Any,
     timestamp_val: float,
     precision: Any = None,
     dilution: Any = None,
+    display_label: Optional[str] = None,
 ) -> Dict[str, Any]:
     if not sender_key:
-        sender_key = str(shortname or "node")
+        sender_key = "node"
     try:
         lat_float = float(lat)
     except Exception:
@@ -6718,7 +7581,6 @@ def _update_location_history(
         lon_float = float(lon)
     except Exception:
         lon_float = lon
-    map_url = _generate_map_link(lat_float, lon_float, shortname)
     precision_val = None
     dilution_val = None
     try:
@@ -6737,13 +7599,10 @@ def _update_location_history(
     if dilution_val is not None and dilution_val > 4:
         quality = "dilute"
     entry = {
-        "key": sender_key,
-        "shortname": shortname,
+        "key": display_label or sender_key,
         "lat": lat_float,
         "lon": lon_float,
         "timestamp": timestamp_val,
-        "map_url": map_url,
-        "label": _sanitize_label(shortname),
         "precision": precision_val,
         "dilution": dilution_val,
         "quality": quality,
@@ -6770,30 +7629,34 @@ def _collect_recent_locations(exclude_key: Optional[str] = None, limit: Optional
     for entry in slice_items:
         lat_val = entry.get("lat")
         lon_val = entry.get("lon")
-        if isinstance(lat_val, (int, float)):
-            lat_str = f"{lat_val:.5f}"
-        else:
-            lat_str = str(lat_val)
-        if isinstance(lon_val, (int, float)):
-            lon_str = f"{lon_val:.5f}"
-        else:
-            lon_str = str(lon_val)
         results.append({
             "key": entry.get("key"),
-            "shortname": entry.get("shortname", "node"),
             "lat": lat_val,
             "lon": lon_val,
-            "lat_str": lat_str,
-            "lon_str": lon_str,
             "time_str": _format_timestamp_local(entry.get("timestamp", _now())),
-            "map_url": entry.get("map_url"),
-            "label": entry.get("label"),
             "quality": entry.get("quality", "unknown"),
             "precision": entry.get("precision"),
             "dilution": entry.get("dilution"),
         })
 
     return results
+
+
+def _prune_location_history_now() -> None:
+    cutoff = _now() - LOCATION_HISTORY_RETENTION
+    with LOCATION_HISTORY_LOCK:
+        stale_keys = [key for key, value in LOCATION_HISTORY.items() if value.get("timestamp", 0) < cutoff]
+        for key in stale_keys:
+            LOCATION_HISTORY.pop(key, None)
+
+
+def location_cleanup_worker(interval: float = 5.0) -> None:
+    while True:
+        try:
+            time.sleep(max(1.0, float(interval)))
+            _prune_location_history_now()
+        except Exception:
+            time.sleep(5.0)
 
 
 def _normalize_context_key(value: Optional[str]) -> str:
@@ -7294,6 +8157,162 @@ def _handle_pending_recall_response(
     return PendingReply("Please reply Y to load it or N to cancel.", "/recall confirm")
 
 
+def _handle_pending_wipe_selection(sender_id: Any, sender_key: str, text: str) -> Optional[PendingReply]:
+    state = PENDING_WIPE_SELECTIONS.get(sender_key)
+    if not state:
+        return None
+
+    mailboxes: List[str] = list(state.get('mailboxes') or [])
+    if not mailboxes:
+        PENDING_WIPE_SELECTIONS.pop(sender_key, None)
+        return PendingReply("⚠️ No mailboxes on file. Run `/wipe mailbox` again.", "/wipe select")
+
+    cleaned = (text or "").strip()
+    if not cleaned:
+        options = ", ".join(f"{idx}) {name}" for idx, name in enumerate(mailboxes, 1))
+        return PendingReply(
+            (
+                f"Reply with 1-{len(mailboxes)} to choose an inbox, {len(mailboxes) + 1} to wipe them all, "
+                "or 0 to cancel. Options: "
+                f"{options}"
+            ),
+            "/wipe select",
+        )
+
+    lowered = cleaned.lower()
+    if lowered in {"n", "no", "cancel", "stop", "exit", "abort"}:
+        PENDING_WIPE_SELECTIONS.pop(sender_key, None)
+        return PendingReply("👍 Cancelled. Nothing was deleted.", "/wipe select")
+
+    allow_all = bool(state.get('allow_all'))
+    lang = state.get('language')
+    actor_label = state.get('actor')
+    try:
+        sender_short = get_node_shortname(sender_id)
+    except Exception:
+        sender_short = str(sender_id)
+    actor_display = actor_label or sender_short
+
+    selected_mailbox: Optional[str] = None
+    if cleaned.isdigit():
+        index = int(cleaned)
+        if index == 0:
+            PENDING_WIPE_SELECTIONS.pop(sender_key, None)
+            return PendingReply("👍 Cancelled. Nothing was deleted.", "/wipe select")
+        if 1 <= index <= len(mailboxes):
+            selected_mailbox = mailboxes[index - 1]
+        elif allow_all and index == len(mailboxes) + 1 and mailboxes:
+            PENDING_WIPE_SELECTIONS.pop(sender_key, None)
+            if sender_key:
+                PENDING_WIPE_REQUESTS.pop(sender_key, None)
+                PENDING_WIPE_REQUESTS[sender_key] = {
+                    "action": "multi_mailbox",
+                    "mailboxes": list(mailboxes),
+                    "language": lang,
+                }
+            clean_log(
+                f"Mailbox wipe requested for all ({len(mailboxes)}) inboxes linked to {actor_display}",
+                "🧹",
+            )
+            return PendingReply(
+                f"🧹 Wipe all {len(mailboxes)} inboxes listed? Reply Y or N.",
+                "/wipe confirm",
+            )
+        else:
+            return PendingReply(
+                f"❓ Pick 1-{len(mailboxes)} for a single inbox, {len(mailboxes) + 1} to wipe them all, or 0 to cancel.",
+                "/wipe select",
+            )
+    else:
+        for name in mailboxes:
+            if name.lower() == lowered:
+                selected_mailbox = name
+                break
+        if allow_all and lowered in {"all", "todo", "todas", "alles"} and mailboxes:
+            PENDING_WIPE_SELECTIONS.pop(sender_key, None)
+            if sender_key:
+                PENDING_WIPE_REQUESTS.pop(sender_key, None)
+                PENDING_WIPE_REQUESTS[sender_key] = {
+                    "action": "multi_mailbox",
+                    "mailboxes": list(mailboxes),
+                    "language": lang,
+                }
+            clean_log(
+                f"Mailbox wipe requested for all ({len(mailboxes)}) inboxes linked to {actor_display}",
+                "🧹",
+            )
+            return PendingReply(
+                f"🧹 Wipe all {len(mailboxes)} inboxes listed? Reply Y or N.",
+                "/wipe confirm",
+            )
+
+    if not selected_mailbox:
+        return PendingReply(
+            f"I didn't recognize that response. Reply with 1-{len(mailboxes)}, {len(mailboxes) + 1} for all, or 0 to cancel.",
+            "/wipe select",
+        )
+
+    PENDING_WIPE_SELECTIONS.pop(sender_key, None)
+    clean_log(f"Mailbox wipe requested for '{selected_mailbox}' by {actor_display}", "🧹")
+    if sender_key:
+        PENDING_WIPE_REQUESTS.pop(sender_key, None)
+        PENDING_WIPE_REQUESTS[sender_key] = {
+            "action": "mailbox",
+            "mailbox": selected_mailbox,
+            "language": lang,
+        }
+    return PendingReply(
+        f"🧹 Delete mailbox '{selected_mailbox}' permanently? Reply Y or N.",
+        "/wipe confirm",
+    )
+
+
+def _handle_pending_mailbox_selection(sender_id: Any, sender_key: str, text: str) -> Optional[PendingReply]:
+    state = PENDING_MAILBOX_SELECTIONS.get(sender_key)
+    if not state:
+        return None
+
+    mailboxes: List[str] = state.get('mailboxes') or []
+    if not mailboxes:
+        PENDING_MAILBOX_SELECTIONS.pop(sender_key, None)
+        return PendingReply("⚠️ No linked mailboxes found. Try `/mail <name> <message>` to create one.", "/c select")
+
+    cleaned = text.strip()
+    if not cleaned:
+        choices = ", ".join(f"{idx}) {name}" for idx, name in enumerate(mailboxes, 1))
+        prompt = (
+            f"Reply with 1-{len(mailboxes)} or send `/c <mailbox>`. "
+            f"Add your PIN after the inbox name if it requires one. Choices: {choices}"
+        )
+        return PendingReply(prompt, "/c select")
+
+    selected_mailbox: Optional[str] = None
+    if cleaned.isdigit():
+        index = int(cleaned)
+        if 1 <= index <= len(mailboxes):
+            selected_mailbox = mailboxes[index - 1]
+    else:
+        lowered = cleaned.lower()
+        for name in mailboxes:
+            if name.lower() == lowered:
+                selected_mailbox = name
+                break
+
+    if not selected_mailbox:
+        choices = ", ".join(f"{idx}) {name}" for idx, name in enumerate(mailboxes, 1))
+        return PendingReply(
+            f"I didn't recognize that choice. Reply with 1-{len(mailboxes)} or type the inbox name (include your PIN if needed). Options: {choices}",
+            "/c select",
+        )
+
+    PENDING_MAILBOX_SELECTIONS.pop(sender_key, None)
+    try:
+        sender_short = get_node_shortname(sender_id)
+    except Exception:
+        sender_short = str(sender_id)
+    return MAIL_MANAGER.handle_check(sender_key, sender_id, sender_short, selected_mailbox, "")
+
+
 def _handle_pending_save_response(sender_id: Any, sender_key: str, text: str) -> Optional[PendingReply]:
     state = PENDING_SAVE_WIZARDS.get(sender_key)
     if not state:
@@ -7448,66 +8467,6 @@ def _maybe_handle_memory_intent(
     return None
 
 
-def _save_weather_reports_locked() -> None:
-    data = WEATHER_REPORTS[-WEATHER_REPORT_MAX_ENTRIES:]
-    payload = json.dumps({'reports': data}, ensure_ascii=False, indent=2)
-    write_atomic(WEATHER_REPORT_FILE, payload)
-
-
-def _prune_weather_reports_locked() -> None:
-    cutoff = _now() - WEATHER_REPORT_RETENTION
-    WEATHER_REPORTS[:] = [r for r in WEATHER_REPORTS if r.get('timestamp', 0.0) >= cutoff]
-    if len(WEATHER_REPORTS) > WEATHER_REPORT_MAX_ENTRIES:
-        del WEATHER_REPORTS[:-WEATHER_REPORT_MAX_ENTRIES]
-
-
-def _record_weather_report(sender_key: str, shortname: str, report_text: str, lat: float, lon: float) -> Dict[str, Any]:
-    timestamp = _now()
-    map_url = _generate_map_link(lat, lon, shortname) if lat is not None and lon is not None else None
-    entry = {
-        'timestamp': timestamp,
-        'shortname': shortname,
-        'text': report_text.strip(),
-        'map_url': map_url,
-        'lat': lat,
-        'lon': lon,
-        'node_key': sender_key,
-    }
-    with WEATHER_REPORT_LOCK:
-        WEATHER_REPORTS.append(entry)
-        _prune_weather_reports_locked()
-        _save_weather_reports_locked()
-    return entry
-
-
-
-def _get_recent_weather_report(max_age: Optional[int] = None) -> Optional[Dict[str, Any]]:
-    if max_age is None:
-        max_age = WEATHER_REPORT_RECENT_WINDOW
-    cutoff = _now() - max_age
-    with WEATHER_REPORT_LOCK:
-        fresh = [r for r in WEATHER_REPORTS if r.get('timestamp', 0.0) >= cutoff]
-        fresh.sort(key=lambda r: r.get('timestamp', 0.0), reverse=True)
-        return fresh[0] if fresh else None
-
-
-def _collect_recent_weather_reports(max_age: Optional[int] = None) -> List[Dict[str, Any]]:
-    if max_age is None:
-        max_age = WEATHER_REPORT_RETENTION
-    cutoff = _now() - max_age
-    with WEATHER_REPORT_LOCK:
-        items = [r for r in WEATHER_REPORTS if r.get('timestamp', 0.0) >= cutoff]
-    items.sort(key=lambda r: r.get('timestamp', 0.0), reverse=True)
-    return items
-
-
-def _format_weather_timestamp(ts: float) -> str:
-    try:
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone()
-        return dt.strftime('%b %d %H:%M')
-    except Exception:
-        return str(ts)
-
 
 def _format_relative_age(seconds: float) -> str:
     seconds = abs(int(seconds))
@@ -7526,23 +8485,119 @@ def _format_relative_age(seconds: float) -> str:
     return f"{weeks}w"
 
 
-def _format_weather_reply_lines(entry: Dict[str, Any], lang: str, include_header: bool = True) -> List[str]:
-    if not entry:
-        return []
+def _weather_condition_label(code: Any) -> str:
+    try:
+        code_int = int(code)
+    except Exception:
+        return "mixed conditions"
+    return WEATHER_CODE_DESCRIPTIONS.get(code_int, "mixed conditions")
+
+
+def _format_temperature(temp_c: Optional[float]) -> str:
+    if temp_c is None:
+        return "?"
+    try:
+        temp_f = (float(temp_c) * 9.0 / 5.0) + 32.0
+        return f"{temp_f:.0f}°F"
+    except Exception:
+        return "?"
+
+
+def _format_precip_inches(mm_value: Optional[float]) -> str:
+    if mm_value is None:
+        return "0 in"
+    try:
+        inches = float(mm_value) / 25.4
+    except Exception:
+        return "0 in"
+    if inches < 0.05:
+        return "<0.05 in"
+    return f"{inches:.2f} in"
+
+
+def _format_wind_speed(kph: Optional[float]) -> str:
+    if kph is None:
+        return "?"
+    try:
+        mph = float(kph) * 0.621371
+        return f"{mph:.0f} mph"
+    except Exception:
+        return "?"
+
+
+def _format_forecast_date(date_str: str) -> str:
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        return dt.strftime("%a %b %d")
+    except Exception:
+        return date_str
+
+
+def _fetch_weather_forecast(lang: str) -> str:
+    now = _now()
+    with WEATHER_CACHE_LOCK:
+        cached_text = WEATHER_CACHE.get('text')
+        cached_time = WEATHER_CACHE.get('timestamp', 0.0)
+        if cached_text and cached_time and (now - float(cached_time)) < WEATHER_CACHE_TTL:
+            return str(cached_text)
+
+    params = {
+        "latitude": WEATHER_LAT,
+        "longitude": WEATHER_LON,
+        "current_weather": "true",
+        "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max,weathercode",
+        "timezone": "auto",
+    }
+    url = "https://api.open-meteo.com/v1/forecast"
+    try:
+        response = requests.get(url, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        raise RuntimeError(exc) from exc
+
     lines: List[str] = []
-    if include_header:
-        lines.append(translate(lang, 'weather_latest', "🌦️ Latest mesh weather:"))
-    report_text = entry.get('text', '')
-    if report_text:
-        lines.append(report_text)
-    time_label = _format_weather_timestamp(entry.get('timestamp', _now()))
-    shortname = entry.get('shortname') or 'node'
-    byline = translate(lang, 'weather_byline', "{time} • {shortname}", time=time_label, shortname=shortname)
-    lines.append(byline)
-    map_url = entry.get('map_url')
-    if map_url:
-        lines.append(f"🔗 {map_url}")
-    return lines
+    header = translate(lang, 'weather_online_header', f"🌤️ Weather for {WEATHER_LOCATION_NAME}")
+    lines.append(header)
+
+    current = data.get('current_weather') or {}
+    if current:
+        temp_now = _format_temperature(current.get('temperature'))
+        wind_now = _format_wind_speed(current.get('windspeed'))
+        cond = _weather_condition_label(current.get('weathercode'))
+        lines.append(translate(lang, 'weather_now_line', f"Now: {temp_now}, {cond}, wind {wind_now}"))
+
+    daily = data.get('daily') or {}
+    times = daily.get('time') or []
+    highs = daily.get('temperature_2m_max') or []
+    lows = daily.get('temperature_2m_min') or []
+    precip = daily.get('precipitation_sum') or []
+    wind = daily.get('windspeed_10m_max') or []
+    codes = daily.get('weathercode') or []
+
+    for idx, label in enumerate(["Today", "Tomorrow"]):
+        if idx >= len(times):
+            break
+        temp_high = _format_temperature(highs[idx] if idx < len(highs) else None)
+        temp_low = _format_temperature(lows[idx] if idx < len(lows) else None)
+        precip_label = _format_precip_inches(precip[idx] if idx < len(precip) else None)
+        wind_label = _format_wind_speed(wind[idx] if idx < len(wind) else None)
+        condition = _weather_condition_label(codes[idx] if idx < len(codes) else None)
+        day_caption = translate(lang, 'weather_day_label', label)
+        lines.append(f"{day_caption}: {condition}, High {temp_high}, Low {temp_low}, precip {precip_label}, wind {wind_label}")
+
+    if len(lines) == 1:
+        fallback = translate(lang, 'weather_service_fail', "⚠️ Weather service unavailable right now.")
+        with WEATHER_CACHE_LOCK:
+            WEATHER_CACHE['timestamp'] = now
+            WEATHER_CACHE['text'] = fallback
+        return fallback
+
+    forecast_text = "\n".join(lines)
+    with WEATHER_CACHE_LOCK:
+        WEATHER_CACHE['timestamp'] = now
+        WEATHER_CACHE['text'] = forecast_text
+    return forecast_text
 
 
 def _resolve_sender_position(sender_id: Any, sender_key: Optional[str]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
@@ -7579,17 +8634,28 @@ def _snapshot_all_node_positions() -> None:
         lat, lon, tstamp, precision, dilution = get_node_location(node_id)
         if lat is None or lon is None:
             continue
-        try:
-            shortname = get_node_shortname(node_id)
-        except Exception:
-            shortname = str(node_id)
         sender_key = _safe_sender_key(node_id) or str(node_id)
+        display_label = sender_key
+        try:
+            short_name = get_node_shortname(node_id)
+            if short_name:
+                display_label = short_name
+        except Exception:
+            pass
         timestamp_val = None
         if isinstance(tstamp, (int, float)):
             timestamp_val = float(tstamp)
         else:
             timestamp_val = _now()
-        _update_location_history(sender_key, shortname, lat, lon, timestamp_val, precision, dilution)
+        _update_location_history(
+            sender_key,
+            lat,
+            lon,
+            timestamp_val,
+            precision,
+            dilution,
+            display_label=display_label,
+        )
 
 
 
@@ -7598,7 +8664,6 @@ def _snapshot_all_node_positions() -> None:
 def _build_locations_kml() -> str:
     _snapshot_all_node_positions()
     points = _collect_recent_locations(exclude_key=None, limit=None)
-    weather_points = _collect_recent_weather_reports()
     lines = [
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
         "<kml xmlns=\"http://www.opengis.net/kml/2.2\">",
@@ -7622,20 +8687,11 @@ def _build_locations_kml() -> str:
         "        </Icon>",
         "      </IconStyle>",
         "    </Style>",
-        "    <Style id=\"weather\">",
-        "      <IconStyle>",
-        "        <color>ffffa200</color>",
-        "        <scale>1.2</scale>",
-        "        <Icon>",
-        "          <href>http://maps.google.com/mapfiles/kml/paddle/blu-stars.png</href>",
-        "        </Icon>",
-        "      </IconStyle>",
-        "    </Style>",
     ]
     for entry in points:
         quality = entry.get("quality", "precise")
         style_url = "#precise" if quality != "dilute" else "#dilute"
-        name = entry.get("shortname", "node")
+        name = entry.get("key", "node")
         lat_val = entry.get("lat")
         lon_val = entry.get("lon")
         time_str = entry.get("time_str", "")
@@ -7651,32 +8707,6 @@ def _build_locations_kml() -> str:
             "      </Point>",
             "    </Placemark>",
         ]
-    for entry in weather_points:
-        lat_val = entry.get('lat')
-        lon_val = entry.get('lon')
-        if lat_val is None or lon_val is None:
-            continue
-        try:
-            lat_float = float(lat_val)
-            lon_float = float(lon_val)
-        except Exception:
-            continue
-        name = entry.get('shortname') or 'Weather report'
-        report_text = entry.get('text', '')
-        time_str = _format_weather_timestamp(entry.get('timestamp', _now()))
-        summary = f"{time_str} • {report_text}" if report_text else time_str
-        lines += [
-            "    <Placemark>",
-            f"      <name>{html.escape('Weather: ' + name)}</name>",
-            "      <styleUrl>#weather</styleUrl>",
-            "      <ExtendedData>",
-            f"        <Data name=\"summary\"><value>{html.escape(summary)}</value></Data>",
-            "      </ExtendedData>",
-            "      <Point>",
-            f"        <coordinates>{lon_float},{lat_float},0</coordinates>",
-            "      </Point>",
-            "    </Placemark>",
-        ]
     lines += [
         "  </Document>",
         "</kml>",
@@ -7687,11 +8717,14 @@ def _format_location_reply(sender_id: Any) -> Optional[str]:
     lat, lon, tstamp, precision, dilution = get_node_location(sender_id)
     if lat is None or lon is None:
         return None
-    try:
-        sn = get_node_shortname(sender_id)
-    except Exception:
-        sn = str(sender_id)
     sender_key = _safe_sender_key(sender_id) or str(sender_id)
+    display_name = sender_key or str(sender_id)
+    try:
+        short_name = get_node_shortname(sender_id)
+        if short_name:
+            display_name = short_name
+    except Exception:
+        pass
     try:
         lat_val = float(lat)
     except Exception:
@@ -7700,29 +8733,19 @@ def _format_location_reply(sender_id: Any) -> Optional[str]:
         lon_val = float(lon)
     except Exception:
         lon_val = lon
-    lat_str = f"{lat_val:.5f}" if isinstance(lat_val, (int, float)) else str(lat_val)
-    lon_str = f"{lon_val:.5f}" if isinstance(lon_val, (int, float)) else str(lon_val)
-    timestamp_val: float
-    if isinstance(tstamp, (int, float)):
-        timestamp_val = float(tstamp)
-    else:
-        timestamp_val = _now()
-    tstr = _format_timestamp_local(timestamp_val)
-    current_entry = _update_location_history(
+    timestamp_val = float(tstamp) if isinstance(tstamp, (int, float)) else _now()
+    _update_location_history(
         sender_key,
-        sn,
         lat_val,
         lon_val,
         timestamp_val,
         precision,
         dilution,
+        display_label=display_name,
     )
-    url_to_show = current_entry.get("map_url")
     _snapshot_all_node_positions()
-    if url_to_show:
-        return f"📍 {sn}: {url_to_show}"
-    # Fallback if we somehow don't have a link yet
-    return f"📍 {sn}: location link unavailable"
+    map_url = _generate_map_link(lat_val, lon_val, display_name)
+    return f"📍 {display_name}: {map_url}"
 
 
 def _handle_position_confirmation(
@@ -7776,10 +8799,13 @@ def load_archive():
                     if 'is_ai' not in m:
                         node_field = str(m.get('node', '') or '')
                         m['is_ai'] = (AI_NODE_NAME and AI_NODE_NAME in node_field) or (m.get('node_id') == FORCE_NODE_NUM)
+                    if 'message' in m:
+                        m['message'] = str(m.get('message') or '')
                     norm.append(m)
                 with messages_lock:
                     messages.clear()
                     messages.extend(norm)
+                    _prune_messages_locked()
                 print(f"Loaded {len(messages)} messages from archive.")
         except Exception as e:
             print(f"⚠️ Could not load archive {ARCHIVE_FILE}: {e}")
@@ -7789,7 +8815,13 @@ def load_archive():
 def save_archive():
   try:
     with messages_lock:
-      snapshot = list(messages)
+      _prune_messages_locked()
+      snapshot: List[Dict[str, Any]] = []
+      for entry in messages:
+        sanitized = dict(entry)
+        if 'message' in sanitized:
+          sanitized['message'] = ''
+        snapshot.append(sanitized)
     with open(ARCHIVE_FILE, "w", encoding="utf-8") as f:
       json.dump(snapshot, f, ensure_ascii=False, indent=2)
   except Exception as e:
@@ -7864,25 +8896,15 @@ def log_message(node_id, text, is_emergency=False, reply_to=None, direct=False, 
     # Determine who to show as the display name and what numeric node_id to store
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    # If force_node is provided (and not None), prefer it as the numeric node id
     stored_node_id = None
-    display_id = "WebUI" if node_id == "WebUI" else None
-    try:
-        if force_node is not None:
-            stored_node_id = force_node
-            display_id = f"{get_node_shortname(force_node)} ({force_node})"
-        else:
-            # If node_id looks numeric, keep it; else preserve string id (except WebUI)
-            if isinstance(node_id, int):
-                stored_node_id = node_id
-                display_id = f"{get_node_shortname(node_id)} ({node_id})"
-            else:
-                # non-numeric node_id (e.g. '!abcd1234'), keep the string for matching in history
-                stored_node_id = None if node_id == "WebUI" else node_id
-                display_id = f"{get_node_shortname(node_id)} ({node_id})" if node_id != "WebUI" else "WebUI"
-    except Exception:
-        # Fallback if get_node_shortname raises
-        display_id = str(node_id)
+    if force_node is not None:
+        stored_node_id = force_node
+    else:
+        if isinstance(node_id, int):
+            stored_node_id = node_id
+        elif isinstance(node_id, str) and node_id != "WebUI":
+            stored_node_id = node_id
+    display_id = _node_display_label(force_node if force_node is not None else node_id)
 
     # Flag messages that originate from the AI so they can be included in history
     is_ai_msg = bool(is_ai)
@@ -7908,12 +8930,17 @@ def log_message(node_id, text, is_emergency=False, reply_to=None, direct=False, 
     }
     with messages_lock:
         messages.append(entry)
+        _prune_messages_locked()
         if MAX_MESSAGE_LOG and MAX_MESSAGE_LOG > 0 and len(messages) > MAX_MESSAGE_LOG:
             # keep only the last MAX_MESSAGE_LOG entries
             del messages[:-MAX_MESSAGE_LOG]
     try:
+        STATS.record_message(direct=bool(direct), is_ai=is_ai_msg)
+    except Exception:
+        pass
+    try:
         with open(LOG_FILE, "a", encoding="utf-8") as logf:
-            logf.write(f"{timestamp} | {display_id} | EMERGENCY={is_emergency} | {text}\n")
+            logf.write(f"{timestamp} | {display_id} | EMERGENCY={is_emergency} | len={len(text or '')}\n")
         _trim_log_file(LOG_FILE)
     except Exception as e:
         print(f"⚠️ Could not write to {LOG_FILE}: {e}")
@@ -7921,9 +8948,39 @@ def log_message(node_id, text, is_emergency=False, reply_to=None, direct=False, 
     return entry
 
 def split_message(text):
+    """Split outgoing text into UTF-8 safe chunks within radio payload limits."""
+
     if not text:
         return []
-    return [text[i: i + MAX_CHUNK_SIZE] for i in range(0, len(text), MAX_CHUNK_SIZE)][:MAX_CHUNKS]
+
+    limit = max(int(MAX_CHUNK_SIZE), 1)
+    chunks: List[str] = []
+    current_chars: List[str] = []
+    current_bytes = 0
+
+    for char in text:
+        encoded = char.encode("utf-8")
+        byte_len = len(encoded)
+        if byte_len > limit:
+            # Replace oversized glyphs with a safe fallback. Keeps transmission within bounds.
+            char = "?"
+            encoded = char.encode("utf-8")
+            byte_len = len(encoded)
+
+        if current_chars and current_bytes + byte_len > limit:
+            chunks.append("".join(current_chars))
+            if len(chunks) >= MAX_CHUNKS:
+                return chunks
+            current_chars = []
+            current_bytes = 0
+
+        current_chars.append(char)
+        current_bytes += byte_len
+
+    if current_chars and len(chunks) < MAX_CHUNKS:
+        chunks.append("".join(current_chars))
+
+    return chunks[:MAX_CHUNKS]
 
 def send_broadcast_chunks(interface, text, channelIndex, chunk_delay: Optional[float] = None):
     dprint(f"send_broadcast_chunks: text='{text}', channelIndex={channelIndex}")
@@ -7987,6 +9044,8 @@ def send_broadcast_chunks(interface, text, channelIndex, chunk_delay: Optional[f
             time.sleep(delay)
     if sent_any:
         clean_log(f"Broadcast to {_channel_display_name(channelIndex)}", "📡")
+    # Return basic info for potential resend scheduling
+    return {"chunks": chunks, "sent": sent_any}
 
 
 def send_direct_chunks(interface, text, destinationId, chunk_delay: Optional[float] = None):
@@ -8016,6 +9075,8 @@ def send_direct_chunks(interface, text, destinationId, chunk_delay: Optional[flo
     ephemeral_ok = hasattr(interface, "sendDirectText")
 
     sent_any = False
+    ack_supported = hasattr(interface, "waitForAckNak")
+    ack_results: List[bool] = []
     for idx, chunk in enumerate(chunks):
         max_retries = 3
         retry_delay = 2
@@ -8024,9 +9085,9 @@ def send_direct_chunks(interface, text, destinationId, chunk_delay: Optional[flo
         for attempt in range(max_retries):
             try:
                 if ephemeral_ok:
-                    interface.sendDirectText(destinationId, chunk, wantAck=False)
+                    interface.sendDirectText(destinationId, chunk, wantAck=True)
                 else:
-                    interface.sendText(chunk, destinationId=destinationId, wantAck=False)
+                    interface.sendText(chunk, destinationId=destinationId, wantAck=True)
                 try:
                     globals()['last_tx_time'] = _now()
                 except Exception:
@@ -8058,11 +9119,280 @@ def send_direct_chunks(interface, text, destinationId, chunk_delay: Optional[flo
             print("❌ Stopping chunk transmission due to persistent failures")
             break
 
+        if success and ack_supported:
+            try:
+                interface.waitForAckNak()
+                clean_log(f"Ack received from {dest_display}", "✅", show_always=False)
+                ack_results.append(True)
+                if RESEND_TELEMETRY_ENABLED:
+                    try:
+                        STATS.record_ack_event(is_direct=True, attempt=1, success=True)
+                    except Exception:
+                        pass
+            except Exception as ack_exc:
+                clean_log(
+                    f"Ack timeout for {dest_display}: {ack_exc}",
+                    "⚠️",
+                    show_always=False,
+                )
+                ack_results.append(False)
+                if RESEND_TELEMETRY_ENABLED:
+                    try:
+                        STATS.record_ack_event(is_direct=True, attempt=1, success=False)
+                    except Exception:
+                        pass
+        elif success and not ack_supported:
+            ack_results.append(True)
+            if RESEND_TELEMETRY_ENABLED:
+                try:
+                    STATS.record_ack_event(is_direct=True, attempt=1, success=True)
+                except Exception:
+                    pass
+
         if success and idx < len(chunks) - 1:
             time.sleep(delay)
     if sent_any:
         clean_log(f"Sent to {dest_display}", "📤")
+    # For callers interested in granular ACK feedback
+    return {"chunks": chunks, "acks": ack_results, "sent": sent_any}
 
+
+def _ordinal(n: int) -> str:
+    if 10 <= (n % 100) <= 20:
+        suffix = 'th'
+    else:
+        suffix = {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')
+    return f"{n}{suffix}"
+
+
+class ResendManager:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.jobs: Dict[str, Dict[str, Any]] = {}
+        self.by_sender: Dict[str, Set[str]] = {}
+
+    def cancel_for_sender(self, sender_key: Optional[str]) -> None:
+        if not sender_key:
+            return
+        with self.lock:
+            job_ids = list(self.by_sender.get(sender_key, set()))
+            for jid in job_ids:
+                job = self.jobs.get(jid)
+                if job is not None:
+                    job['cancel'] = True
+            self.by_sender.pop(sender_key, None)
+
+    def _register(self, job: Dict[str, Any]) -> str:
+        jid = job.get('id')
+        if not jid:
+            import uuid
+            jid = uuid.uuid4().hex
+            job['id'] = jid
+        with self.lock:
+            self.jobs[jid] = job
+            sender_key = job.get('sender_key')
+            if sender_key:
+                self.by_sender.setdefault(sender_key, set()).add(jid)
+        return jid
+
+    def _finalize(self, jid: str) -> None:
+        with self.lock:
+            job = self.jobs.pop(jid, None)
+            if job is None:
+                return
+            sk = job.get('sender_key')
+            if sk and sk in self.by_sender:
+                self.by_sender[sk].discard(jid)
+                if not self.by_sender[sk]:
+                    self.by_sender.pop(sk, None)
+
+    def _under_usage_threshold(self) -> bool:
+        try:
+            usage = _calculate_network_usage_percent(StatsManager.WINDOW_SECONDS)
+        except Exception:
+            usage = None
+        if usage is None:
+            return True  # Fail open
+        return float(usage) < float(RESEND_USAGE_THRESHOLD_PERCENT)
+
+    def schedule_dm_resend(
+        self,
+        *,
+        interface_ref,
+        destination_id,
+        text: str,
+        chunks: List[str],
+        acks: List[bool],
+        attempts: int,
+        interval_seconds: float,
+        sender_key: Optional[str],
+        is_user_dm: bool,
+    ) -> None:
+        if not RESEND_ENABLED:
+            return
+        if RESEND_DM_ONLY is True:
+            # Allowed only for DMs; this function is for DMs, so OK
+            pass
+        # Determine initial unacked indices
+        pending_idxs: Set[int] = set()
+        for i, _ in enumerate(chunks):
+            flag = True
+            if i < len(acks):
+                flag = bool(acks[i])
+            if not flag:
+                pending_idxs.add(i)
+        if not pending_idxs:
+            return
+        # Guard rails
+        attempts = max(1, int(attempts))
+        interval_seconds = max(1.0, float(interval_seconds))
+
+        job: Dict[str, Any] = {
+            'sender_key': sender_key,
+            'destination': destination_id,
+            'cancel': False,
+            'attempt': 2,  # next try label (2nd try)
+            'max_attempts': attempts,
+            'pending': pending_idxs,
+            'text': text,
+        }
+        jid = self._register(job)
+
+        def _worker():
+            try:
+                while True:
+                    # Cancel checks
+                    if job.get('cancel'):
+                        break
+                    if sender_key and (_is_user_blocked(sender_key) or _is_user_muted(sender_key)):
+                        break
+                    # Done?
+                    if not job['pending']:
+                        break
+                    # Attempts exhausted?
+                    if job['attempt'] > job['max_attempts']:
+                        break
+                    # Network usage gate
+                    if not self._under_usage_threshold():
+                        # Skip without consuming attempt number
+                        time.sleep(interval_seconds)
+                        continue
+                    try:
+                        # Build subset
+                        subset = [chunks[i] for i in sorted(job['pending'])]
+                        if not subset:
+                            break
+                        # Prepare suffix label for this attempt (optional)
+                        label = f" ({_ordinal(job['attempt'])} try)" if RESEND_SUFFIX_ENABLED else ""
+                        # Send subset one by one so we can attach suffix to the last
+                        new_pending: Set[int] = set()
+                        for j, idx in enumerate(sorted(job['pending'])):
+                            part = chunks[idx]
+                            is_last = (j == len(job['pending']) - 1)
+                            if is_last:
+                                # Try to append suffix within chunk size limit
+                                candidate = part + label
+                                if len(candidate.encode('utf-8')) <= int(MAX_CHUNK_SIZE):
+                                    payloads = [candidate]
+                                else:
+                                    payloads = [part, label]
+                            else:
+                                payloads = [part]
+                            # Send this part (or parts)
+                            part_acked = True
+                            for payload in payloads:
+                                res = send_direct_chunks(interface_ref, payload, destination_id, chunk_delay=0)
+                                sent_acks = res.get('acks') or []
+                                # Consider ack True if every ack in this send succeeded; if no acks present, assume True
+                                if sent_acks and not all(bool(x) for x in sent_acks):
+                                    part_acked = False
+                                # Telemetry (aggregate for this payload)
+                                if RESEND_TELEMETRY_ENABLED:
+                                    try:
+                                        ok = (not sent_acks) or all(bool(x) for x in sent_acks)
+                                        STATS.record_ack_event(is_direct=True, attempt=int(job['attempt']), success=bool(ok))
+                                    except Exception:
+                                        pass
+                            if not part_acked:
+                                new_pending.add(idx)
+                        job['pending'] = new_pending
+                    except Exception as exc:
+                        clean_log(f"Resend error: {exc}", "⚠️", show_always=False)
+                    # Early stop if everything acked
+                    if not job['pending']:
+                        break
+                    # Prepare next try
+                    job['attempt'] += 1
+                    # Sleep with jitter
+                    jitter = random.uniform(0, max(0.0, float(RESEND_JITTER_SECONDS)))
+                    time.sleep(interval_seconds + jitter)
+            finally:
+                self._finalize(jid)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def schedule_broadcast_resend(
+        self,
+        *,
+        interface_ref,
+        channel_idx: int,
+        text: str,
+        attempts: int,
+        interval_seconds: float,
+    ) -> None:
+        if not RESEND_ENABLED or not RESEND_BROADCAST_ENABLED:
+            return
+        if RESEND_DM_ONLY:
+            return
+        attempts = max(1, int(attempts))
+        interval_seconds = max(1.0, float(interval_seconds))
+        job: Dict[str, Any] = {
+            'sender_key': None,
+            'cancel': False,
+            'attempt': 2,
+            'max_attempts': attempts,
+        }
+        jid = self._register(job)
+
+        def _worker():
+            try:
+                attempt_num = 2
+                while attempt_num <= attempts:
+                    if job.get('cancel'):
+                        break
+                    if not self._under_usage_threshold():
+                        time.sleep(interval_seconds)
+                        continue
+                    # Append attempt label to last chunk or as separate tiny chunk
+                    suffix = f" ({_ordinal(attempt_num)} try)" if RESEND_SUFFIX_ENABLED else ""
+                    chunks = split_message(text)
+                    if chunks:
+                        last = chunks[-1]
+                        candidate = last + suffix
+                        if len(candidate.encode('utf-8')) <= int(MAX_CHUNK_SIZE):
+                            chunks[-1] = candidate
+                            payloads = chunks
+                        else:
+                            payloads = chunks + [suffix]
+                    else:
+                        payloads = [suffix]
+                    try:
+                        for part in payloads:
+                            send_broadcast_chunks(interface_ref, part, channel_idx, chunk_delay=0)
+                    except Exception as exc:
+                        clean_log(f"Broadcast resend error: {exc}", "⚠️", show_always=False)
+                    attempt_num += 1
+                    jitter = random.uniform(0, max(0.0, float(RESEND_JITTER_SECONDS)))
+                    time.sleep(interval_seconds + jitter)
+            finally:
+                self._finalize(jid)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+
+RESEND_MANAGER = ResendManager()
+
+ALARM_TIMER_MANAGER: Optional[AlarmTimerManager] = None
 
 def _schedule_follow_up_message(
     interface_ref,
@@ -8088,6 +9418,14 @@ def _schedule_follow_up_message(
         try:
             if wait_seconds:
                 time.sleep(wait_seconds)
+            # Skip if user muted/blocked
+            if is_direct:
+                try:
+                    s_key = _safe_sender_key(sender_node)
+                except Exception:
+                    s_key = None
+                if s_key and (_is_user_blocked(s_key) or _is_user_muted(s_key)):
+                    return
             if is_direct:
                 send_direct_chunks(interface_ref, text, sender_node)
             else:
@@ -8129,6 +9467,7 @@ def _clear_direct_history(sender_id: Any) -> int:
 
 def _process_wipe_confirmation(sender_id: Any, message: str, is_direct: bool, channel_idx: Optional[int]) -> PendingReply:
     sender_key = _safe_sender_key(sender_id)
+    is_admin = bool(sender_key and sender_key in AUTHORIZED_ADMINS)
     state = PENDING_WIPE_REQUESTS.get(sender_key)
     if not state:
         return PendingReply("Wipe request expired. Start again with /wipe.", "/wipe confirm")
@@ -8149,7 +9488,22 @@ def _process_wipe_confirmation(sender_id: Any, message: str, is_direct: bool, ch
         if not mailbox:
             return PendingReply("Mailbox not specified. Try again with `/wipe mailbox <name>`.", "/wipe confirm")
         clean_log(f"Mailbox wipe confirmed for '{mailbox}'", "🧹")
-        return MAIL_MANAGER.handle_wipe(mailbox)
+        return MAIL_MANAGER.handle_wipe(mailbox, actor_key=sender_key, is_admin=is_admin)
+
+    if action == "multi_mailbox":
+        selected = state.get("mailboxes") or []
+        if not selected:
+            return PendingReply("Mailbox list expired. Run `/wipe mailbox` again.", "/wipe confirm")
+        responses: List[str] = []
+        for name in selected:
+            if not name:
+                continue
+            reply = MAIL_MANAGER.handle_wipe(str(name), actor_key=sender_key, is_admin=is_admin)
+            if isinstance(reply, PendingReply) and reply.text:
+                responses.append(reply.text)
+        if not responses:
+            responses.append("🧹 No inboxes were cleared.")
+        return PendingReply("\n".join(responses), "/wipe confirm")
 
     if action == "chathistory":
         if not is_direct:
@@ -8178,7 +9532,7 @@ def _process_wipe_confirmation(sender_id: Any, message: str, is_direct: bool, ch
             return PendingReply("Mailbox required for `/wipe all`. Use `/wipe all <mailbox>`.", "/wipe confirm")
         lines: List[str] = []
         clean_log(f"Full wipe confirmed for '{mailbox}'", "🧹")
-        mail_reply = MAIL_MANAGER.handle_wipe(mailbox)
+        mail_reply = MAIL_MANAGER.handle_wipe(mailbox, actor_key=sender_key, is_admin=is_admin)
         if isinstance(mail_reply, PendingReply):
             if mail_reply.text:
                 lines.append(mail_reply.text)
@@ -8303,13 +9657,26 @@ def send_to_ollama(
     use_history: bool = True,
     extra_context: Optional[str] = None,
     allow_streaming: bool = True,
-):
+): 
     dprint(f"send_to_ollama: user_message='{user_message}' sender_id={sender_id} is_direct={is_direct} channel={channel_idx}")
+    if not is_ai_enabled():
+        ai_log("Blocked: AI responses disabled", "ollama")
+        return AI_DISABLED_MESSAGE
     ai_log("Processing message...", "ollama")
+    try:
+        STATS.record_ai_request()
+    except Exception:
+        pass
 
     # Normalize text for non-ASCII characters using unidecode
     user_message = unidecode(user_message)
     effective_system_prompt = _sanitize_prompt_text(system_prompt) or _sanitize_prompt_text(SYSTEM_PROMPT) or "You are a helpful assistant responding to mesh network chats."
+
+    extra_block = extra_context.strip() if extra_context else ""
+    history_limit = OLLAMA_CONTEXT_CHARS
+    if extra_block:
+        reserve_chars = max(500, OLLAMA_CONTEXT_CHARS // 3)
+        history_limit = max(reserve_chars, OLLAMA_CONTEXT_CHARS - len(extra_block))
 
     # Build optional conversation history
     history = ""
@@ -8321,6 +9688,7 @@ def send_to_ollama(
                 is_direct=is_direct,
                 channel_idx=channel_idx,
                 thread_root_ts=thread_root_ts,
+                max_chars=history_limit,
             )
         except Exception as e:
             dprint(f"Warning: failed building history for Ollama: {e}")
@@ -8334,7 +9702,6 @@ def send_to_ollama(
 
     # Compose final prompt: system prompt, optional context, then user message
     combined_history = history.strip() if history else ""
-    extra_block = extra_context.strip() if extra_context else ""
     if extra_block:
         if combined_history:
             combined_history = f"{extra_block}\n\n{combined_history}"
@@ -8347,9 +9714,7 @@ def send_to_ollama(
     if DEBUG_ENABLED:
         dprint(f"Ollama combined prompt:\n{combined_prompt}")
     else:
-        # Show simplified prompt info in clean mode
-        prompt_preview = user_message[:50] + "..." if len(user_message) > 50 else user_message
-        clean_log(f"Prompt: {prompt_preview}", "💭")
+        clean_log(f"Prompt prepared (len={len(user_message)})", "💭")
 
     stream_flag = bool(OLLAMA_STREAM and allow_streaming)
 
@@ -8379,16 +9744,45 @@ def send_to_ollama(
             return False
         try:
             if is_direct and sender_id is not None:
-                send_direct_chunks(interface, chunk_text, sender_id, chunk_delay=0)
+                result = send_direct_chunks(interface, chunk_text, sender_id, chunk_delay=0)
+                # Schedule partial resend for streamed chunk if needed
+                if RESEND_ENABLED and is_direct:
+                    chunks = result.get('chunks') or []
+                    acks = result.get('acks') or []
+                    # streamed chunk should map to 1 chunk typically; schedule if unacked
+                    if (not acks) or (not all(bool(x) for x in acks)):
+                        try:
+                            skey = _safe_sender_key(sender_id)
+                        except Exception:
+                            skey = None
+                        RESEND_MANAGER.schedule_dm_resend(
+                            interface_ref=interface,
+                            destination_id=sender_id,
+                            text=chunk_text,
+                            chunks=chunks if chunks else [chunk_text],
+                            acks=acks if acks else [False],
+                            attempts=RESEND_USER_ATTEMPTS,
+                            interval_seconds=RESEND_USER_INTERVAL,
+                            sender_key=skey,
+                            is_user_dm=True,
+                        )
                 return True
             if not is_direct and channel_idx is not None:
                 send_broadcast_chunks(interface, chunk_text, channel_idx, chunk_delay=0)
+                if RESEND_ENABLED and RESEND_BROADCAST_ENABLED and not RESEND_DM_ONLY:
+                    RESEND_MANAGER.schedule_broadcast_resend(
+                        interface_ref=interface,
+                        channel_idx=channel_idx,
+                        text=chunk_text,
+                        attempts=RESEND_SYSTEM_ATTEMPTS,
+                        interval_seconds=RESEND_SYSTEM_INTERVAL,
+                    )
                 return True
         except Exception as exc:
             clean_log(f"Streaming send failed: {exc}", "⚠️", show_always=False)
         return False
 
-    def _consume_stream(response: requests.Response):
+    def _consume_stream(response):
         nonlocal use_streaming
         total_parts: List[str] = []
         total_len = 0
@@ -8460,8 +9854,7 @@ def send_to_ollama(
         full_text = "".join(total_parts)
         if not full_text:
             full_text = _format_ai_error("Ollama", "no content returned")
-        clean_resp = full_text[:100] + "..." if len(full_text) > 100 else full_text
-        ai_log(f"Response: {clean_resp}", "ollama")
+        ai_log(f"Response ready (len={len(full_text)})", "ollama")
         return StreamingResult(full_text[:MAX_RESPONSE_LENGTH], sent_chunks=streamed_chunks, truncated=truncated)
 
     try:
@@ -8496,9 +9889,7 @@ def send_to_ollama(
             # Extract clean response for logging
             resp = jr.get("response")
             if resp:
-                # Show clean response instead of technical details
-                clean_resp = resp[:100] + "..." if len(resp) > 100 else resp
-                ai_log(f"Response: {clean_resp}", "ollama")
+                ai_log(f"Response ready (len={len(resp)})", "ollama")
             # Ollama may return different fields depending on version; prefer 'response' then 'choices'
             if not resp and isinstance(jr.get("choices"), list) and jr.get("choices"):
                 # choices may contain dicts with 'text' or 'content'
@@ -8560,6 +9951,8 @@ def send_to_home_assistant(user_message):
 
 def get_ai_response(prompt, sender_id=None, is_direct=False, channel_idx=None, thread_root_ts=None):
   """Return an AI response using the configured provider (Ollama by default)."""
+  if not is_ai_enabled():
+    return AI_DISABLED_MESSAGE
   system_prompt = build_system_prompt_for_sender(sender_id)
   extra_context = None
   use_history = True
@@ -8620,6 +10013,8 @@ def strip_pin(text):
     return text[:idx].strip() + " " + text[idx+8:].strip()
 
 def route_message_text(user_message, channel_idx):
+  if not is_ai_enabled():
+    return AI_DISABLED_MESSAGE
   if HOME_ASSISTANT_ENABLED and channel_idx == HOME_ASSISTANT_CHANNEL_INDEX:
     info_print("[Info] Routing to Home Assistant channel.")
     if HOME_ASSISTANT_ENABLE_PIN:
@@ -8641,19 +10036,22 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
   global motd_content, SYSTEM_PROMPT, config, MESHTASTIC_KB_WARM_CACHE
   cmd = cmd.lower()
   dprint(f"handle_command => cmd='{cmd}', full_text='{full_text}', sender_id={sender_id}, is_direct={is_direct}, language={language_hint}")
-  lang = _normalize_language_code(language_hint) if language_hint else LANGUAGE_FALLBACK
+  if not is_command_enabled(cmd):
+    clean_log(f"Command {cmd} blocked (disabled)", "⛔", show_always=True, rate_limit=False)
+    return _cmd_reply(cmd, f"⚠️ {cmd} is currently disabled by the operator.")
   sender_key = _safe_sender_key(sender_id)
+  lang = _resolve_user_language(language_hint, sender_key)
   if cmd != "/wipe" and sender_key:
     PENDING_WIPE_REQUESTS.pop(sender_key, None)
   if cmd == "/about":
     return _cmd_reply(cmd, "MESH-MASTER Off Grid Chat Bot - By: MR-TBOT.com")
 
-  elif cmd in ["/ai", "/bot", "/query", "/data"]:
+  elif cmd in ["/ai", "/bot", "/data"]:
     user_prompt = full_text[len(cmd):].strip()
     
     # Special handling for DMs: if the command has no content, treat the whole message as a regular AI query
     if is_direct and not user_prompt:
-      # User just typed "/ai" or "/query" alone in a DM - treat it as "ai" (regular message)
+      # User just typed "/ai" or "/bot" alone in a DM - treat it as "ai" (regular message)
       user_prompt = cmd[1:]  # Remove the "/" to make it just "ai", "bot", etc.
       info_print(f"[Info] Converting empty {cmd} command in DM to regular AI query: '{user_prompt}'")
     elif not user_prompt:
@@ -8676,10 +10074,10 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     if is_direct:
       if location_text:
         return _cmd_reply(cmd, location_text)
-      return _cmd_reply(cmd, "🤖 Sorry, I have no GPS fix for your node.")
+      return _cmd_reply(cmd, "🤖 Sorry, I have no GPS fix for your node. Check your Meshtastic app settings to make sure GPS is enabled.")
     else:
       if not location_text:
-        return _cmd_reply(cmd, "🤖 Sorry, I have no GPS fix for your node.")
+        return _cmd_reply(cmd, "🤖 Sorry, I have no GPS fix for your node. Check your Meshtastic app settings to make sure GPS is enabled.")
       if sender_key:
         PENDING_POSITION_CONFIRM[sender_key] = {
           "channel_idx": channel_idx,
@@ -8691,6 +10089,25 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
   elif cmd == "/test":
     sn = get_node_shortname(sender_id)
     return _cmd_reply(cmd, f"Hello {sn}! Received {LOCAL_LOCATION_STRING} by {AI_NODE_NAME}.")
+
+  elif cmd == "/onboard":
+    if not is_direct:
+      return _cmd_reply(cmd, "❌ This command can only be used in a direct message.")
+    if not sender_key:
+      return _cmd_reply(cmd, "⚠️ I couldn't identify your DM session. Try again in a moment.")
+    remainder = full_text[len(cmd):].strip()
+    restart = remainder.lower() in {"restart", "reset", "start", "again"}
+    try:
+      sender_short = get_node_shortname(sender_id)
+    except Exception:
+      sender_short = str(sender_id)
+    return ONBOARDING_MANAGER.start_session(
+      sender_key=sender_key,
+      sender_id=sender_id,
+      sender_short=sender_short,
+      language_hint=lang,
+      restart=restart,
+    )
 
   elif cmd == "/m":
     if not is_direct:
@@ -8726,24 +10143,56 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
   elif cmd == "/c":
     if not is_direct:
       return _cmd_reply(cmd, "❌ This command can only be used in a direct message.")
+    sender_key = _safe_sender_key(sender_id)
+    if not sender_key:
+      return _cmd_reply(cmd, "⚠️ I couldn't identify your DM session. Try again in a moment.")
     remainder = full_text[len(cmd):].strip()
     if not remainder:
-      message = (
-        "📭 To check mail, run `/checkmail <mailbox>` (add a question to search). 💡 Need a box? Start with `/mail <mailbox> <message>`."
-      )
-      return _cmd_reply(cmd, message)
+      mailboxes = MAIL_MANAGER.mailboxes_for_user(sender_key)
+      if not mailboxes:
+        PENDING_MAILBOX_SELECTIONS.pop(sender_key, None)
+        message = (
+          "📭 You're not linked to any inboxes yet. Start with `/mail <mailbox> <message>` to create one."
+        )
+        return _cmd_reply(cmd, message)
+      PENDING_MAILBOX_SELECTIONS.pop(sender_key, None)
+      PENDING_MAILBOX_SELECTIONS[sender_key] = {
+        'mailboxes': mailboxes,
+        'language': lang,
+      }
+      comma_list = ", ".join(mailboxes)
+      numbered = [f"{idx}) {name}" for idx, name in enumerate(mailboxes, 1)]
+      lines = [
+        f"📬 Linked inboxes: {comma_list}",
+        "Reply with a number to open it, or type the inbox name.",
+        "If the inbox has a PIN, add it after the name before sending.",
+        *numbered,
+        "Need a new inbox? Run `/mail <mailbox> <message>`.",
+      ]
+      return PendingReply("\n".join(lines), "/c select")
     parts = remainder.split(None, 1)
     if not parts:
       return _cmd_reply(cmd, "Use this by typing: /c mailbox [question]")
     mailbox = parts[0].strip().strip("'\"")
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    if not rest:
+      try:
+        if mailbox and not MAIL_MANAGER.store.mailbox_exists(mailbox):
+          inline_match = re.match(r"^(?P<box>[A-Za-z0-9_\-]+?)(?P<pin>\d{4,8})$", mailbox)
+          if inline_match:
+            candidate_box = inline_match.group('box')
+            if MAIL_MANAGER.store.mailbox_exists(candidate_box):
+              mailbox = candidate_box
+              rest = inline_match.group('pin')
+      except Exception:
+        pass
     if not mailbox:
       return _cmd_reply(cmd, "Mailbox name cannot be empty.")
-    rest = parts[1].strip() if len(parts) > 1 else ""
-    sender_key = _safe_sender_key(sender_id)
     try:
       sender_short = get_node_shortname(sender_id)
     except Exception:
       sender_short = str(sender_id)
+    PENDING_MAILBOX_SELECTIONS.pop(sender_key, None)
     reply = MAIL_MANAGER.handle_check(sender_key, sender_id, sender_short, mailbox, rest)
     return reply
 
@@ -8763,7 +10212,43 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
 
     if sub in {"mailbox", "mail", "box"}:
       if not remainder:
-        return _cmd_reply(cmd, "Use this by typing: /wipe mailbox <name>")
+        if not sender_key:
+          return _cmd_reply(cmd, "⚠️ I couldn't identify your DM session. Try again in a moment.")
+        mailboxes = MAIL_MANAGER.mailboxes_for_user(sender_key)
+        if not mailboxes:
+          return PendingReply(
+            "📪 I don't see any inboxes linked to you yet. Create one with `/mail <mailbox> <message>` first.",
+            "/wipe command",
+          )
+        unique_mailboxes = []
+        seen_mailboxes: Set[str] = set()
+        for name in mailboxes:
+          normalized = MAIL_MANAGER.store.normalize_mailbox(name)
+          if normalized in seen_mailboxes:
+            continue
+          seen_mailboxes.add(normalized)
+          unique_mailboxes.append(name)
+        try:
+          actor = get_node_shortname(sender_id)
+        except Exception:
+          actor = str(sender_id)
+        PENDING_WIPE_SELECTIONS.pop(sender_key, None)
+        PENDING_WIPE_REQUESTS.pop(sender_key, None)
+        PENDING_WIPE_SELECTIONS[sender_key] = {
+          "mailboxes": unique_mailboxes,
+          "language": lang,
+          "allow_all": True,
+          "actor": actor,
+        }
+        lines = ["📬 Linked inboxes:"]
+        lines.extend(f"{idx}) {name}" for idx, name in enumerate(unique_mailboxes, 1))
+        lines.append(f"{len(unique_mailboxes) + 1}) Wipe ALL listed inboxes")
+        lines.append("0) Cancel")
+        lines.append("ℹ️ Only the mailbox owner can authorize a wipe.")
+        lines.append(
+          f"Reply with 1-{len(unique_mailboxes)} for a single inbox, {len(unique_mailboxes) + 1} to clear them all, or 0 to cancel."
+        )
+        return PendingReply("\n".join(lines), "/wipe select")
       mailbox = remainder.split()[0].strip("'\"")
       if not mailbox:
         return _cmd_reply(cmd, "Mailbox name cannot be empty.")
@@ -8821,11 +10306,12 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
 
   elif cmd == "/emailhelp":
     guide = (
-      "📬 Mesh Mail Quickstart:\n"
-      "1) `/mail campsite hey team` makes the inbox.\n"
-      "2) Friends reply with `/mail campsite their update`.\n"
-      "3) Read with `/checkmail campsite` or search like `/checkmail campsite plans tonight`.\n"
-      "4) Cleanup? `/wipe mailbox campsite` will erase it after a Y/N confirm."
+      "📬 Mesh Mail Quickstart (DM only):\n"
+      "- Create the inbox with your first note: `/mail <mailbox> hey team`.\n"
+      "- Teammates drop updates the same way: `/mail <mailbox> their update`.\n"
+      "- Read the latest mail anytime: `/checkmail <mailbox>` (alias `/c <mailbox>`).\n"
+      "- Set a PIN during creation? Include it when reading: `/checkmail <mailbox> PIN=1234`.\n"
+      "- Only the owner can clear it with `/wipe mailbox <mailbox>` after the Y/N confirm."
     )
     return _cmd_reply(cmd, guide)
 
@@ -8901,6 +10387,8 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     return _handle_exit_session(sender_key)
 
   elif cmd == "/meshtastic":
+    if not is_ai_enabled():
+      return _cmd_reply(cmd, AI_DISABLED_MESSAGE)
     if not _ensure_meshtastic_kb_loaded():
       return _cmd_reply(cmd, "MeshTastic field guide unavailable. Upload data and try again.")
     query = full_text[len(cmd):].strip()
@@ -9014,16 +10502,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
       return _cmd_reply(cmd, _format_personality_summary(sender_key))
 
     if action in {"prompt", "custom", "append"}:
-      if not arg:
-        return _cmd_reply(cmd, "Use this by typing: /vibe prompt <extra instructions> | /vibe prompt clear")
-      lowered = arg.lower()
-      if lowered in {"clear", "reset", "none", "remove"}:
-        _set_user_prompt_override(sender_key, None)
-        return _cmd_reply(cmd, "🧹 Custom prompt cleared. You're back to personality defaults.")
-      if len(arg) > 800:
-        return _cmd_reply(cmd, "⚠️ Custom prompt too long. Limit to 800 characters.")
-      _set_user_prompt_override(sender_key, arg)
-      return _cmd_reply(cmd, "📝 Custom prompt saved. It will be appended to your responses.")
+      return _cmd_reply(cmd, "🔒 Custom vibe prompts are no longer editable. Pick a vibe or use `/vibe status`.")
 
     if action in {"reset", "default", "restore"}:
       _reset_user_personality(sender_key)
@@ -9050,7 +10529,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
         lines.append(description)
       return _cmd_reply(cmd, "\n".join(lines))
 
-    return _cmd_reply(cmd, "Send `/vibe` to browse vibes, then reply with a number to switch. Extras: /vibe prompt <text>, /vibe prompt clear, /vibe reset.")
+    return _cmd_reply(cmd, "Send `/vibe` to browse vibes, then reply with a number to switch. Extras: /vibe status, /vibe set <name>, /vibe reset.")
 
   elif cmd in {"/aivibe", "/changevibe", "/choosevibe", "/aipersonality"}:
     summary = _format_personality_summary(_safe_sender_key(sender_id))
@@ -9059,9 +10538,9 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
   elif cmd == "/help":
     built_in = [
       "/about", "/menu", "/mail", "/checkmail", "/emailhelp", "/wipe",
-      "/query", "/test",
+      "/test",
       "/motd", "/meshinfo", "/bible", "/biblehelp", "/web", "/drudge", "/chucknorris", "/elpaso", "/blond", "/yomomma",
-      "/games", "/hangman", "/wordle", "/wordladder", "/adventure", "/rps", "/coinflip", "/cipher", "/bingo", "/quizbattle", "/morse",
+      "/games", "/blackjack", "/yahtzee", "/hangman", "/wordle", "/wordladder", "/adventure", "/rps", "/coinflip", "/cipher", "/quizbattle", "/morse",
       "/vibe", "/chathistory", "/changemotd", "/changeprompt", "/showprompt", "/printprompt", "/reset"
     ]
     custom_cmds = [c.get("command") for c in commands_config.get("commands", [])]
@@ -9070,9 +10549,134 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     help_text += "\nBrowse highlights with /menu."
     return _cmd_reply(cmd, help_text)
 
+
   elif cmd == "/menu":
     menu_text = format_structured_menu("menu", lang)
     return _cmd_reply(cmd, menu_text)
+
+  elif cmd == "/web":
+    remainder = full_text[len(cmd):].strip()
+    sender_key = _safe_sender_key(sender_id)
+
+    def _web_help_message() -> str:
+      lines = [
+        "🌐 Web tools ready:",
+        "• `/web ddg <keywords>` — DuckDuckGo quick search (default).",
+        "• `/web <keywords>` — same as ddg shorthand.",
+        "• `/web crawl <site> [pages]` — light crawler for contact details.",
+        "• `/web https://site` — single page preview.",
+        "Use `/web clear` to drop saved results. Follow up with questions or `/reset` to wipe context.",
+      ]
+      return "\n".join(lines)
+
+    if not remainder or remainder.lower() in {"help", "?", "info"}:
+      return _cmd_reply(cmd, _web_help_message())
+
+    if remainder.lower() in {"clear", "reset"}:
+      if sender_key:
+        _clear_web_context(sender_key)
+      return _cmd_reply(cmd, "🧹 Cleared saved web findings.")
+
+    parts = remainder.split(None, 1)
+    directive = parts[0].lower()
+    argument = parts[1].strip() if len(parts) > 1 else ""
+
+    def _record_web_context(formatted: str, context_text: Optional[str] = None) -> None:
+      if sender_key:
+        _store_web_context(sender_key, formatted, context=context_text)
+
+    if directive in {"ddg", "duckduckgo", "search"}:
+      query = argument or ""
+      if not query:
+        return _cmd_reply(cmd, "Use this by typing: /web ddg <keywords>")
+      try:
+        results = _web_search_duckduckgo(query)
+      except RuntimeError as exc:
+        message = str(exc)
+        if message == "offline":
+          offline_notice = translate(lang, "web_offline", "🌐 Offline mode only. Web search unavailable.")
+          return _cmd_reply(cmd, offline_notice)
+        return _cmd_reply(cmd, f"⚠️ Web search failed: {message}")
+      formatted = _format_web_results(query, results)
+      context_block = _context_from_results(query, results)
+      _record_web_context(formatted, context_block)
+      try:
+        clean_log(f"Web search '{query}' → {len(results)} result(s)", "🌐", show_always=False)
+      except Exception:
+        pass
+      return _cmd_reply(cmd, formatted)
+
+    if directive in {"crawl", "spider"}:
+      if not argument:
+        return _cmd_reply(cmd, "Use this by typing: /web crawl <site> [pages]")
+      crawl_tokens = argument.split()
+      target = crawl_tokens[0]
+      page_limit: Optional[int] = None
+      if len(crawl_tokens) > 1:
+        try:
+          page_limit = max(1, int(crawl_tokens[1]))
+        except ValueError:
+          target = argument  # treat entire argument as part of the URL if second token not numeric
+          page_limit = None
+      start_url = _extract_direct_url(target) or target
+      try:
+        pages, contacts, contact_page = _crawl_website(start_url, max_pages=page_limit or WEB_CRAWL_MAX_PAGES)
+      except CrawlStartError as exc:
+        detail = exc.detail or "crawl failed"
+        status_note = f" (HTTP {exc.status_code})" if exc.status_code else ""
+        return _cmd_reply(cmd, f"⚠️ Couldn't start crawl of {exc.url}{status_note}: {detail}")
+      except RuntimeError as exc:
+        message = str(exc)
+        if message == "offline":
+          offline_notice = translate(lang, "web_offline", "🌐 Offline mode only. Web search unavailable.")
+          return _cmd_reply(cmd, offline_notice)
+        return _cmd_reply(cmd, f"⚠️ Crawl failed: {message}")
+      formatted = _format_crawl_results(start_url, pages, contacts, contact_page)
+      context_block = _context_from_crawl(start_url, pages, contacts, contact_page)
+      _record_web_context(formatted, context_block)
+      try:
+        clean_log(f"Web crawl '{start_url}' → {len(pages)} page(s)", "🕸️", show_always=False)
+      except Exception:
+        pass
+      return _cmd_reply(cmd, formatted)
+
+    direct_url = _extract_direct_url(remainder)
+    if direct_url:
+      try:
+        preview = _fetch_url_preview(direct_url)
+      except RuntimeError as exc:
+        message = str(exc)
+        if message == "offline":
+          offline_notice = translate(lang, "web_offline", "🌐 Offline mode only. Web search unavailable.")
+          return _cmd_reply(cmd, offline_notice)
+        return _cmd_reply(cmd, f"⚠️ Fetch failed: {message}")
+      formatted = _format_web_results(direct_url, preview)
+      context_block = _context_from_results(direct_url, preview)
+      _record_web_context(formatted, context_block)
+      try:
+        clean_log(f"Web preview '{direct_url}'", "🌐", show_always=False)
+      except Exception:
+        pass
+      return _cmd_reply(cmd, formatted)
+
+    # Default: treat remainder as DuckDuckGo search query.
+    query = remainder
+    try:
+      results = _web_search_duckduckgo(query)
+    except RuntimeError as exc:
+      message = str(exc)
+      if message == "offline":
+        offline_notice = translate(lang, "web_offline", "🌐 Offline mode only. Web search unavailable.")
+        return _cmd_reply(cmd, offline_notice)
+      return _cmd_reply(cmd, f"⚠️ Web search failed: {message}")
+    formatted = _format_web_results(query, results)
+    context_block = _context_from_results(query, results)
+    _record_web_context(formatted, context_block)
+    try:
+      clean_log(f"Web search '{query}' → {len(results)} result(s)", "🌐", show_always=False)
+    except Exception:
+      pass
+    return _cmd_reply(cmd, formatted)
 
   elif cmd == "/offline":
     if not is_direct:
@@ -9097,7 +10701,6 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     }
     subcmd = offline_aliases.get(subcmd_raw)
     if not subcmd:
-      # Try a gentle fuzzy match so typos like "wki" still guide the user.
       suggestions = difflib.get_close_matches(subcmd_raw, offline_aliases.keys(), n=1, cutoff=0.7)
       if suggestions:
         subcmd = offline_aliases[suggestions[0]]
@@ -9160,172 +10763,6 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
 
     return _cmd_reply(cmd, "Offline toolkit commands:\n• wiki <topic>")
 
-  elif cmd == "/web":
-    query = full_text[len(cmd):].strip()
-    if not is_direct:
-      return _cmd_reply(cmd, translate(lang, 'dm_only', "❌ This command can only be used in a direct message."))
-    if not query:
-      return _cmd_reply(cmd, "Use this by typing: /web <search terms>")
-
-    tokens = query.split()
-    crawl_flag = False
-    crawl_pages = WEB_CRAWL_MAX_PAGES
-    if tokens:
-      last_token = tokens[-1].lower()
-      crawl_match = re.match(r"crawl(\d+)?", last_token)
-      if crawl_match:
-        crawl_flag = True
-        tokens = tokens[:-1]
-        num_spec = crawl_match.group(1)
-        if num_spec:
-          try:
-            crawl_pages = max(1, min(int(num_spec), WEB_CRAWL_MAX_LIMIT))
-          except ValueError:
-            crawl_pages = WEB_CRAWL_MAX_PAGES
-    query_core = " ".join(tokens).strip() if crawl_flag else query
-    if crawl_flag and not query_core:
-      return _cmd_reply(cmd, "Provide a domain to crawl, e.g. `/web example.com crawl`.")
-
-    context_payload = None
-    try:
-      direct_url = _extract_direct_url(query_core)
-      if crawl_flag:
-        if not direct_url:
-          return _cmd_reply(cmd, "Crawl needs a single domain without extra words, e.g. `/web example.com crawl`.")
-        pages, contacts, contact_page = _crawl_website(direct_url, max_pages=crawl_pages)
-        formatted = _format_crawl_results(direct_url, pages, contacts, contact_page)
-        context_payload = None  # skip storing crawl context per user request
-        clean_log(f"Crawled {len(pages)} pages from '{direct_url}' (contacts: {len(contacts)})", "🕸️", show_always=False)
-      elif direct_url:
-        results = _fetch_url_preview(direct_url)
-        formatted = _format_web_results(direct_url, results)
-        context_payload = _context_from_results(direct_url, results)
-        clean_log(f"Direct web fetch '{direct_url}'", "🔗", show_always=False)
-      else:
-        results = _web_search_duckduckgo(query, WEB_SEARCH_MAX_RESULTS)
-        formatted = _format_web_results(query, results)
-        context_payload = _context_from_results(query, results)
-        clean_log(f"Web search '{query}' returned {len(results)} results", "🔍", show_always=False)
-    except RuntimeError as exc:
-      if str(exc) == "offline":
-        clean_log("Web search blocked: offline mode", "⚠️", show_always=True, rate_limit=False)
-        return _cmd_reply(cmd, translate(lang, 'web_offline', "🌐 Offline mode only. Web search unavailable."))
-      clean_log(f"Web search error: {exc}", "⚠️", show_always=True, rate_limit=False)
-      return _cmd_reply(cmd, "⚠️ Web search failed. Try again later.")
-    except Exception as exc:
-      clean_log(f"Web handler exception: {exc}", "⚠️", show_always=True, rate_limit=False)
-      return _cmd_reply(cmd, "⚠️ Something went wrong processing that request. Try again later.")
-    sender_key = _safe_sender_key(sender_id)
-    if context_payload and not crawl_flag:
-      _store_web_context(sender_key, formatted, context=context_payload)
-    return _cmd_reply(cmd, formatted)
-
-  elif cmd == "/drudge":
-    try:
-      headlines = _fetch_drudge_headlines()
-    except RuntimeError as exc:
-      if str(exc) == "offline":
-        clean_log("Drudge fetch blocked: offline mode", "⚠️", show_always=True, rate_limit=False)
-        return _cmd_reply(cmd, "🌐 Offline mode only. Unable to reach Drudge Report.")
-      clean_log(f"Drudge fetch error: {exc}", "⚠️", show_always=True, rate_limit=False)
-      return _cmd_reply(cmd, "⚠️ Couldn't load Drudge headlines right now. Try again later.")
-
-    if not headlines:
-      return _cmd_reply(cmd, "🗞️ No Drudge headlines found at the moment.")
-
-    lines = ["🗞️ Drudge Report (latest headlines):"]
-    for idx, item in enumerate(headlines, 1):
-      title = item.get("title") or "(untitled)"
-      lines.append(f"{idx}. {title}")
-    formatted = "\n".join(lines)
-    clean_log("Fetched Drudge Report headlines", "🗞️", show_always=False)
-    return _cmd_reply(cmd, formatted)
-
-  elif cmd == "/write":
-    write_menu = format_structured_menu("write", lang)
-    return _cmd_reply(cmd, write_menu)
-
-  elif cmd == "/wiki":
-    topic = full_text[len(cmd):].strip()
-    if not topic:
-      return _cmd_reply(cmd, "Use this by typing: /wiki <topic>")
-    if not is_direct:
-      return _cmd_reply(cmd, "❌ This command can only be used in a direct message.")
-    try:
-      article = _fetch_wikipedia_article(topic, max_chars=WIKI_MAX_CHARS)
-    except RuntimeError as exc:
-      reason = str(exc)
-      if reason == "offline":
-        return _cmd_reply(cmd, translate(lang, 'web_offline', "🌐 Offline mode only. Web search unavailable."))
-      if reason == "wiki_missing":
-        return _cmd_reply(cmd, "📚 I couldn't find that topic on Wikipedia.")
-      clean_log(f"Wiki fetch error: {exc}", "⚠️", show_always=True, rate_limit=False)
-      return _cmd_reply(cmd, "⚠️ Wikipedia lookup failed. Try again later.")
-    except Exception as exc:
-      clean_log(f"Wiki handler exception: {exc}", "⚠️", show_always=True, rate_limit=False)
-      return _cmd_reply(cmd, "⚠️ Something went wrong processing that request. Try again later.")
-
-    formatted = _format_wiki_summary(article)
-    clean_log(f"Wikipedia article '{article.get('title', topic)}' loaded", "📚", show_always=False)
-    sender_key = _safe_sender_key(sender_id)
-    if sender_key:
-      context_payload = _format_wiki_context(article)
-      _store_web_context(sender_key, formatted, context=context_payload)
-    if OFFLINE_WIKI_ENABLED and OFFLINE_WIKI_STORE is not None:
-      try:
-        OFFLINE_WIKI_STORE.store_article(
-          title=article.get('title', topic),
-          content=article.get('content', ''),
-          summary=article.get('summary'),
-          source=article.get('source'),
-          aliases=[topic],
-          overwrite=False,
-        )
-      except Exception as exc:
-        clean_log(f"Offline wiki store error: {exc}", "⚠️", show_always=True, rate_limit=False)
-    return _cmd_reply(cmd, formatted)
-
-  elif cmd in WRITE_COMMAND_FLOWS:
-    if not is_direct:
-      msg = translate(lang, 'dm_only', "❌ This command can only be used in a direct message.")
-      return _cmd_reply(cmd, msg)
-    flow = WRITE_COMMAND_FLOWS[cmd]
-    subject = full_text[len(cmd):].strip()
-    sender_key = _safe_sender_key(sender_id)
-    if flow == "sayno" and (not subject):
-      if not sender_key:
-        return _cmd_reply(cmd, "I need to know who I'm talking to first. Try again in a bit.")
-      PENDING_WRITE_REQUESTS[sender_key] = {
-        "flow": flow,
-        "created": _now(),
-        "language": lang,
-      }
-      return _start_write_wizard(flow, lang)
-    if not subject:
-      usage_map = {
-        "/hype": "Use this by typing: /hype <topic>",
-        "/apology": "Use this by typing: /apology <name or group>",
-        "/breakup": "Use this by typing: /breakup <name>",
-        "/quitjob": "Use this by typing: /quitjob <boss or team>",
-        "/congrats": "Use this by typing: /congrats <achievement>",
-        "/thankyou": "Use this by typing: /thankyou <person or team>",
-        "/sayno": "Use this by typing: /sayno <name or request>",
-      }
-      helper = usage_map.get(cmd, f"Use this by typing: {cmd} <subject>")
-      return _cmd_reply(cmd, helper)
-    response = _generate_write_response(
-      flow,
-      subject,
-      lang,
-      sender_id=sender_id,
-      is_direct=is_direct,
-      channel_idx=channel_idx,
-      thread_root_ts=thread_root_ts,
-    )
-    if response:
-      return response
-    return _cmd_reply(cmd, "⚠️ That prompt didn't go through. Try again in a moment.")
-
   elif cmd == "/motd":
     motd_msg = translate(lang, 'motd_current', "Current MOTD:\n{motd}", motd=motd_content)
     return _cmd_reply(cmd, motd_msg)
@@ -9357,7 +10794,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     result = handle_trivia_command(cmd, category, args, sender_id, is_direct, channel_idx, lang)
     return _cmd_reply(cmd, result)
 
-  elif cmd in {"/games", "/hangman", "/wordle", "/adventure", "/rps", "/coinflip", "/wordladder", "/cipher", "/bingo", "/quizbattle", "/morse"}:
+  elif cmd in {"/games", "/blackjack", "/yahtzee", "/hangman", "/wordle", "/adventure", "/rps", "/coinflip", "/wordladder", "/cipher", "/quizbattle", "/morse"}:
     if cmd != "/games" and not is_direct:
       msg = translate(lang, 'dm_only', "❌ This command can only be used in a direct message.")
       return _cmd_reply(cmd, msg)
@@ -9370,18 +10807,8 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     reply = GAME_MANAGER.handle_command(cmd, args, sender_key, sender_short, lang)
     return reply
 
-  elif cmd in TRAINER_COMMAND_MAP:
-    trainer_key = TRAINER_COMMAND_MAP[cmd]
-    trainer_text = format_trainer_response(trainer_key, lang)
-    return _cmd_reply(cmd, trainer_text)
 
-  elif cmd == "/survival":
-    survival_menu = format_structured_menu("survival", lang)
-    return _cmd_reply(cmd, survival_menu)
 
-  elif cmd in SURVIVAL_GUIDES:
-    guide = format_survival_guide(cmd, lang)
-    return _cmd_reply(cmd, guide)
 
   elif cmd == "/bible":
     remainder = full_text[len(cmd):].strip()
@@ -9521,6 +10948,35 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     fallback = translate(lang, 'yomomma_missing', "😅 Yo momma joke library is empty right now.")
     return _cmd_reply(cmd, fallback)
 
+  elif cmd == "/stats":
+    if not is_direct:
+      return _cmd_reply(cmd, translate(lang, 'dm_only', "❌ This command can only be used in a direct message."))
+    if sender_key not in AUTHORIZED_ADMINS:
+      if sender_key:
+        PENDING_ADMIN_REQUESTS[sender_key] = {
+          "command": cmd,
+          "full_text": full_text,
+          "is_direct": is_direct,
+          "channel_idx": channel_idx,
+          "thread_root_ts": thread_root_ts,
+          "language": lang,
+        }
+      try:
+        actor = get_node_shortname(sender_id)
+      except Exception:
+        actor = str(sender_id)
+      clean_log(
+        f"Admin password required for /stats from {actor} ({sender_id})",
+        "🔐",
+        show_always=True,
+        rate_limit=False,
+      )
+    
+      prompt = translate(lang, 'admin_auth_required', "🔐 Admin access required. Reply with the admin password to continue.")
+      return PendingReply(prompt, "admin password")
+    report = _format_stats_report(lang)
+    return _cmd_reply(cmd, report)
+
   elif cmd == "/changemotd":
     if not is_direct:
       return _cmd_reply(cmd, translate(lang, 'dm_only', "❌ This command can only be used in a direct message."))
@@ -9560,7 +11016,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
       return _cmd_reply(cmd, error_msg)
 
   elif cmd == "/changeprompt":
-    message = "🔒 The core system prompt is fixed. Use /aipersonality set <name> or /aipersonality prompt <text> to adjust tone."
+    message = "🔒 The core system prompt is fixed. Use `/vibe set <name>` or `/vibe` to adjust tone."
     return _cmd_reply(cmd, message)
 
   elif cmd in ["/showprompt", "/printprompt"]:
@@ -9578,6 +11034,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     # Clear chat context for either this direct DM thread (sender <-> AI)
     # or for the channel history if invoked in a channel.
     cleared = 0
+    archive_needs_save = False
     with messages_lock:
       before = len(messages)
       if is_direct:
@@ -9614,6 +11071,8 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
           pass
       after = len(messages)
       cleared = max(0, before - after)
+      archive_needs_save = cleared > 0
+    if archive_needs_save:
       save_archive()
     if cleared > 0:
       if is_direct:
@@ -9629,6 +11088,80 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
         return _cmd_reply(cmd, f"🧹 Nothing to reset for channel {ch_name}.")
       else:
         return _cmd_reply(cmd, "🧹 Nothing to reset (unknown target).")
+
+  elif cmd == "/alarm":
+    sender_key = _safe_sender_key(sender_id)
+    remainder = full_text[len(cmd):].strip()
+    if not sender_key:
+      return _cmd_reply(cmd, "⚠️ Unable to identify your session. Try again.")
+    if remainder.lower().startswith("list"):
+      if ALARM_TIMER_MANAGER is None:
+        return _cmd_reply(cmd, "Alarm scheduler not available.")
+      text = ALARM_TIMER_MANAGER.list_alarms(sender_key)
+      return _cmd_reply(cmd, text)
+    if remainder.lower().startswith(("delete", "remove", "cancel")):
+      if ALARM_TIMER_MANAGER is None:
+        return _cmd_reply(cmd, "Alarm scheduler not available.")
+      args = remainder.split()
+      if len(args) >= 2 and args[1].lower() == "all":
+        text = ALARM_TIMER_MANAGER.clear_alarms(sender_key)
+        return _cmd_reply(cmd, text)
+      if len(args) >= 2:
+        text = ALARM_TIMER_MANAGER.delete_alarm(sender_key, args[1])
+        return _cmd_reply(cmd, text)
+      return _cmd_reply(cmd, "Usage: /alarm delete <id|all>")
+    if not remainder:
+      return _cmd_reply(cmd, "Usage: /alarm <time> [date|daily] [label]. Try '/alarm list'.")
+    if ALARM_TIMER_MANAGER is None:
+      return _cmd_reply(cmd, "Alarm scheduler not available.")
+    ok, msg = ALARM_TIMER_MANAGER.add_alarm(sender_key, sender_id, remainder)
+    return _cmd_reply(cmd, msg)
+
+  elif cmd == "/timer":
+    sender_key = _safe_sender_key(sender_id)
+    remainder = full_text[len(cmd):].strip()
+    if not sender_key:
+      return _cmd_reply(cmd, "⚠️ Unable to identify your session. Try again.")
+    low = remainder.lower()
+    if low.startswith("list"):
+      if ALARM_TIMER_MANAGER is None:
+        return _cmd_reply(cmd, "Timer scheduler not available.")
+      text = ALARM_TIMER_MANAGER.list_timers(sender_key)
+      return _cmd_reply(cmd, text)
+    if low.startswith(("cancel", "delete", "remove")):
+      if ALARM_TIMER_MANAGER is None:
+        return _cmd_reply(cmd, "Timer scheduler not available.")
+      parts = remainder.split()
+      if len(parts) >= 2 and parts[1].lower() == "all":
+        text = ALARM_TIMER_MANAGER.clear_timers(sender_key)
+        return _cmd_reply(cmd, text)
+      if len(parts) >= 2:
+        text = ALARM_TIMER_MANAGER.cancel_timer(sender_key, parts[1])
+        return _cmd_reply(cmd, text)
+      return _cmd_reply(cmd, "Usage: /timer cancel <id|all>")
+    if not remainder:
+      return _cmd_reply(cmd, "Usage: /timer <duration> [label]. Try '/timer list'.")
+    if ALARM_TIMER_MANAGER is None:
+      return _cmd_reply(cmd, "Timer scheduler not available.")
+    ok, msg = ALARM_TIMER_MANAGER.add_timer(sender_key, sender_id, remainder)
+    return _cmd_reply(cmd, msg)
+
+  elif cmd == "/stopwatch":
+    sender_key = _safe_sender_key(sender_id)
+    remainder = full_text[len(cmd):].strip()
+    if not sender_key:
+      return _cmd_reply(cmd, "⚠️ Unable to identify your session. Try again.")
+    if ALARM_TIMER_MANAGER is None:
+      return _cmd_reply(cmd, "Stopwatch not available.")
+    low = remainder.lower()
+    if low.startswith("start"):
+      text = ALARM_TIMER_MANAGER.stopwatch_start(sender_key, sender_id)
+      return _cmd_reply(cmd, text)
+    if low.startswith("stop"):
+      text = ALARM_TIMER_MANAGER.stopwatch_stop(sender_key)
+      return _cmd_reply(cmd, text)
+    text = ALARM_TIMER_MANAGER.stopwatch_status(sender_key)
+    return _cmd_reply(cmd, text)
 
   for c in commands_config.get("commands", []):
     if c.get("command").lower() == cmd:
@@ -9649,17 +11182,443 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
 
   return None
 
+ADMIN_CONTROL_COMMANDS = {"/admin", "/ai", "/channels+dm", "/channels", "/dm", "/autoping", "/status", "/whatsoff", "/aliases"}
+ADMIN_CONTROL_RESERVED = {"/ai", "/channels+dm", "/channels", "/dm", "/admin", "/autoping", "/status", "/whatsoff", "/aliases"}
+
+
+# -----------------------------------
+# Admin status helpers
+# -----------------------------------
+
+def _message_mode_summary(mode: str) -> str:
+    normalized = (mode or "").strip().lower()
+    if normalized == "dm_only":
+        return "DM only"
+    if normalized == "channel_only":
+        return "Channels only"
+    return "Channels + DMs"
+
+
+def _gather_admin_feature_snapshot() -> Dict[str, Any]:
+    snapshot = get_feature_flags_snapshot()
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    return snapshot
+
+
+def _render_admin_status(sender_id: Any) -> str:
+    snapshot = _gather_admin_feature_snapshot()
+    try:
+        short_name = get_node_shortname(sender_id)
+    except Exception:
+        short_name = str(sender_id)
+
+    ai_enabled = bool(snapshot.get("ai_enabled", True))
+    message_mode = snapshot.get("message_mode", "both")
+    auto_ping = bool(snapshot.get("auto_ping_enabled", True))
+    disabled_commands = snapshot.get("disabled_commands") or []
+    disabled_commands = [cmd for cmd in disabled_commands if cmd]
+    disabled_commands.sort()
+
+    reply_in_channels = bool(config.get("reply_in_channels", True))
+    reply_in_directs = bool(config.get("reply_in_directs", True))
+
+    lines = [f"Admin status for {short_name}:"]
+    lines.append(f"• AI responses: {'Enabled' if ai_enabled else 'Disabled'}")
+    lines.append(f"• Messaging mode: {_message_mode_summary(message_mode)}")
+    lines.append(f"• Auto ping replies: {'Enabled' if auto_ping else 'Disabled'}")
+    lines.append(f"• Channel replies: {'Enabled' if reply_in_channels else 'Disabled'}")
+    lines.append(f"• Direct message replies: {'Enabled' if reply_in_directs else 'Disabled'}")
+
+    if disabled_commands:
+        lines.append("• Commands disabled: " + ", ".join(disabled_commands))
+    else:
+        lines.append("• Commands disabled: none")
+
+    return "\n".join(lines)
+
+
+def _render_admin_disabled_summary() -> str:
+    snapshot = _gather_admin_feature_snapshot()
+
+    entries: List[str] = []
+
+    if not bool(snapshot.get("ai_enabled", True)):
+        entries.append("AI responses (/ai off)")
+
+    message_mode = snapshot.get("message_mode", "both").lower()
+    if message_mode == "dm_only":
+        entries.append("Channel broadcasts (message mode: DM only)")
+    elif message_mode == "channel_only":
+        entries.append("Direct messages (message mode: Channels only)")
+
+    if not bool(snapshot.get("auto_ping_enabled", True)):
+        entries.append("Auto ping replies")
+
+    if not bool(config.get("reply_in_channels", True)):
+        entries.append("Channel replies (config)")
+
+    if not bool(config.get("reply_in_directs", True)):
+        entries.append("Direct message replies (config)")
+
+    disabled_commands = snapshot.get("disabled_commands") or []
+    disabled_commands = sorted(cmd for cmd in disabled_commands if cmd)
+    if disabled_commands:
+        entries.append("Disabled commands: " + ", ".join(disabled_commands))
+
+    if not entries:
+        return "All admin-managed features are currently enabled."
+
+    lines = ["Disabled features summary:"]
+    for entry in entries:
+        lines.append(f"• {entry}")
+    return "\n".join(lines)
+
+
+def _render_admin_aliases() -> str:
+    lines: List[str] = []
+    # Dynamic aliases from commands_config
+    dyn = _get_dynamic_command_aliases()
+    if dyn:
+        lines.append("Dynamic Aliases:")
+        for alias, target in sorted(dyn.items()):
+            lines.append(f"• {alias} → {target}")
+    else:
+        lines.append("Dynamic Aliases: none")
+    # Built-in aliases (short list)
+    built: List[str] = []
+    for alias, info in COMMAND_ALIASES.items():
+        canonical = info.get('canonical', alias)
+        if alias != canonical:
+            built.append(f"{alias} → {canonical}")
+    if built:
+        lines.append("")
+        lines.append("Built-in Aliases:")
+        # Limit to keep output short
+        for row in sorted(built)[:30]:
+            lines.append(f"• {row}")
+        if len(built) > 30:
+            lines.append(f"(+{len(built)-30} more)")
+    return "\n".join(lines)
+
+
+def _admin_try_define_command_alias(text: str, sender_key: Optional[str]) -> Optional[PendingReply]:
+    """If `text` looks like '/alias = /canonical', register a dynamic alias.
+
+    Rules:
+    - Admin-only; caller should ensure sender_key is authorized before invoking.
+    - Flexible spacing around '=' and optional slash on the right-hand side.
+    - If one side is unknown and the other is known, create alias unknown -> known.
+    - If both known, map left -> right canonical.
+    - Persist to commands_config['command_aliases'] and take effect immediately.
+    """
+    if not sender_key:
+        return None
+    try:
+        m = re.match(r"^\s*/\s*([^=\s]+)\s*=\s*/?\s*([^=\s]+)\s*$", text.strip())
+        if not m:
+            return None
+        left_raw = m.group(1)
+        right_raw = m.group(2)
+        left_token = _normalize_command_name(left_raw)
+        right_token = _normalize_command_name(right_raw)
+        # Determine canonical for both sides
+        l_can, _, _, _, _ = resolve_command_token(left_token)
+        r_can, _, _, _, _ = resolve_command_token(right_token)
+        alias_name: Optional[str] = None
+        target_canonical: Optional[str] = None
+        if l_can and not r_can:
+            alias_name, target_canonical = right_token, l_can
+        elif r_can and not l_can:
+            alias_name, target_canonical = left_token, r_can
+        elif l_can and r_can:
+            alias_name, target_canonical = left_token, r_can
+        else:
+            return PendingReply("❌ I couldn't find a known command on either side. Try linking an unknown to a known one.", "admin alias")
+        if not alias_name or not target_canonical:
+            return None
+        if alias_name == target_canonical:
+            return PendingReply("ℹ️ That alias already points to the target.", "admin alias")
+        # Prevent overriding core admin controls
+        if alias_name in ADMIN_CONTROL_RESERVED:
+            return PendingReply("❌ That name is reserved.", "admin alias")
+        # Update commands_config and in-memory mapping
+        with CONFIG_LOCK:
+            try:
+                cfg = commands_config if isinstance(commands_config, dict) else {"commands": []}
+                aliases = cfg.setdefault('command_aliases', {})
+                # Normalize storage without extra slashes
+                store_alias = alias_name if alias_name.startswith('/') else f'/{alias_name}'
+                store_target = target_canonical if target_canonical.startswith('/') else f'/{target_canonical}'
+                aliases[store_alias] = store_target
+                # Persist
+                try:
+                    write_atomic(COMMANDS_CONFIG_FILE, json.dumps(cfg, indent=2))
+                except Exception as exc:
+                    return PendingReply(f"⚠️ Saved in memory but failed to write commands_config.json: {exc}", "admin alias")
+            except Exception as exc:
+                return PendingReply(f"⚠️ Could not update aliases: {exc}", "admin alias")
+        # Reflect immediately by updating runtime COMMAND_ALIASES for menu + resolution consistency
+        try:
+            COMMAND_ALIASES[_normalize_command_name(alias_name)] = {"canonical": _normalize_command_name(target_canonical), "languages": []}
+        except Exception:
+            pass
+        return PendingReply(f"🔗 Linked {alias_name} → {target_canonical}. Added to Other Commands.", "admin alias")
+    except Exception:
+        return None
+
+
+def _admin_control_command(text: str, sender_id: Any, sender_key: str, channel_idx: Optional[int], *, preview: bool = False):
+    tokens = text.strip().split()
+    if not tokens:
+        return False if preview else None
+    raw_primary = tokens[0]
+    primary = raw_primary.lower()
+    args = [token.lower() for token in tokens[1:]]
+
+    if primary in {"/status", "/whatsoff"}:
+        if preview:
+            return True
+        if primary == "/status":
+            message = _render_admin_status(sender_id)
+            return PendingReply(message, "admin status")
+        summary = _render_admin_disabled_summary()
+        return PendingReply(summary, "admin whatsoff")
+
+    if primary == "/admin" and not args:
+        if preview:
+            return True
+        lines = [
+            "🛡️ Admin console ready.",
+            "• /ai on · /ai off",
+            "• /channels+dm on",
+            "• /channels on",
+            "• /dm on",
+            "• /autoping on · /autoping off",
+            "• /status",
+            "• /whatsoff",
+            "• /aliases",
+            "• /<command> on · /<command> off",
+            "Other commands follow the regular menu."
+        ]
+        return PendingReply("\n".join(lines), "/admin command")
+
+    if not args:
+        return False if preview else None
+
+    action = args[0]
+
+    if primary == "/aliases":
+        if preview:
+            return True
+        return PendingReply(_render_admin_aliases(), "admin aliases")
+
+    if primary in {"/channels+dm", "/channels", "/dm"}:
+        if action != "on":
+            if preview:
+                return True
+            return PendingReply("Use 'on' to activate this mode. Run /admin for the full list.", "admin control")
+        mode_map = {
+            "/channels+dm": ("both", "Channels + DMs reopened."),
+            "/channels": ("channel_only", "Channel broadcasts only."),
+            "/dm": ("dm_only", "Direct messages only."),
+        }
+        mode_value, message = mode_map[primary]
+        if preview:
+            return True
+        update_feature_flags(message_mode=mode_value)
+        try:
+            actor = get_node_shortname(sender_id)
+        except Exception:
+            actor = str(sender_id)
+        clean_log(
+            f"Inbound messaging set to {mode_value} via admin DM from {actor}",
+            "🛡️",
+            show_always=True,
+            rate_limit=False,
+        )
+        return PendingReply(f"🛡️ {message}", "admin control")
+
+    if action not in {"on", "off"}:
+        return False if preview else None
+
+    if primary == "/ai":
+        enabled = action == "on"
+        if preview:
+            return True
+        update_feature_flags(ai_enabled=enabled)
+        try:
+            actor = get_node_shortname(sender_id)
+        except Exception:
+            actor = str(sender_id)
+        status = "enabled" if enabled else "disabled"
+        clean_log(
+            f"AI responses {status} via admin DM from {actor}",
+            "🛡️",
+            show_always=True,
+            rate_limit=False,
+        )
+        emoji = "🤖" if enabled else "🛑"
+        return PendingReply(f"{emoji} AI responses {status}.", "admin control")
+
+    if primary == "/autoping":
+        enabled = action == "on"
+        if preview:
+            return True
+        update_feature_flags(auto_ping_enabled=enabled)
+        try:
+            actor = get_node_shortname(sender_id)
+        except Exception:
+            actor = str(sender_id)
+        status = "enabled" if enabled else "disabled"
+        clean_log(
+            f"Auto ping replies {status} via admin DM from {actor}",
+            "🛡️",
+            show_always=True,
+            rate_limit=False,
+        )
+        emoji = "🏓" if enabled else "🚫"
+        return PendingReply(f"{emoji} Auto ping {status}.", "admin control")
+
+    normalized = _normalize_command_name(primary)
+    if not normalized or normalized in ADMIN_CONTROL_RESERVED:
+        return False if preview else None
+    known = _all_known_commands()
+    if normalized not in known:
+        if preview:
+            return True
+        return PendingReply(f"Unknown command {normalized}.", "admin control")
+    if normalized != primary:
+        if preview:
+            return True
+        return PendingReply("Use the exact command name (no aliases).", "admin control")
+    if preview:
+        return True
+    enabled = action == "on"
+    set_command_enabled(normalized, enabled)
+    try:
+        actor = get_node_shortname(sender_id)
+    except Exception:
+        actor = str(sender_id)
+    log_status = "enabled" if enabled else "disabled"
+    clean_log(
+        f"Command {normalized} {log_status} via admin DM from {actor}",
+        "🛡️",
+        show_always=True,
+        rate_limit=False,
+    )
+    verb = "enabled" if enabled else "disabled"
+    return PendingReply(f"🛠️ Command {normalized} {verb}.", "admin control")
+
+
 def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=None, check_only=False):
   dprint(f"parse_incoming_text => text='{text}' is_direct={is_direct} channel={channel_idx} check_only={check_only}")
   sender_key = _safe_sender_key(sender_id)
+  lang = _resolve_user_language(None, sender_key)
   if not check_only:
     channel_type = "DM" if is_direct else f"Ch{channel_idx}"
     logged_text = text if text is not None else ""
-    short = get_node_shortname(sender_id) or str(sender_id)
+    short = _node_display_label(sender_id)
     clean_log(f"Message from {short} ({channel_type}): {_redact_sensitive(logged_text)}", "📨")
   text = text.strip()
   if not text:
     return None if not check_only else False
+  # Quick DM-level control commands: stop/resume/blacklist/unblock
+  sender_key = _safe_sender_key(sender_id)
+  lower = text.lower().strip()
+  if is_direct and sender_key:
+    # Handle pending blacklist confirmations
+    if sender_key in PENDING_BLOCK_CONFIRM and not lower.startswith('/'):
+      choice = lower.strip()
+      if choice in {"y", "yes", "yeah", "yep"}:
+        PENDING_BLOCK_CONFIRM.pop(sender_key, None)
+        _set_user_blocked(sender_key, True)
+        _set_user_muted(sender_key, True)
+        # Cancel any queued items
+        RESEND_MANAGER.cancel_for_sender(sender_key)
+        cancel_pending_responses_for_sender(sender_key)
+        try:
+          MAIL_MANAGER.cancel_all_for_sender(sender_key)
+        except Exception:
+          pass
+        return PendingReply("⛔ You are now blocked. I will not respond until you send 'unblock'.", "blacklist confirm")
+      elif choice in {"n", "no", "nope"}:
+        PENDING_BLOCK_CONFIRM.pop(sender_key, None)
+        return PendingReply("👍 Not blocked. I'm still here if you need me.", "blacklist confirm")
+      else:
+        return PendingReply("Please reply Y or N to confirm the block.", "blacklist confirm")
+
+    if lower in {"/stop", "stop"}:
+      if check_only:
+        return True
+      _set_user_muted(sender_key, True)
+      RESEND_MANAGER.cancel_for_sender(sender_key)
+      removed = cancel_pending_responses_for_sender(sender_key)
+      try:
+        MAIL_MANAGER.cancel_all_for_sender(sender_key)
+      except Exception:
+        pass
+      try:
+        if ALARM_TIMER_MANAGER is not None:
+          ALARM_TIMER_MANAGER.pause_for_user(sender_key)
+      except Exception:
+        pass
+      note = f"✅ Paused. Use /start or /resume to continue. (cleared {removed} queued replies)"
+      return PendingReply(note, "stop command")
+    if lower in {"/start", "start", "/resume", "resume", "/continue", "continue", "/unmute", "unmute"}:
+      if check_only:
+        return True
+      _set_user_muted(sender_key, False)
+      if _is_user_blocked(sender_key):
+        # If blocked, inform to use unblock
+        return PendingReply("You're blocked. Send 'unblock' to remove the block.", "resume command")
+      try:
+        if ALARM_TIMER_MANAGER is not None:
+          ALARM_TIMER_MANAGER.resume_for_user(sender_key)
+      except Exception:
+        pass
+      return PendingReply("▶️ Resumed. I'll reply to your messages again.", "resume command")
+    # Blacklist requests (various phrasings)
+    if any(phrase in lower for phrase in {"/blacklistme", "blacklistme", "black list me", "add me to the black list", "add me to blacklist"}):
+      if check_only:
+        return True
+      PENDING_BLOCK_CONFIRM[sender_key] = {"ts": time.time()}
+      return PendingReply("⚠️ Block all my replies to you? Reply Y to confirm, N to cancel.", "blacklist confirm")
+    if lower in {"/unblock", "unblock", "unblock me", "/unblock me"}:
+      if check_only:
+        return True
+      _set_user_blocked(sender_key, False)
+      _set_user_muted(sender_key, False)
+      return PendingReply("✅ Unblocked. I can respond to you again.", "unblock command")
+  if is_direct and sender_key and not text.startswith("/"):
+    matched, source = _admin_credentials_match(text)
+    if matched:
+      if check_only:
+        return False
+      return _process_admin_password(sender_id, text)
+  message_mode = get_message_mode()
+  # If blocked, suppress everything except 'unblock' handled above
+  if sender_key and _is_user_blocked(sender_key):
+    return None if not check_only else False
+  # If muted, suppress auto/AI replies; let commands still pass
+  if sender_key and _is_user_muted(sender_key) and not text.startswith('/'):
+    return None if not check_only else False
+  if is_direct and message_mode == "channel_only":
+    if check_only:
+      return False
+    try:
+      clean_log("Direct message blocked: DM disabled", "🚫", show_always=False)
+    except Exception:
+      pass
+    return "⚠️ Direct messages are currently disabled by the operator. Try the main channel instead."
+  if (not is_direct) and message_mode == "dm_only":
+    if check_only:
+      return False
+    try:
+      clean_log("Channel message blocked: channel messaging disabled", "🚫", show_always=False)
+    except Exception:
+      pass
+    return "⚠️ Channel messaging is currently disabled by the operator. Please send a direct message instead."
   if is_direct and not config.get("reply_in_directs", True):
     return None if not check_only else False
   if (not is_direct) and channel_idx != HOME_ASSISTANT_CHANNEL_INDEX and not config.get("reply_in_channels", True):
@@ -9677,85 +11636,6 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
     if check_only:
       return False
     return _process_admin_password(sender_id, text)
-  if sender_key and sender_key in PENDING_WEATHER_REPORTS and not text.startswith("/"):
-    state = PENDING_WEATHER_REPORTS.get(sender_key) or {}
-    if (_now() - state.get('created', 0.0,)) > 600:
-      PENDING_WEATHER_REPORTS.pop(sender_key, None)
-    else:
-      if check_only:
-        return False
-      stage = state.get('stage', 'confirm')
-      lang = state.get('language') or LANGUAGE_FALLBACK
-      text_lower = text.strip().lower()
-      if stage == 'confirm':
-        if text_lower in WIPE_CONFIRM_YES:
-          state['stage'] = 'report'
-          state['created'] = _now()
-          prompt = translate(lang, 'weather_prompt_report', "Great! Reply with a quick weather update (temp, wind, conditions).")
-          return PendingReply(prompt, "/weather wizard")
-        if text_lower in WIPE_CONFIRM_NO:
-          PENDING_WEATHER_REPORTS.pop(sender_key, None)
-          decline = translate(lang, 'weather_decline', "No worries. You can try /weather again later.")
-          return PendingReply(decline, "/weather wizard")
-        reminder = translate(lang, 'weather_confirm_reminder', "Please reply Y to report or N to skip.")
-        return PendingReply(reminder, "/weather wizard")
-      elif stage == 'report':
-        report_text = text.strip()
-        if len(report_text) < 5:
-          short_msg = translate(lang, 'weather_report_too_short', "Please provide a bit more detail about the weather.")
-          return PendingReply(short_msg, "/weather wizard")
-        if len(report_text) > 240:
-          report_text = report_text[:240].strip()
-        lat, lon, pos_ts = _resolve_sender_position(sender_id, sender_key)
-        if lat is None or lon is None:
-          PENDING_WEATHER_REPORTS.pop(sender_key, None)
-          need_fix = translate(lang, 'weather_need_location', "I don't have your latest location yet. Share it with /whereami and try /weather again.")
-          return PendingReply(need_fix, "/weather wizard")
-        try:
-          shortname = get_node_shortname(sender_id)
-        except Exception:
-          shortname = sender_key or 'node'
-        entry = _record_weather_report(sender_key, shortname, report_text, float(lat), float(lon))
-        if pos_ts is None:
-          pos_ts = _now()
-        _update_location_history(sender_key, shortname, lat, lon, pos_ts, None, None)
-        PENDING_WEATHER_REPORTS.pop(sender_key, None)
-        clean_log(f"Weather report from {shortname}: {report_text}", "🌦️", show_always=True, rate_limit=False)
-        thanks = translate(lang, 'weather_saved_header', "🌦️ Weather report saved—thank you!")
-        lines = [thanks]
-        lines.extend(_format_weather_reply_lines(entry, lang, include_header=False))
-        return PendingReply("\n".join(lines), "/weather wizard")
-      else:
-        PENDING_WEATHER_REPORTS.pop(sender_key, None)
-  if is_direct and sender_key and sender_key in PENDING_WRITE_REQUESTS and not text.startswith("/"):
-    if check_only:
-      return False
-    state = PENDING_WRITE_REQUESTS.get(sender_key) or {}
-    flow = state.get('flow')
-    if not flow:
-      PENDING_WRITE_REQUESTS.pop(sender_key, None)
-      return PendingReply("Let's start over—run the command again when you're ready.", "/write wizard")
-    created = state.get('created', 0.0)
-    if (_now() - created) > WRITE_FLOW_TIMEOUT:
-      PENDING_WRITE_REQUESTS.pop(sender_key, None)
-      return PendingReply(f"⏳ Wizard timed out. Run /{flow} again when you're ready.", f"/{flow} wizard")
-    state_lang = state.get('language') or LANGUAGE_FALLBACK
-    subject = text.strip()
-    if not subject:
-      return _start_write_wizard(flow, state_lang)
-    PENDING_WRITE_REQUESTS.pop(sender_key, None)
-    response = _generate_write_response(
-      flow,
-      subject,
-      state_lang,
-      sender_id=sender_id,
-      is_direct=is_direct,
-      channel_idx=channel_idx,
-      thread_root_ts=thread_root_ts,
-    )
-    if response:
-      return response
-    return _cmd_reply(f"/{flow}", "⚠️ Couldn't draft that message right now. Try again in a moment.")
   if sender_key and sender_key in PENDING_POSITION_CONFIRM and not text.startswith("/"):
     if check_only:
       return False
@@ -9768,6 +11648,73 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
     wizard_reply = _handle_pending_save_response(sender_id, sender_key, text)
     if wizard_reply:
       return wizard_reply
+  raw_cmd_lower = None
+  admin_control_preview = False
+  if text.startswith("/"):
+    raw_cmd_lower = text.split()[0].lower()
+    # Admin alias creation: '/new=/old' or '/old = /new' form
+    if is_direct and sender_key and sender_key in AUTHORIZED_ADMINS and ('=' in raw_cmd_lower or '=' in text):
+      alias_reply = _admin_try_define_command_alias(text, sender_key)
+      if alias_reply:
+        if check_only:
+          return True
+        return alias_reply
+    if is_direct and sender_key and sender_key not in AUTHORIZED_ADMINS:
+      try:
+        admin_control_preview = _admin_control_command(
+          text,
+          sender_id,
+          sender_key,
+          channel_idx,
+          preview=True,
+        ) or False
+      except Exception:
+        admin_control_preview = False
+  if (
+      is_direct
+      and sender_key
+      and sender_key not in AUTHORIZED_ADMINS
+      and (raw_cmd_lower in ADMIN_CONTROL_COMMANDS or admin_control_preview)
+  ):
+    if check_only:
+      return False
+    PENDING_ADMIN_REQUESTS[sender_key] = {
+      "command": raw_cmd_lower,
+      "full_text": text,
+      "is_direct": True,
+      "channel_idx": channel_idx,
+      "thread_root_ts": thread_root_ts,
+      "language": lang,
+    }
+    prompt = translate(lang, 'admin_auth_required', "🔐 Admin access required. Reply with the admin password to continue.")
+    return PendingReply(prompt, "admin password")
+  if is_direct and sender_key and sender_key in PENDING_WIPE_SELECTIONS and not text.startswith("/"):
+    if check_only:
+      return False
+    wipe_select_reply = _handle_pending_wipe_selection(sender_id, sender_key, text)
+    if wipe_select_reply:
+      return wipe_select_reply
+  if is_direct and sender_key and sender_key in PENDING_MAILBOX_SELECTIONS and not text.startswith("/"):
+    if check_only:
+      return False
+    mailbox_reply = _handle_pending_mailbox_selection(sender_id, sender_key, text)
+    if mailbox_reply:
+      return mailbox_reply
+  if is_direct and sender_key and not text.startswith("/") and ONBOARDING_MANAGER.is_session_active(sender_key):
+    if check_only:
+      return False
+    try:
+      sender_short = get_node_shortname(sender_id)
+    except Exception:
+      sender_short = str(sender_id)
+    onboarding_reply = ONBOARDING_MANAGER.handle_incoming(
+      sender_key=sender_key,
+      sender_id=sender_id,
+      sender_short=sender_short,
+      message=text,
+    )
+    if onboarding_reply:
+      return onboarding_reply
   if is_direct and sender_key and MAIL_MANAGER.has_pending_creation(sender_key) and not text.startswith("/"):
     if check_only:
       return False
@@ -9810,6 +11757,51 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
 
   sanitized = text.replace('\u0007', '').strip()
   normalized = sanitized.lower()
+
+  if is_direct and sanitized and not sanitized.startswith('/'):
+    promoted = promote_bare_command(sanitized, _known_commands(), resolve_command_token)
+    if promoted:
+      text = promoted
+      sanitized = text.strip()
+      normalized = sanitized.lower()
+    elif ' ' not in sanitized:
+      bare_token = sanitized.strip(string.whitespace + string.punctuation)
+      if bare_token:
+        candidate = f"/{bare_token}"
+        canonical_cmd, _, _, _, alias_append = resolve_command_token(candidate)
+        if canonical_cmd:
+          rebuilt = canonical_cmd
+          if alias_append:
+            rebuilt = f"{rebuilt}{alias_append}"
+          text = rebuilt
+          sanitized = text.strip()
+          normalized = sanitized.lower()
+
+  engagement_prompt = None
+  if is_direct and sender_key and not check_only:
+    skip_prompt = sanitized.startswith('/') or normalized.startswith('reply')
+    try:
+      engagement_prompt = MAIL_MANAGER.user_engaged(sender_key, node_id=sender_id, skip_prompt=skip_prompt)
+    except Exception:
+      engagement_prompt = None
+
+  if is_direct and sender_key and not check_only:
+    try:
+      sender_shortname = get_node_shortname(sender_id)
+    except Exception:
+      sender_shortname = str(sender_id)
+    reply_result = MAIL_MANAGER.handle_reply_intent(sender_key, sender_id, sender_shortname, sanitized)
+    if reply_result is not None:
+      return reply_result
+
+  if normalized in {"ping", "pong"}:
+    if not is_auto_ping_enabled():
+      return None if not check_only else False
+    if check_only:
+      return False
+    reply_text = "Pong!" if normalized == "ping" else "Ping!"
+    return PendingReply(reply_text, "ping pong auto")
+
   quick_reply = None
   quick_reason = None
   pending_position_info = None
@@ -9846,6 +11838,11 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
       PENDING_POSITION_CONFIRM[sender_key] = pending_position_info
     return PendingReply(quick_reply, quick_reason or "quick reply")
 
+  if engagement_prompt and not sanitized.startswith('/') and not normalized.startswith('reply'):
+    if check_only:
+      return False
+    return PendingReply(engagement_prompt, "mail engagement")
+
   if is_direct and sender_key and not text.startswith("/"):
     memory_result = _maybe_handle_memory_intent(sender_id, sender_key, sanitized, LANGUAGE_FALLBACK, check_only=check_only)
     if memory_result is not None:
@@ -9856,13 +11853,22 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
       if isinstance(memory_result, bool):
         return False
 
-  if text.startswith("/") and sender_key in PENDING_WEATHER_REPORTS:
-    PENDING_WEATHER_REPORTS.pop(sender_key, None)
-  if text.startswith("/") and sender_key in PENDING_WRITE_REQUESTS:
-    PENDING_WRITE_REQUESTS.pop(sender_key, None)
 
   # Commands (start with /) should be handled and given context
   if text.startswith("/"):
+    low_cmd = text.lower().strip()
+    if low_cmd.startswith("/start stopwatch"):
+      text = "/stopwatch start"
+    elif low_cmd.startswith("/stop stopwatch"):
+      text = "/stopwatch stop"
+    if is_direct and sender_key in AUTHORIZED_ADMINS:
+      if check_only:
+        if _admin_control_command(text, sender_id, sender_key, channel_idx, preview=True):
+          return False
+      else:
+        admin_resp = _admin_control_command(text, sender_id, sender_key, channel_idx)
+        if admin_resp is not None:
+          return admin_resp
     raw_cmd = text.split()[0]
     canonical_cmd, notice_reason, suggestions, language_hint, alias_append = resolve_command_token(raw_cmd)
     if notice_reason == "unknown" or canonical_cmd is None:
@@ -9878,7 +11884,7 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
       if cmd_lower in ["/reset"]:
         return False  # Process immediately, not async
       # Built-in AI commands need async processing
-      if cmd_lower in ["/ai", "/bot", "/query", "/data"]:
+      if cmd_lower in ["/ai", "/bot", "/data"]:
         return True  # Needs AI processing
       if cmd_lower == "/c":
         remainder = text[len(raw_cmd):].strip()
@@ -9894,7 +11900,8 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
           return True  # Needs AI processing
       return False  # Other commands can be processed immediately
     else:
-      if sender_key and canonical_cmd.lower() != "/bible":
+      canonical_lower = canonical_cmd.lower()
+      if sender_key and canonical_lower not in {"/bible", "/stop"}:
         _clear_bible_nav(sender_key)
       if canonical_cmd != raw_cmd or alias_append:
         remainder = text[len(raw_cmd):]
@@ -9952,7 +11959,17 @@ def on_receive(packet=None, interface=None, **kwargs):
     to_node_int = BROADCAST_ADDR
   sender_key = _safe_sender_key(sender_node)
   if sender_key and sender_key not in NODE_FIRST_SEEN:
-    NODE_FIRST_SEEN[sender_key] = _now()
+    now_ts = _now()
+    NODE_FIRST_SEEN[sender_key] = now_ts
+  if sender_key:
+    try:
+      STATS.record_user_interaction(sender_key)
+    except Exception:
+      pass
+  try:
+    ONBOARDING_MANAGER.handle_heartbeat(sender_key, sender_node)
+  except Exception as exc:
+    clean_log(f"Onboarding heartbeat error: {exc}", "⚠️")
   try:
     MAIL_MANAGER.handle_heartbeat(sender_key, sender_node)
   except Exception as exc:
@@ -9996,17 +12013,23 @@ def on_receive(packet=None, interface=None, **kwargs):
     # De-dup: if we have seen the same text/from/to/channel very recently, drop it
     rx_key = _rx_make_key(packet, text, ch_idx)
     if _rx_seen_before(rx_key):
-      info_print(f"[Info] Duplicate RX suppressed for from={sender_node} ch={ch_idx}: {text}")
+      info_print(f"[Info] Duplicate RX suppressed for from={sender_node} ch={ch_idx} (len={len(text or '')})")
       return
-    sender_display = get_node_shortname(sender_node) or str(sender_node or '?')
+    sender_display = _node_display_label(sender_node)
+    normalized_text = (text or "").strip()
+    msg_length = len(normalized_text)
+    if sender_key and _is_heartbeat_text(normalized_text):
+        NODE_HEARTBEAT_LAST[sender_key] = _now()
+    sender_token = f"[NODE:{sender_display}]"
     if to_node_int == BROADCAST_ADDR:
       dest_display = _channel_display_name(ch_idx)
-      channel_label = dest_display
+      dest_token = f"[DEST:channel:{ch_idx}]"
+      dest_label = f"[Channel #{ch_idx}]"
     else:
-      dest_display = get_node_shortname(raw_to) or get_node_shortname(to_node_int) or str(raw_to or to_node_int)
-      channel_label = "DM"
-    summary = _truncate_for_log(text)
-    info_print(f"📨 {sender_display} → {dest_display} ({channel_label}): {summary}")
+      dest_display = _node_display_label(raw_to or to_node_int)
+      dest_token = f"[DEST:node:{dest_display}]"
+      dest_label = "[DM]"
+    info_print(f"📨 {sender_token} {sender_display} → {dest_token} {dest_display} {dest_label} (len={msg_length})")
 
     entry = log_message(
         sender_node,
@@ -10015,7 +12038,6 @@ def on_receive(packet=None, interface=None, **kwargs):
         channel_idx=(None if to_node_int != BROADCAST_ADDR else ch_idx),
     )
 
-    normalized_text = (text or "").strip()
     if sender_key and normalized_text and not normalized_text.startswith('/'):
         _cooldown_register(sender_key, sender_node, interface)
 
@@ -10067,8 +12089,26 @@ def on_receive(packet=None, interface=None, **kwargs):
     should_respond = parse_incoming_text(text, sender_node, is_direct, ch_idx, thread_root_ts=thread_root_ts, check_only=True)
     
     if should_respond:
+      # If AI chill mode is active and the Ollama intake is overloaded, block and DM the sender
+      # Home Assistant channel traffic should not be blocked by chill mode
+      is_ha_route = (HOME_ASSISTANT_ENABLED and (not is_direct) and (ch_idx == HOME_ASSISTANT_CHANNEL_INDEX))
+      if (AI_PROVIDER == 'ollama') and (not is_ha_route) and _ai_chill_overloaded():
+        if sender_key:
+          newly_added = _ai_chill_track(sender_key, sender_node=sender_node)
+          if newly_added:
+            clean_log(f"Chill mode blocked Ollama intake for {sender_key}", "🧊", show_always=True, rate_limit=False)
+            _ai_chill_notify_initial(sender_key, sender_node, interface)
+        # Do not enqueue the task; return early so other commands/messages flow normally
+        return
+
       # Queue the response for async processing instead of blocking here
       info_print(f"🤖 [AsyncAI] Queueing response for {sender_node}: {text[:50]}...")
+      try:
+        current_depth = response_queue.qsize()
+      except Exception:
+        current_depth = 0
+      if current_depth > QUEUE_NOTICE_THRESHOLD:
+        _maybe_notify_queue_delay(sender_key, sender_node, interface, is_direct)
       task = (text, sender_node, is_direct, ch_idx, thread_root_ts, interface)
       try:
         response_queue.put(task, block=False)
@@ -10110,7 +12150,7 @@ def on_receive(packet=None, interface=None, **kwargs):
         if response_text:
           target_name = get_node_shortname(sender_node) or str(sender_node)
           summary = _truncate_for_log(response_text)
-          clean_log(f"Ollama → {target_name} (0.0s): {summary}", "🦙", show_always=True, rate_limit=False)
+          clean_log(f"Ollama → {target_name} (0.0s)", "🦙", show_always=True, rate_limit=False)
           if pending:
             _command_delay(pending.reason)
           if not already_sent:
@@ -10153,6 +12193,10 @@ def on_receive(packet=None, interface=None, **kwargs):
       MAIL_MANAGER.flush_notifications(interface, send_direct_chunks)
     except Exception as exc:
       clean_log(f"Mailbox notification flush error: {exc}", "⚠️")
+    try:
+      ONBOARDING_MANAGER.flush_notifications(interface, send_direct_chunks)
+    except Exception as exc:
+      clean_log(f"Onboarding notification flush error: {exc}", "⚠️")
 
 @app.route("/messages", methods=["GET"])
 def get_messages_api():
@@ -10178,6 +12222,136 @@ def get_nodes_api():
 @app.route("/connection_status", methods=["GET"], endpoint="connection_status_info")
 def connection_status_info():
     return jsonify({"status": connection_status, "error": last_error_message})
+
+
+@app.route("/dashboard/metrics", methods=["GET"])
+def get_dashboard_metrics():
+    """Return the live metrics snapshot used by the dashboard overview."""
+    try:
+        payload = _gather_dashboard_metrics()
+    except Exception as exc:  # pragma: no cover - defensive guardrail for the UI
+        return jsonify({"error": str(exc)}), 500
+    return jsonify(payload)
+
+
+@app.route("/dashboard/features", methods=["POST"])
+def update_dashboard_features():
+    try:
+        payload = request.get_json(force=True, silent=False) or {}
+    except Exception as exc:
+        return jsonify({"error": f"Invalid JSON payload: {exc}"}), 400
+
+    ai_enabled = payload.get("ai_enabled")
+    disabled_commands = payload.get("disabled_commands")
+    message_mode = payload.get("message_mode")
+    admin_passphrase = payload.get("admin_passphrase")
+    auto_ping_enabled_raw = payload.get("auto_ping_enabled")
+    old_passphrase = get_admin_passphrase()
+
+    if disabled_commands is not None and not isinstance(disabled_commands, (list, tuple)):
+        return jsonify({"error": "'disabled_commands' must be a list"}), 400
+
+    normalized_disabled: Optional[List[str]] = None
+    if disabled_commands is not None:
+        normalized_disabled = []
+        known = _all_known_commands()
+        for cmd in disabled_commands:
+            normalized = _normalize_command_name(cmd)
+            if normalized and normalized in known:
+                normalized_disabled.append(normalized)
+            else:
+                return jsonify({"error": f"Unknown command: {cmd}"}), 400
+
+    normalized_mode: Optional[str] = None
+    if message_mode is not None:
+        normalized_mode = _normalize_message_mode(message_mode)
+        if normalized_mode not in MESSAGE_MODE_OPTIONS:
+            return jsonify({"error": f"Invalid message_mode: {message_mode}"}), 400
+
+    sanitized_passphrase: Optional[str] = None
+    if admin_passphrase is not None:
+        sanitized_passphrase = str(admin_passphrase or "").strip()
+
+    auto_ping_flag: Optional[bool] = None
+    if auto_ping_enabled_raw is not None:
+        auto_ping_flag = bool(auto_ping_enabled_raw)
+
+    updated = update_feature_flags(
+        ai_enabled=ai_enabled,
+        disabled_commands=normalized_disabled,
+        message_mode=normalized_mode,
+        admin_passphrase=sanitized_passphrase,
+        auto_ping_enabled=auto_ping_flag,
+    )
+    old_passphrase_norm = str(old_passphrase or "").strip()
+    passphrase_changed = False
+    if sanitized_passphrase is not None:
+        passphrase_changed = (str(sanitized_passphrase or "").strip() != old_passphrase_norm)
+
+    try:
+        if ai_enabled is not None:
+            status = "enabled" if updated.get("ai_enabled", True) else "disabled"
+            clean_log(f"AI responses {status} via dashboard", "🛠️", show_always=True, rate_limit=False)
+        if normalized_disabled is not None:
+            if normalized_disabled:
+                clean_log(
+                    f"Commands disabled: {', '.join(normalized_disabled)}",
+                    "🛠️",
+                    show_always=True,
+                    rate_limit=False,
+                )
+            else:
+                clean_log("All commands enabled via dashboard", "🛠️", show_always=True, rate_limit=False)
+        if normalized_mode is not None:
+            if normalized_mode == "both":
+                clean_log("Inbound messaging set to channels + DMs", "🛠️", show_always=True, rate_limit=False)
+            elif normalized_mode == "dm_only":
+                clean_log("Inbound messaging set to DM only", "🛠️", show_always=True, rate_limit=False)
+            elif normalized_mode == "channel_only":
+                clean_log("Inbound messaging set to channels only", "🛠️", show_always=True, rate_limit=False)
+        if sanitized_passphrase is not None:
+            message = "Admin handoff word updated via dashboard"
+            if passphrase_changed:
+                message += " — whitelist reset"
+            clean_log(message, "🔐", show_always=True, rate_limit=False)
+        if auto_ping_flag is not None:
+            status = "enabled" if auto_ping_flag else "disabled"
+            clean_log(f"Auto ping replies {status} via dashboard", "🛠️", show_always=True, rate_limit=False)
+    except Exception:
+        pass
+
+    return jsonify(gather_feature_snapshot())
+
+
+@app.route("/dashboard/admins/remove", methods=["POST"])
+def remove_dashboard_admin():
+    try:
+        payload = request.get_json(force=True, silent=False) or {}
+    except Exception as exc:
+        return jsonify({"error": f"Invalid JSON payload: {exc}"}), 400
+
+    admin_key = str(payload.get("key") or "").strip()
+    if not admin_key:
+        return jsonify({"error": "Missing admin identifier"}), 400
+
+    if admin_key not in AUTHORIZED_ADMINS:
+        return jsonify({"error": "Admin not found"}), 404
+
+    AUTHORIZED_ADMINS.discard(admin_key)
+    AUTHORIZED_ADMIN_NAMES.pop(admin_key, None)
+    PENDING_ADMIN_REQUESTS.pop(admin_key, None)
+    if admin_key in _feature_flag_admins:
+        _feature_flag_admins.discard(admin_key)
+        snapshot = get_feature_flags_snapshot()
+        current = set(snapshot.get("admin_whitelist", []))
+        if admin_key in current:
+            current.discard(admin_key)
+            update_feature_flags(admin_whitelist=sorted(current))
+    else:
+        _refresh_authorized_admins(retain_existing=False)
+    clean_log(f"Admin access revoked for {admin_key}", "🛡️", show_always=True, rate_limit=False)
+    return jsonify(gather_feature_snapshot())
+
 
 @app.route("/logs_stream")
 def logs_stream():
@@ -10419,6 +12593,21 @@ def logs():
         font-size:0.72rem;
         color:#cfd9e6;
       }}
+      .heartbeat-indicator {{
+        font-size:0.72rem;
+        color:#f06292;
+        display:inline-flex;
+        align-items:center;
+        margin-right:4px;
+        opacity:0.7;
+        transition:transform 0.3s ease, opacity 0.3s ease;
+      }}
+      .heartbeat-indicator.inactive {{
+        opacity:0.3;
+      }}
+      .heartbeat-indicator.pulse {{
+        animation: viewer-heartbeat 1s ease-in-out;
+      }}
       .status-bar {{
         display:flex;
         justify-content:center;
@@ -10478,29 +12667,45 @@ def logs():
         color:#cca961;
       }}
       .log-line {{
-        display:block;
+        display:flex;
+        align-items:flex-start;
+        gap:8px;
         margin:0;
         transform-origin: bottom center;
+        white-space:pre-wrap;
+        line-height:1.5;
       }}
       .log-line.animate-up {{ animation: rise-scale 0.85s ease-out; position:relative; z-index:0; }}
-      .emoji {{
+      .log-line .emoji {{
         width:1em;
         height:1em;
-        margin:0 0.05em;
-        vertical-align:-0.1em;
+        flex-shrink:0;
+        margin:0;
+        vertical-align:middle;
       }}
       .log-line.incoming {{ color:#D7BA7D; }}
       .log-line.outgoing {{ color:#6A9955; }}
       .log-line.clock {{ color:#2472C8; }}
       .log-line.error {{ color:#F14C4C; font-weight:700; }}
+      .log-line.incoming .message {{ color:#D7BA7D; }}
+      .log-line.outgoing .message {{ color:#6A9955; }}
+      .log-line.clock .message {{ color:#2472C8; }}
+      .log-line.error .message {{ color:#F14C4C; font-weight:700; }}
       .header .clock {{ color:#2472C8; font-weight:bold; }}
       .log-line a {{ color:#90caf9; }}
+      @keyframes viewer-heartbeat {{
+        0% {{ transform: scale(1); opacity:0.7; }}
+        25% {{ transform: scale(1.4); opacity:1; }}
+        55% {{ transform: scale(1.1); opacity:0.85; }}
+        100% {{ transform: scale(1); opacity:0.7; }}
+      }}
     </style>
   </head>
   <body>
     <div class="header">
       <div class="status-bar">
         <div class="scroll-indicator on" id="scrollStatus">
+          <span class="heartbeat-indicator" id="heartbeatIndicator">💓</span>
           <span class="label" id="scrollLabel">Scrolling</span>
           <span class="arrow">↓</span>
         </div>
@@ -10646,6 +12851,8 @@ def logs():
       const logbox = document.getElementById('logbox');
       const scrollStatus = document.getElementById('scrollStatus');
       const scrollLabel = document.getElementById('scrollLabel');
+      const heartbeatIndicator = document.getElementById('heartbeatIndicator');
+      let heartbeatTimer = null;
 
       function updateScrollLabel(text, arrowOn) {{
         scrollLabel.textContent = text;
@@ -10654,9 +12861,26 @@ def logs():
         }} else {{
           scrollStatus.classList.remove('on');
         }}
+        if (heartbeatIndicator) {{
+          heartbeatIndicator.classList.toggle('inactive', !arrowOn);
+        }}
       }}
 
       updateScrollLabel('Scrolling', true);
+
+      function pulseHeartbeat() {{
+        if (!heartbeatIndicator) {{
+          return;
+        }}
+        if (heartbeatTimer) {{
+          clearTimeout(heartbeatTimer);
+        }}
+        heartbeatIndicator.classList.remove('pulse');
+        heartbeatIndicator.classList.remove('inactive');
+        void heartbeatIndicator.offsetWidth;
+        heartbeatIndicator.classList.add('pulse');
+        heartbeatTimer = setTimeout(() => heartbeatIndicator.classList.remove('pulse'), 700);
+      }}
 
       function smoothScrollToBottom() {{
         if (autoScroll && !isUserScrolling) {{
@@ -10695,6 +12919,16 @@ def logs():
         eventSource.onmessage = function(event) {{
           if (event.data.includes('heartbeat') || event.data.includes('keepalive')) {{
             lastMessageTime = Date.now();
+            pulseHeartbeat();
+            updateScrollLabel('Streaming', true);
+            reconnectAttempts = 0;
+            return;
+          }}
+          if (event.data.includes('💓 HB')) {{
+            lastMessageTime = Date.now();
+            pulseHeartbeat();
+            updateScrollLabel('Streaming', true);
+            reconnectAttempts = 0;
             return;
           }}
 
@@ -10773,1165 +13007,4486 @@ def health():
 
 @app.route("/dashboard", methods=["GET"])
 def dashboard():
-    channel_names = config.get("channel_names", {})
-    channel_names_json = json.dumps(channel_names)
+    # Prepare activity stream (logs) bootstrap HTML and emoji helpers
+    visible_logs = [
+        line for line in script_logs
+        if (_viewer_should_show(line) if _viewer_filter_enabled else True)
+    ]
+    visible_logs = visible_logs[-400:]
+    initial_log_html = "".join(_render_log_line_html(line) for line in visible_logs)
+    if not initial_log_html:
+        initial_log_html = "<span class=\"log-line\">No activity yet.</span>"
 
-    # Prepare node GPS and beacon info for JS
-    node_gps_info = {}
-    if interface and hasattr(interface, "nodes"):
-        for nid, ninfo in interface.nodes.items():
-            pos = ninfo.get("position", {})
-            lat = pos.get("latitude")
-            lon = pos.get("longitude")
-            tstamp = pos.get("time")
-            # Try all possible hop keys, fallback to None
-            hops = (
-                ninfo.get("hopLimit")
-                or ninfo.get("hop_count")
-                or ninfo.get("hopCount")
-                or ninfo.get("numHops")
-                or ninfo.get("num_hops")
-                or ninfo.get("hops")
-                or None
-            )
-            # Convert tstamp (epoch) to readable UTC if present
-            if tstamp:
-                try:
-                    dt = datetime.fromtimestamp(tstamp, timezone.utc)
-                    tstr = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-                except Exception:
-                    tstr = str(tstamp)
-            else:
-                tstr = None
-            node_gps_info[str(nid)] = {
-                "lat": lat,
-                "lon": lon,
-                "beacon_time": tstr,
-                "hops": hops,
-            }
-    node_gps_info_json = json.dumps(node_gps_info)
+    try:
+        metrics_bootstrap = _gather_dashboard_metrics()
+    except Exception as exc:  # pragma: no cover - defensive guardrail for UI
+        print(f"⚠️ Failed to gather dashboard metrics for bootstrap: {exc}")
+        metrics_bootstrap = {}
+    metrics_bootstrap_attr = html.escape(json.dumps(metrics_bootstrap, ensure_ascii=False), quote=True)
 
-    # Get connected node's GPS for distance calculation
-    my_lat, my_lon, _, _, _ = get_node_location(interface.myNode.nodeNum) if interface and hasattr(interface, "myNode") and interface.myNode else (None, None, None, None, None)
-    my_gps_json = json.dumps({"lat": my_lat, "lon": my_lon})
-
-    html = """
-<html>
+    page_html = r"""<!DOCTYPE html>
+<html lang="en">
 <head>
-  <title>MESH-MASTER Dashboard</title>
+  <meta charset="utf-8">
+  <title>MESH-MASTER Operations Console</title>
   <style>
-    :root { --theme-color: #ffa500; }
-    body { background: #000; color: #fff; font-family: Arial, sans-serif; margin: 0; padding-top: 120px; transition: filter 0.5s linear; }
-    #connectionStatus { position: fixed; top: 0; left: 0; width: 100%; z-index: 350; text-align: center; padding: 0; font-size: 14px; font-weight: bold; display: block; }
-    .header-buttons { position: fixed; top: 0; right: 0; z-index: 400; }
-    .header-buttons a { background: var(--theme-color); color: #000; padding: 8px 12px; margin: 5px; text-decoration: none; border-radius: 4px; font-weight: bold; }
-    #ticker-container { position: fixed; top: 20px; left: 0; width: 100vw; z-index: 300; height: 50px; display: flex; align-items: center; justify-content: center; pointer-events: none; }
-    #ticker { background: #111; color: var(--theme-color); white-space: nowrap; overflow: hidden; width: 100vw; min-width: 100vw; max-width: 100vw; padding: 5px 0; font-size: 36px; display: none; position: relative; border-bottom: 2px solid var(--theme-color); min-height: 50px; pointer-events: auto; }
-    #ticker p { display: inline-block; margin: 0; animation: tickerScroll 30s linear infinite; vertical-align: middle; min-width: 100vw; }
-    #ticker .dismiss-btn { position: absolute; right: 20px; top: 50%; transform: translateY(-50%); font-size: 18px; background: #222; color: #fff; border: 1px solid var(--theme-color); border-radius: 4px; cursor: pointer; padding: 2px 10px; z-index: 10; }
-    @keyframes tickerScroll { 0% { transform: translateX(100%); } 100% { transform: translateX(-100%); } }
-    #sendForm { margin: 20px; padding: 20px; background: #111; border: 2px solid var(--theme-color); border-radius: 10px; }
-    .three-col { display: flex; flex-direction: row; gap: 20px; margin: 20px; height: calc(100vh - 220px); }
-    .three-col .col:nth-child(1), .three-col .col:nth-child(3) { flex: 2; overflow-y: auto; }
-    .three-col .col:nth-child(2) { flex: 1; overflow-y: auto; }
-    .lcars-panel { background: #111; padding: 20px; border: 2px solid var(--theme-color); border-radius: 10px; }
-    .lcars-panel h2 { color: var(--theme-color); margin-top: 0; }
-    .message { border: 1px solid var(--theme-color); border-radius: 4px; margin: 5px; padding: 5px; }
-    .message.outgoing { background: #222; }
-    .message.newMessage { border-color: #00ff00; background: #1a2; }
-    .message.recentNode { border-color: #00bfff; background: #113355; }
-    .timestamp { font-size: 0.8em; color: #666; }
-    .btn { margin-left: 10px; padding: 2px 6px; font-size: 0.8em; cursor: pointer; }
-    .switch { position: relative; display: inline-block; width: 60px; height: 34px; vertical-align: middle; }
-    .switch input { opacity: 0; width: 0; height: 0; }
-    .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; }
-    .slider:before { position: absolute; content: ""; height: 26px; width: 26px; left: 4px; bottom: 4px; background-color: white; transition: .4s; }
-    input:checked + .slider { background-color: #2196F3; }
-    input:focus + .slider { box-shadow: 0 0 1px #2196F3; }
-    input:checked + .slider:before { transform: translateX(26px); }
-    .slider.round { border-radius: 34px; }
-    .slider.round:before { border-radius: 50%; }
-    #charCounter { font-size: 0.9em; color: #ccc; text-align: right; margin-top: 5px; }
-    .nodeItem { margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid var(--theme-color); display: flex; flex-direction: column; align-items: flex-start; flex-wrap: wrap; }
-    .nodeItem.recentNode { border-bottom: 2px solid #00bfff; background: #113355; }
-    .nodeMainLine { font-weight: bold; font-size: 1.1em; }
-    .nodeLongName { color: #aaa; font-size: 0.98em; margin-top: 2px; }
-    .nodeInfoLine { margin-top: 2px; font-size: 0.95em; color: #ccc; display: flex; flex-wrap: wrap; gap: 10px; }
-    .nodeGPS { margin-left: 0; }
-    .nodeBeacon { color: #aaa; font-size: 0.92em; }
-    .nodeHops { color: #6cf; font-size: 0.92em; }
-    .nodeMapBtn { margin-left: 0; background: #222; color: #fff; border: 1px solid #ffa500; border-radius: 4px; padding: 2px 6px; font-size: 1em; cursor: pointer; text-decoration: none; }
-    .nodeMapBtn:hover { background: #ffa500; color: #000; }
-    .channel-header { display: flex; align-items: center; gap: 10px; }
-    .reply-btn { margin-left: 10px; padding: 2px 8px; font-size: 0.85em; background: #222; color: var(--theme-color); border: 1px solid var(--theme-color); border-radius: 4px; cursor: pointer; }
-    .mark-read-btn { margin-left: 10px; padding: 2px 8px; font-size: 0.85em; background: #222; color: #0f0; border: 1px solid #0f0; border-radius: 4px; cursor: pointer; }
-    .mark-all-read-btn { margin-left: 10px; padding: 2px 8px; font-size: 0.85em; background: #222; color: #ff0; border: 1px solid #ff0; border-radius: 4px; cursor: pointer; }
-    /* Threaded DM styles */
-    .dm-thread { margin-bottom: 16px; border-left: 3px solid var(--theme-color); padding-left: 10px; }
-    .dm-thread .message { margin-left: 0; }
-    .dm-thread .reply-btn { margin-top: 5px; }
-    .dm-thread .thread-replies { margin-left: 30px; border-left: 2px dashed #555; padding-left: 10px; }
-    /* Node sort controls */
-    .nodeSortBar { margin-bottom: 10px; }
-    .nodeSortBar label { margin-right: 8px; }
-    .nodeSortBar select { background: #222; color: #fff; border: 1px solid var(--theme-color); border-radius: 4px; padding: 2px 8px; }
-    /* Full width search bar for nodes */
-    #nodeSearch { width: 100%; margin-bottom: 10px; font-size: 1em; padding: 6px; box-sizing: border-box; }
-    /* UI Settings panel hidden by default */
-    .settings-panel { display: none; background: #111; border: 2px solid var(--theme-color); border-radius: 10px; padding: 20px; margin: 20px; }
-    .settings-toggle { background: var(--theme-color); color: #000; padding: 8px 12px; margin: 20px; border-radius: 4px; font-weight: bold; cursor: pointer; display: inline-block; }
-    .settings-toggle.active { background: #222; color: #ffa500; }
-    /* Timezone selector */
-    #timezoneSelect { margin-left: 10px; }
-    /* Keep settings toggle and panel fixed so they don't move */
-    .settings-toggle { position: fixed; bottom: 16px; left: 16px; z-index: 1100; box-shadow: 0 2px 6px rgba(0,0,0,0.6); }
-    .settings-panel { position: fixed; bottom: 64px; left: 16px; z-index: 1100; width: 360px; max-height: 60vh; overflow:auto; margin: 0; }
-    /* Autostart panel styles */
-    .autostart-panel { position: fixed; bottom: 16px; right: 16px; z-index: 1100; }
-    .autostart-box { display:flex;align-items:center;gap:10px;padding:10px 14px;background:#111;border:2px solid var(--theme-color);border-radius:12px; }
+    :root {
+      --bg: #05070b;
+      --bg-alt: #07090c;
+      --bg-panel: #0b1018;
+      --border: #111722;
+      --border-light: #162030;
+      --accent: #569cd6;
+      --accent-strong: #007acc;
+      --accent-soft: rgba(86, 156, 214, 0.16);
+      --text-primary: #d7deed;
+      --text-secondary: #9aa4ba;
+      --text-faint: #7c8497;
+      --success: #6a9955;
+      --warning: #d7ba7d;
+      --danger: #f44747;
+      --shadow: rgba(0, 0, 0, 0.35);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 0;
+      background: var(--bg);
+      color: var(--text-primary);
+      font-family: "JetBrains Mono", "Fira Code", "Consolas", monospace;
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { color: #8dc2f0; }
+    .app-shell {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    .app-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 16px 28px;
+      background: linear-gradient(90deg, #07090c, #0b1018);
+      border-bottom: 1px solid var(--border);
+      box-shadow: 0 2px 8px var(--shadow);
+      position: sticky;
+      top: 0;
+      z-index: 200;
+    }
+    .brand {
+      display: flex;
+      flex-direction: column;
+    }
+    .brand-title {
+      font-size: 20px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .brand-subtitle {
+      color: var(--text-secondary);
+      font-size: 13px;
+      letter-spacing: 0.05em;
+    }
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      color: var(--text-secondary);
+      font-size: 13px;
+    }
+    .header-actions .divider {
+      width: 1px;
+      height: 20px;
+      background: var(--border);
+    }
+    .header-link {
+      padding: 6px 12px;
+      border-radius: 4px;
+      border: 1px solid transparent;
+      transition: background 0.2s ease, border-color 0.2s ease;
+    }
+    .header-link:hover {
+      background: var(--accent-soft);
+      border-color: var(--accent);
+    }
+    .connection-banner {
+      padding: 10px 28px;
+      font-size: 14px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(7, 9, 12, 0.92);
+      color: var(--text-secondary);
+    }
+    .connection-banner.is-connected {
+      background: rgba(106, 153, 85, 0.18);
+      color: var(--success);
+      border-bottom-color: rgba(106, 153, 85, 0.45);
+    }
+    .connection-banner.is-degraded {
+      background: rgba(215, 186, 125, 0.18);
+      color: var(--warning);
+      border-bottom-color: rgba(215, 186, 125, 0.45);
+    }
+    .connection-banner.is-disconnected {
+      background: rgba(244, 71, 71, 0.14);
+      color: var(--danger);
+      border-bottom-color: rgba(244, 71, 71, 0.45);
+    }
+    .connection-banner.is-unknown {
+      color: var(--text-secondary);
+    }
+    .content {
+      flex: 1;
+      padding: 24px;
+      display: grid;
+      grid-template-columns: minmax(320px, 2fr) minmax(420px, 3fr);
+      grid-template-areas: "primary activity";
+      gap: 20px;
+      align-items: start;
+    }
+    .primary {
+      grid-area: primary;
+      display: flex;
+      flex-direction: column;
+      gap: 28px;
+    }
+    .activity {
+      grid-area: activity;
+      display: flex;
+      flex-direction: column;
+      gap: 28px;
+      position: relative;
+    }
+    .activity::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      border-radius: 14px;
+      background: rgba(7, 9, 12, 0.92);
+      box-shadow: 0 40px 60px rgba(0, 0, 0, 0.45);
+      z-index: 0;
+    }
+    .activity > * {
+      position: relative;
+      z-index: 1;
+    }
+    .panel {
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 18px;
+      box-shadow: 0 12px 28px rgba(0, 0, 0, 0.2);
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .panel[data-draggable="true"] .panel-header {
+      cursor: grab;
+    }
+    .panel.is-dragging {
+      opacity: 0.6;
+      cursor: grabbing;
+    }
+    .panel.is-dragging .panel-header {
+      cursor: grabbing;
+    }
+    .panel-drag-handle {
+      user-select: none;
+      touch-action: none;
+    }
+    .panel-placeholder {
+      display: block;
+      width: 100%;
+      border: 2px dashed rgba(86, 156, 214, 0.45);
+      border-radius: 10px;
+      min-height: 88px;
+      margin: 4px 0;
+      pointer-events: none;
+      background: rgba(86, 156, 214, 0.08);
+    }
+    [data-panel-zone].drop-active {
+      outline: 1px dashed rgba(86, 156, 214, 0.45);
+      outline-offset: 6px;
+    }
+    .panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 10px;
+    }
+    .panel-title {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .panel-body {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .panel.collapsed {
+      gap: 8px;
+    }
+    .panel.collapsed .panel-body {
+      display: none;
+    }
+    .panel-collapse {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 26px;
+      padding: 0;
+      background: rgba(86, 156, 214, 0.15);
+      border: 1px solid rgba(86, 156, 214, 0.25);
+      border-radius: 6px;
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+    }
+    .panel-collapse::before {
+      content: '▾';
+      font-size: 14px;
+      line-height: 1;
+      transform: translateY(-1px);
+    }
+    .panel.collapsed .panel-collapse::before {
+      content: '▸';
+      transform: translateY(-1px);
+    }
+    .panel-collapse:hover,
+    .panel-collapse:focus-visible {
+      background: rgba(86, 156, 214, 0.28);
+      border-color: rgba(86, 156, 214, 0.45);
+      color: var(--accent);
+      outline: none;
+    }
+    .panel-header h2 {
+      margin: 0;
+      font-size: 17px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+    .panel-subtitle {
+      font-size: 13px;
+      color: var(--text-secondary);
+      white-space: nowrap;
+    }
+    .ops-panel {
+      gap: 14px;
+    }
+    .config-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .config-select-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .config-select-row label {
+      font-size: 11.5px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-secondary);
+    }
+    .config-reset-btn {
+      margin-left: auto;
+      background: rgba(244, 71, 71, 0.12);
+      border: 1px solid rgba(244, 71, 71, 0.35);
+      border-radius: 6px;
+      color: var(--danger);
+      font-size: 11.5px;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      padding: 6px 10px;
+      cursor: pointer;
+      text-transform: uppercase;
+      transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+    }
+    .config-reset-btn:hover {
+      background: rgba(244, 71, 71, 0.22);
+      border-color: rgba(244, 71, 71, 0.5);
+    }
+    .config-select {
+      flex: 1;
+      background: rgba(17, 19, 25, 0.9);
+      border: 1px solid rgba(86, 156, 214, 0.35);
+      border-radius: 8px;
+      color: var(--text-primary);
+      font-family: inherit;
+      font-size: 13px;
+      padding: 8px 10px;
+    }
+    .config-row.config-row-stack {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 8px;
+    }
+    .config-row.config-row-stack .config-key-heading {
+      margin: 0 0 4px 0;
+    }
+    .config-select:focus {
+      border-color: var(--accent);
+      outline: none;
+      box-shadow: 0 0 0 2px rgba(86, 156, 214, 0.22);
+    }
+    .config-quiet-hours {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 12px;
+    }
+    .config-quiet-hours .quiet-toggle {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12.5px;
+    }
+    .config-quiet-hours .quiet-toggle input {
+      width: 16px;
+      height: 16px;
+    }
+    .config-quiet-hours .quiet-range {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .config-quiet-hours .quiet-range span {
+      font-size: 12.5px;
+      color: var(--text-secondary);
+    }
+    .config-quiet-hours .quiet-select {
+      flex: 0 0 auto;
+      width: 110px;
+    }
+    .config-bool-group {
+      display: flex;
+      gap: 14px;
+      align-items: center;
+    }
+    .config-bool-option {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12.5px;
+      color: var(--text-primary);
+    }
+    .config-bool-option input[type="radio"] {
+      accent-color: var(--accent);
+    }
+    .config-table {
+      border: 1px solid var(--border-light);
+      border-radius: 10px;
+      background: rgba(11, 15, 22, 0.92);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .config-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      padding: 10px 12px;
+      border-bottom: 1px solid rgba(60, 65, 80, 0.4);
+    }
+    .config-row:last-child {
+      border-bottom: none;
+    }
+    .config-key {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 180px;
+    }
+    .config-key-label {
+      font-weight: 600;
+      color: var(--accent);
+      font-size: 13px;
+      letter-spacing: 0.02em;
+    }
+    .config-key-code {
+      font-family: "JetBrains Mono", "Fira Code", "Consolas", monospace;
+      font-size: 11px;
+      color: var(--text-faint);
+      letter-spacing: 0.02em;
+      text-transform: lowercase;
+    }
+    .config-key.has-explainer {
+      cursor: help;
+    }
+    .config-value {
+      flex: 1;
+      margin-left: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .config-display-line {
+      display: flex;
+      justify-content: flex-end;
+      align-items: center;
+      gap: 8px;
+      color: var(--text-primary);
+      font-size: 12.5px;
+      text-align: right;
+      word-break: break-word;
+    }
+    .config-display {
+      white-space: pre-wrap;
+    }
+    .config-key-heading {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .config-info {
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      border: 1px solid var(--border-light);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--accent);
+      background: transparent;
+      cursor: help;
+      transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+    }
+    .config-info:hover,
+    .config-info:focus-visible {
+      background: var(--accent-soft);
+      border-color: var(--accent);
+      color: #8dc2f0;
+      outline: none;
+    }
+    .command-item[data-explainer] span {
+      cursor: help;
+    }
+    .dashboard-tooltip {
+      position: fixed;
+      z-index: 9999;
+      max-width: 300px;
+      padding: 10px 12px;
+      background: rgba(7, 10, 16, 0.97);
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      box-shadow: 0 16px 32px rgba(0, 0, 0, 0.45);
+      color: var(--text-primary);
+      font-size: 12px;
+      line-height: 1.5;
+      pointer-events: none;
+      opacity: 0;
+      transform: translate(-50%, -8px);
+      transition: opacity 0.12s ease, transform 0.12s ease;
+      white-space: pre-line;
+    }
+    .dashboard-tooltip.is-visible {
+      opacity: 1;
+      transform: translate(-50%, 0);
+    }
+    .config-type-badge {
+      background: rgba(86, 156, 214, 0.18);
+      border: 1px solid rgba(86, 156, 214, 0.4);
+      border-radius: 6px;
+      color: #cfe3fb;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      padding: 2px 8px;
+      text-transform: uppercase;
+    }
+    .config-edit-btn,
+    .config-save-btn,
+    .config-cancel-btn {
+      background: rgba(86, 156, 214, 0.15);
+      border: 1px solid rgba(86, 156, 214, 0.3);
+      border-radius: 6px;
+      color: var(--text-primary);
+      font-size: 11.5px;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      padding: 4px 10px;
+      cursor: pointer;
+      text-transform: uppercase;
+      transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+    }
+    .config-edit-btn:hover,
+    .config-save-btn:hover {
+      background: rgba(86, 156, 214, 0.28);
+      border-color: rgba(86, 156, 214, 0.45);
+      color: var(--accent);
+    }
+    .config-cancel-btn {
+      background: rgba(244, 71, 71, 0.12);
+      border-color: rgba(244, 71, 71, 0.32);
+      color: var(--danger);
+    }
+    .config-cancel-btn:hover {
+      background: rgba(244, 71, 71, 0.22);
+      border-color: rgba(244, 71, 71, 0.45);
+    }
+    .config-edit-area {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .config-row:not(.is-editing) .config-edit-area {
+      display: none;
+    }
+    .config-row.is-editing .config-display-line {
+      display: none;
+    }
+    .config-input {
+      width: 100%;
+      background: rgba(17, 19, 25, 0.9);
+      border: 1px solid rgba(86, 156, 214, 0.35);
+      border-radius: 8px;
+      color: var(--text-primary);
+      font-family: inherit;
+      font-size: 12.5px;
+      padding: 8px 10px;
+      resize: vertical;
+      min-height: 48px;
+    }
+    .config-input:focus {
+      border-color: var(--accent);
+      outline: none;
+      box-shadow: 0 0 0 2px rgba(86, 156, 214, 0.22);
+    }
+    .config-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 6px;
+    }
+    .config-status {
+      font-size: 11px;
+      color: var(--text-secondary);
+      text-align: right;
+      min-height: 14px;
+    }
+    .config-status[data-tone="error"] {
+      color: var(--danger);
+    }
+    .config-status[data-tone="success"] {
+      color: #7adba4;
+    }
+    .config-row[data-saving="true"] .config-save-btn,
+    .config-row[data-saving="true"] .config-cancel-btn,
+    .config-row[data-saving="true"] .config-edit-btn {
+      cursor: wait;
+      opacity: 0.6;
+    }
+    .config-row[data-saving="true"] .config-input {
+      pointer-events: none;
+      opacity: 0.65;
+    }
+    .config-empty {
+      margin: 0;
+      padding: 14px;
+      text-align: center;
+      color: var(--text-secondary);
+      font-size: 12.5px;
+    }
+    .feature-alerts {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      background: rgba(86, 156, 214, 0.08);
+      border: 1px solid rgba(86, 156, 214, 0.25);
+      border-radius: 10px;
+      padding: 8px 12px;
+    }
+    .feature-pill {
+      background: rgba(86, 156, 214, 0.18);
+      border-radius: 999px;
+      padding: 2px 10px;
+      font-size: 12px;
+      color: #cfe3fb;
+    }
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 4px 0 2px;
+    }
+    .mode-toggle {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 6px 0 4px;
+    }
+    .mode-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .mode-title {
+      font-weight: 600;
+      font-size: 13px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--text-secondary);
+    }
+    .mode-status {
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    .mode-buttons {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      background: rgba(17, 19, 25, 0.75);
+      border: 1px solid rgba(86, 156, 214, 0.25);
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .mode-buttons[data-saving="true"] {
+      opacity: 0.6;
+      pointer-events: none;
+    }
+    .mode-btn {
+      background: transparent;
+      color: var(--text-secondary);
+      border: none;
+      padding: 8px 10px;
+      font-size: 12.5px;
+      cursor: pointer;
+      transition: background 0.2s ease, color 0.2s ease;
+    }
+    .mode-btn + .mode-btn {
+      border-left: 1px solid rgba(86, 156, 214, 0.15);
+    }
+    .passphrase-card {
+      background: var(--bg-panel);
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .passphrase-card label {
+      font-size: 11.5px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-secondary);
+    }
+    .passphrase-input {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+    .passphrase-input input {
+      flex: 1;
+      background: rgba(9, 12, 19, 0.92);
+      border: 1px solid rgba(86, 156, 214, 0.3);
+      border-radius: 6px;
+      color: var(--text-primary);
+      font-family: inherit;
+      font-size: 13px;
+      padding: 8px 10px;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease;
+    }
+    .passphrase-input input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(86, 156, 214, 0.25);
+      outline: none;
+    }
+    .passphrase-hint {
+      margin: 0;
+      font-size: 11.5px;
+      color: var(--text-secondary);
+    }
+    .passphrase-warning {
+      margin: 0;
+      font-size: 11.5px;
+      color: var(--warning);
+    }
+    .mode-btn.active {
+      background: var(--accent);
+      color: #081019;
+      font-weight: 600;
+    }
+    .mode-btn:focus-visible {
+      outline: 2px solid var(--accent-strong);
+      outline-offset: -2px;
+    }
+    .switch {
+      position: relative;
+      width: 44px;
+      height: 24px;
+      flex-shrink: 0;
+    }
+    .switch input {
+      display: none;
+    }
+    .switch .slider {
+      position: absolute;
+      inset: 0;
+      background: #3a3d45;
+      border-radius: 24px;
+      transition: background 0.25s ease;
+    }
+    .switch .slider::before {
+      content: "";
+      position: absolute;
+      width: 18px;
+      height: 18px;
+      left: 3px;
+      top: 3px;
+      border-radius: 50%;
+      background: #f4f7fb;
+      transition: transform 0.25s ease;
+    }
+    .switch input:checked + .slider {
+      background: var(--accent);
+    }
+    .switch input:checked + .slider::before {
+      transform: translateX(20px);
+    }
+    .toggle-copy {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .toggle-title {
+      font-weight: 600;
+      font-size: 14px;
+    }
+    .toggle-status {
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    .command-groups {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .command-groups[data-saving="true"] {
+      opacity: 0.6;
+      pointer-events: none;
+    }
+    .command-group {
+      background: rgba(17, 19, 25, 0.75);
+      border: 1px solid rgba(60, 65, 80, 0.55);
+      border-radius: 10px;
+      padding: 0;
+      overflow: hidden;
+    }
+    .command-group summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 10px 14px;
+      font-weight: 600;
+      font-size: 13px;
+      color: var(--text-primary);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .command-group summary::after {
+      content: '▾';
+      font-size: 12px;
+      color: var(--text-secondary);
+      transition: transform 0.2s ease;
+      margin-left: 12px;
+    }
+    .command-group:not([open]) summary::after {
+      transform: rotate(-90deg);
+    }
+    .command-group summary::-webkit-details-marker {
+      display: none;
+    }
+    .command-group[open] summary {
+      border-bottom: 1px solid rgba(60, 65, 80, 0.6);
+    }
+    .command-list {
+      display: grid;
+      gap: 6px 12px;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      padding: 10px 14px 12px;
+    }
+    .command-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12.5px;
+      color: var(--text-secondary);
+      text-transform: none;
+    }
+    .command-item input {
+      accent-color: var(--accent-strong);
+    }
+    .command-item.is-disabled span {
+      color: var(--warning);
+      font-weight: 600;
+    }
+    .feature-empty {
+      font-size: 12.5px;
+      color: var(--text-secondary);
+      padding: 6px 16px 8px;
+    }
+    .snapshot-grid {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    }
+    .snapshot-section {
+      background: rgba(17, 19, 25, 0.65);
+      border: 1px solid rgba(60, 65, 80, 0.45);
+      border-radius: 10px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .snapshot-section h3 {
+      margin: 0;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--text-secondary);
+    }
+    .snapshot-list {
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .snapshot-list div {
+      display: flex;
+      flex-direction: column-reverse;
+      align-items: flex-start;
+      gap: 2px;
+      padding: 0;
+    }
+    .snapshot-list dt {
+      margin: 0;
+      font-size: 11px;
+      color: var(--text-secondary);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .snapshot-list dd {
+      margin: 0;
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+    .stat-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 14px;
+      padding: 10px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .stat-row:last-child {
+      border-bottom: none;
+    }
+    .stat-row .label {
+      color: var(--text-secondary);
+    }
+    .stat-row .value {
+      color: var(--text-primary);
+      font-weight: 500;
+    }
+    .games-breakdown {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin-top: 4px;
+    }
+    .games-breakdown span {
+      background: rgba(86, 156, 214, 0.12);
+      border: 1px solid rgba(86, 156, 214, 0.25);
+      border-radius: 999px;
+      padding: 4px 10px;
+    }
+    .onboard-roster {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      margin-top: 6px;
+      max-height: 160px;
+      overflow-y: auto;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    .onboard-roster-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 6px;
+      border-radius: 6px;
+      background: rgba(86, 156, 214, 0.08);
+      border: 1px solid rgba(86, 156, 214, 0.18);
+    }
+    .onboard-roster-item strong {
+      color: var(--text-primary);
+      font-size: 12.5px;
+    }
+    .onboard-roster-item span {
+      color: var(--text-secondary);
+      font-size: 11px;
+    }
+    .onboard-roster-empty {
+      font-size: 12px;
+      color: var(--text-secondary);
+      padding: 6px 0;
+    }
+    .stat-value-number {
+      font-weight: 600;
+      color: var(--text-primary);
+      font-size: 1.05em;
+    }
+    .delta {
+      display: inline-flex;
+      align-items: center;
+      font-size: 11px;
+      letter-spacing: 0.02em;
+    }
+    .delta-up {
+      color: #6a9955;
+    }
+    .delta-down {
+      color: #f44747;
+    }
+    .delta-flat {
+      color: var(--text-secondary);
+    }
+    .log-panel {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      background: rgba(7, 9, 12, 0.92);
+      border: 1px solid rgba(50, 54, 67, 0.75);
+      border-radius: 14px;
+      padding: 22px 24px;
+      box-shadow: 0 24px 48px rgba(0, 0, 0, 0.3);
+      overflow: hidden;
+    }
+    .log-panel .panel-header {
+      border-bottom: 1px solid rgba(60, 65, 80, 0.45);
+      padding-bottom: 10px;
+      margin-bottom: 10px;
+    }
+    .logbox {
+      flex: 1;
+      overflow-y: auto;
+      background: transparent;
+      border: none;
+      padding: 8px 4px 4px;
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-family: "JetBrains Mono", "Fira Code", "Consolas", monospace;
+      font-size: 13px;
+      line-height: 1.6;
+      scrollbar-width: thin;
+    }
+    .logbox::before {
+      content: "";
+      position: sticky;
+      top: 0;
+      height: 38px;
+      pointer-events: none;
+      background: linear-gradient(to bottom, rgba(7,9,12,0.96) 0%, rgba(7,9,12,0) 85%);
+      z-index: 2;
+    }
+    .log-line {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 0 8px;
+      color: #dce6f4;
+      transition: transform 0.35s ease, opacity 0.35s ease;
+      white-space: pre-wrap;
+      line-height: 1.5;
+    }
+    .log-line.new-line {
+      border-left: 3px solid var(--accent);
+      padding-left: 12px;
+    }
+    .log-line.animate-up {
+      animation: rise-in 0.6s ease-out;
+    }
+    .log-line .emoji {
+      width: 1em;
+      height: 1em;
+      flex-shrink: 0;
+      margin: 0;
+      vertical-align: middle;
+    }
+    @keyframes rise-in {
+      0% { transform: translateY(12px); opacity: 0; }
+      60% { transform: translateY(4px); opacity: 0.8; }
+      100% { transform: translateY(0); opacity: 1; }
+    }
+    .log-line .timestamp {
+      color: var(--text-secondary);
+      margin-right: 8px;
+    }
+    .log-line .message {
+      color: var(--text-primary);
+      flex: 1;
+    }
+    .log-line.incoming .message {
+      color: #d7ba7d;
+    }
+    .log-line.outgoing .message {
+      color: #6a9955;
+    }
+    .log-line.clock .message {
+      color: #2472c8;
+    }
+    .log-line.error .message {
+      color: #f14c4c;
+      font-weight: 600;
+    }
+    .scroll-status {
+      font-size: 12px;
+      color: #cfd9e6;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(25, 28, 36, 0.75);
+      border: 1px solid rgba(86, 156, 214, 0.25);
+      padding: 4px 12px;
+      border-radius: 999px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .scroll-status::before {
+      content: "";
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: rgba(207, 217, 230, 0.45);
+      transition: background 0.2s ease;
+    }
+    .scroll-status::after {
+      content: "↓";
+      font-size: 12px;
+      opacity: 0;
+      transform: translateY(-2px);
+      transition: opacity 0.2s ease;
+    }
+    .heartbeat-indicator {
+      font-size: 12px;
+      color: #f06292;
+      display: inline-flex;
+      align-items: center;
+      margin-right: 4px;
+      opacity: 0.7;
+      transition: transform 0.3s ease, opacity 0.3s ease;
+    }
+    .heartbeat-indicator.inactive {
+      opacity: 0.3;
+    }
+    .heartbeat-indicator.pulse {
+      animation: heartbeat-pulse 1s ease-in-out;
+    }
+    @keyframes pulse-arrow {
+      0% { transform: translateY(-2px); opacity: 0.15; }
+      50% { transform: translateY(2px); opacity: 0.6; }
+      100% { transform: translateY(-2px); opacity: 0.15; }
+    }
+    @keyframes heartbeat-pulse {
+      0% { transform: scale(1); opacity: 0.7; }
+      25% { transform: scale(1.35); opacity: 1; }
+      55% { transform: scale(1.1); opacity: 0.85; }
+      100% { transform: scale(1); opacity: 0.7; }
+    }
+    .scroll-status.on::before {
+      background: var(--accent);
+    }
+    .scroll-status.on::after {
+      opacity: 0.7;
+      animation: pulse-arrow 2s ease-in-out infinite;
+    }
+    .btn {
+      background: var(--accent);
+      color: #0b121a;
+      border: none;
+      padding: 6px 12px;
+      border-radius: 4px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.2s ease;
+    }
+    .btn:hover {
+      background: var(--accent-strong);
+      color: #fff;
+    }
+    .btn-small {
+      padding: 4px 10px;
+      font-size: 12px;
+    }
+    .passphrase-actions {
+      margin-top: 6px;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+    .passphrase-card {
+      position: relative;
+    }
+    .passphrase-set {
+      background: var(--accent);
+      border: 1px solid rgba(86, 156, 214, 0.4);
+      color: #06101c;
+      padding: 8px 14px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+      flex-shrink: 0;
+    }
+    .passphrase-set:hover:not(:disabled) {
+      background: #8dc2f0;
+      border-color: var(--accent);
+    }
+    .passphrase-set:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+    .admin-list-link {
+      margin-left: 8px;
+      color: var(--accent);
+      text-decoration: underline;
+      cursor: pointer;
+    }
+    .admin-list-link:hover {
+      color: var(--accent-strong);
+    }
+    .activity-header-meta {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .uptime-ticker {
+      font-size: 12px;
+      color: var(--text-secondary);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: rgba(86, 156, 214, 0.12);
+      border: 1px solid rgba(86, 156, 214, 0.25);
+    }
+    .admin-popover[hidden] {
+      display: none;
+    }
+    .admin-popover {
+      position: absolute;
+      top: 100%;
+      right: 0;
+      margin-top: 10px;
+      min-width: 320px;
+      max-width: calc(100vw - 40px);
+      background: rgba(11, 16, 24, 0.98);
+      border: 1px solid var(--border-light);
+      border-radius: 12px;
+      box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding: 16px 18px 18px;
+      z-index: 200;
+    }
+    .admin-popover::before {
+      content: "";
+      position: absolute;
+      top: -8px;
+      right: 24px;
+      width: 16px;
+      height: 16px;
+      transform: rotate(45deg);
+      background: inherit;
+      border-left: 1px solid var(--border-light);
+      border-top: 1px solid var(--border-light);
+    }
+    .admin-popover-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+    }
+    .admin-popover-header h3 {
+      margin: 0;
+      font-size: 14px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--text-secondary);
+    }
+    .admin-popover-close {
+      background: transparent;
+      border: none;
+      color: var(--text-secondary);
+      font-size: 18px;
+      line-height: 1;
+      padding: 2px 6px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.2s ease, color 0.2s ease;
+    }
+    .admin-popover-close:hover,
+    .admin-popover-close:focus-visible {
+      background: rgba(86, 156, 214, 0.2);
+      color: var(--text-primary);
+      outline: none;
+    }
+    .admin-popover-body {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      max-height: 260px;
+      overflow-y: auto;
+    }
+    .admin-list {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .admin-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(12, 16, 24, 0.92);
+      border: 1px solid rgba(60, 65, 80, 0.6);
+      color: var(--text-secondary);
+      font-size: 12.5px;
+    }
+    .admin-item-info {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      flex: 1;
+      min-width: 0;
+    }
+    .admin-item strong {
+      color: var(--text-primary);
+      font-size: 13px;
+    }
+    .admin-item-key {
+      font-size: 11px;
+      color: var(--text-faint);
+      letter-spacing: 0.02em;
+      word-break: break-all;
+    }
+    .admin-empty {
+      font-size: 12.5px;
+      color: var(--text-secondary);
+    }
+    .admin-remove-btn {
+      background: rgba(244, 71, 71, 0.16);
+      border: 1px solid rgba(244, 71, 71, 0.4);
+      color: var(--danger);
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 11.5px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      cursor: pointer;
+      transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+    }
+    .admin-remove-btn:hover:not(:disabled) {
+      background: rgba(244, 71, 71, 0.28);
+      border-color: rgba(244, 71, 71, 0.55);
+    }
+    .admin-remove-btn:disabled {
+      opacity: 0.55;
+      cursor: default;
+    }
+    @media (max-width: 1200px) {
+      .content {
+        grid-template-columns: 1fr;
+        grid-template-areas:
+          "primary"
+          "activity";
+      }
+    }
+    @media (max-width: 720px) {
+      .app-header {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 12px;
+      }
+      .header-actions {
+        align-self: stretch;
+        justify-content: space-between;
+      }
+      .content {
+        padding: 20px;
+      }
+    }
   </style>
+</head>
+<body>
+  <div class="app-shell" id="appShell" data-initial-metrics="__METRICS__">
+    <header class="app-header">
+      <div class="brand">
+        <span class="brand-title">Mesh-Master 🚀</span>
+        <span class="brand-subtitle">Operations Console 🛰️</span>
+      </div>
+      <div class="header-actions">
+        <span id="metricsTimestamp" class="panel-subtitle">Waiting for metrics…</span>
+        <span class="divider"></span>
+        <a class="header-link" href="/logs" target="_blank">Pop-out Stream</a>
+      </div>
+    </header>
+    <div id="connectionBanner" class="connection-banner is-unknown">Checking connection…</div>
+    <main class="content">
+      <section class="primary" data-panel-zone="primary">
+        <article class="panel snapshot-panel" data-panel-id="snapshot" data-draggable="true" data-collapsible="true">
+          <div class="panel-header">
+            <div class="panel-title">
+              <h2>Activity Snapshot 📊</h2>
+              <span class="panel-subtitle">Mesh visibility</span>
+            </div>
+            <button type="button" class="panel-collapse" aria-expanded="true" aria-controls="snapshotBody" aria-label="Collapse panel"></button>
+          </div>
+          <div class="panel-body" id="snapshotBody">
+            <div class="snapshot-grid">
+              <section class="snapshot-section">
+                <h3>Messaging ✉️</h3>
+                <dl class="snapshot-list">
+                  <div><dt>Total</dt><dd id="stat-msg-total">—</dd></div>
+                  <div><dt>Direct</dt><dd id="stat-msg-direct">—</dd></div>
+                  <div><dt>AI Authored</dt><dd id="stat-msg-ai">—</dd></div>
+                </dl>
+              </section>
+              <section class="snapshot-section">
+                <h3>Network 🌐</h3>
+                <dl class="snapshot-list">
+                  <div><dt>Active nodes</dt><dd id="stat-nodes-current">—</dd></div>
+                  <div><dt>New nodes</dt><dd id="stat-nodes-new">—</dd></div>
+                  <div><dt>Active users</dt><dd id="stat-active-users">—</dd></div>
+                </dl>
+                <div class="games-breakdown" id="stat-games-breakdown"></div>
+              </section>
+              <section class="snapshot-section">
+                <h3>Ack Telemetry 📶</h3>
+                <dl class="snapshot-list">
+                  <div><dt>DM 1st try</dt><dd id="stat-ack-dm-first">—</dd></div>
+                  <div><dt>DM resend</dt><dd id="stat-ack-dm-resend">—</dd></div>
+                  <div><dt>DM events</dt><dd id="stat-ack-dm-events">—</dd></div>
+                </dl>
+              </section>
+              <section class="snapshot-section">
+                <h3>Onboarding 🧭</h3>
+                <dl class="snapshot-list">
+                  <div><dt>New 24h</dt><dd id="stat-new-onboards">—</dd></div>
+                  <div><dt>Games launched</dt><dd id="stat-games">—</dd></div>
+                </dl>
+                <div class="onboard-roster" id="onboardRoster"></div>
+              </section>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel ops-panel" data-panel-id="operations" data-draggable="true">
+          <div class="panel-header">
+            <h2>Operations Center 🛠️</h2>
+            <span id="featuresStatus" class="panel-subtitle">Manage AI and command access</span>
+          </div>
+          <div id="featureAlerts" class="feature-alerts" hidden></div>
+          <div class="toggle-row">
+            <label class="switch">
+              <input type="checkbox" id="aiToggle">
+              <span class="slider"></span>
+            </label>
+            <div class="toggle-copy">
+              <span class="toggle-title">AI Responses 🤖</span>
+              <span id="aiToggleStatus" class="toggle-status">Enabled</span>
+            </div>
+          </div>
+          <div class="toggle-row">
+            <label class="switch">
+              <input type="checkbox" id="autoPingToggle">
+              <span class="slider"></span>
+            </label>
+            <div class="toggle-copy">
+              <span class="toggle-title">Auto Ping Replies 🏓</span>
+              <span id="autoPingToggleStatus" class="toggle-status">Enabled</span>
+            </div>
+          </div>
+          <div class="mode-toggle">
+            <div class="mode-header">
+              <span class="mode-title">Inbound Messaging 📡</span>
+              <span class="mode-status" id="modeStatus">Channels + DMs</span>
+            </div>
+            <div class="mode-buttons" role="radiogroup" aria-label="Inbound messaging mode">
+              <button type="button" class="mode-btn" data-mode="both" aria-pressed="false">Channels + DMs</button>
+              <button type="button" class="mode-btn" data-mode="dm_only" aria-pressed="false">DM only</button>
+              <button type="button" class="mode-btn" data-mode="channel_only" aria-pressed="false">Channels only</button>
+            </div>
+          </div>
+          <div class="passphrase-card">
+            <label for="adminPassphrase">🔑 Admin Handoff Word</label>
+            <div class="passphrase-input">
+              <input type="text" id="adminPassphrase" name="adminPassphrase" placeholder="enter secret word" autocomplete="off" spellcheck="false">
+              <button type="button" id="adminPassphraseSet" class="passphrase-set">Set</button>
+            </div>
+            <p class="passphrase-warning" id="adminPassphraseWarning" hidden>Saving a new word keeps the current admin whitelist. Use the admin list to remove anyone who should no longer have access.</p>
+            <p class="passphrase-hint">Share this word privately; a DM containing only it grants admin powers instantly. <a href="#" id="adminListToggle" class="admin-list-link" role="button">admin list</a></p>
+            <div class="admin-popover" id="adminListPopover" role="dialog" aria-labelledby="adminListTitle" hidden>
+              <div class="admin-popover-header">
+                <h3 id="adminListTitle">Admin Access</h3>
+                <button type="button" class="admin-popover-close" id="adminListClose" aria-label="Close admin list">✕</button>
+              </div>
+              <div class="admin-popover-body">
+                <p class="admin-empty" id="adminListEmpty">No admins currently authorized.</p>
+                <ul class="admin-list" id="adminList"></ul>
+              </div>
+            </div>
+          </div>
+          <div class="command-groups" id="commandGroups"></div>
+        </article>
+
+        <article class="panel radio-panel" data-panel-id="radio-settings" data-draggable="true" data-collapsible="true">
+          <div class="panel-header">
+            <div class="panel-title">
+              <h2>Radio Settings 📻</h2>
+              <span class="panel-subtitle">LoRa hop limit and channels</span>
+            </div>
+            <button type="button" class="panel-collapse" aria-expanded="true" aria-controls="radioPanelBody" aria-label="Collapse panel"></button>
+          </div>
+          <div class="panel-body" id="radioPanelBody">
+            <div class="config-section" aria-live="polite">
+              <div class="config-row">
+                <div class="config-key">
+                  <div class="config-key-heading">
+                    <strong>Hop Limit</strong>
+                  </div>
+                </div>
+                <div class="config-value">
+                  <div class="config-display-line">
+                    <input type="number" min="0" max="7" id="radioHopLimit" class="config-input" style="width: 100px; display: inline-block;" aria-label="Hop limit">
+                    <button type="button" id="radioHopSave" class="config-save-btn" style="margin-left: 8px;">Apply</button>
+                    <span class="config-status" id="radioHopStatus"></span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="config-row config-row-stack" id="radioChannelsRow">
+                <div class="config-key-heading"><strong>Channels</strong></div>
+                <div class="config-value">
+                  <div id="radioChannelsList" class="config-table"></div>
+                  <div style="margin-top: 8px; display:flex; gap:8px; align-items:center; flex-wrap: wrap;">
+                    <button type="button" id="radioAddChannel" class="config-save-btn">Add Channel</button>
+                    <span class="config-status" id="radioChannelsStatus"></span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel config-panel" data-panel-id="config-overview" data-draggable="true" data-collapsible="true">
+          <div class="panel-header">
+            <div class="panel-title">
+              <h2>Configuration Overview ⚙️</h2>
+              <span class="panel-subtitle">Inspect current config.json values</span>
+            </div>
+            <button type="button" class="panel-collapse" aria-expanded="true" aria-controls="configOverviewBody" aria-label="Collapse panel"></button>
+          </div>
+          <div class="panel-body" id="configOverviewBody">
+            <div class="config-select-row">
+              <label for="configCategorySelect">Category</label>
+              <select id="configCategorySelect" class="config-select"></select>
+              <button type="button" id="configResetDefaults" class="config-reset-btn" title="Reset all settings to defaults">⚠️ Reset All Defaults</button>
+            </div>
+            <div class="config-table" id="configSettingsList">
+              <p class="config-empty">Config snapshot unavailable.</p>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section class="activity" data-panel-zone="activity">
+        <article class="panel log-panel" data-panel-id="log" data-draggable="true">
+          <div class="panel-header">
+            <h2>Mesh Activity Stream 📡</h2>
+            <div class="activity-header-meta">
+              <div class="scroll-status on" id="scrollStatus"><span class="heartbeat-indicator" id="heartbeatIndicator">💓</span><span id="scrollLabel">Streaming</span></div>
+              <span class="uptime-ticker" id="uptimeTicker">—</span>
+            </div>
+          </div>
+          <div id="logbox" class="logbox">
+"""
+    page_html += initial_log_html
+    page_html += r"""
+          </div>
+        </article>
+      </section>
+    </main>
+  </div>
 
   <script>
-    // --- Mark as Read/Unread State ---
-    let readDMs = JSON.parse(localStorage.getItem("readDMs") || "[]");
-    let readChannels = JSON.parse(localStorage.getItem("readChannels") || "{}");
-
-    function saveReadDMs() {
-      localStorage.setItem("readDMs", JSON.stringify(readDMs));
-    }
-    function saveReadChannels() {
-      localStorage.setItem("readChannels", JSON.stringify(readChannels));
-    }
-    function markDMAsRead(ts) {
-      if (!readDMs.includes(ts)) {
-        readDMs.push(ts);
-        saveReadDMs();
-        fetchMessagesAndNodes();
+    const METRICS_URL = "/dashboard/metrics";
+    const METRICS_POLL_MS = 10000;
+    const LOG_STREAM_MAX = 400;
+    const LOG_RECONNECT_MAX = 8;
+    const LOG_WAIT_THRESHOLD_MS = 30000;
+    const CONFIG_UPDATE_URL = "/dashboard/config/update";
+    const CONFIG_RESET_URL = "/dashboard/config/reset";
+    const JS_ERROR_URL = "/dashboard/js-error";
+    const RADIO_STATE_URL = "/dashboard/radio/state";
+    const RADIO_HOPS_URL = "/dashboard/radio/hops";
+    const RADIO_ADD_CHANNEL_URL = "/dashboard/radio/channel/add";
+    const RADIO_UPDATE_CHANNEL_URL = "/dashboard/radio/channel/update";
+    const RADIO_REMOVE_CHANNEL_URL = "/dashboard/radio/channel/remove";
+    const RADIO_STATE_POLL_MS = 15000;
+    const appShellEl = document.getElementById('appShell');
+    const heartbeatIndicator = document.getElementById('heartbeatIndicator');
+    let initialMetrics = {};
+    if (appShellEl) {
+      try {
+        initialMetrics = JSON.parse(appShellEl.dataset.initialMetrics || '{}');
+      } catch (err) {
+        console.error('Initial metrics parse failed:', err);
+        initialMetrics = {};
       }
     }
-    function markAllDMsAsRead() {
-      if (!confirm("Are you sure you want to mark ALL direct messages as read?")) return;
-      let dms = allMessages.filter(m => m.direct);
-      readDMs = dms.map(m => m.timestamp);
-      saveReadDMs();
-      fetchMessagesAndNodes();
-    }
-    function markChannelAsRead(channelIdx) {
-      if (!confirm("Are you sure you want to mark ALL messages in this channel as read?")) return;
-      let msgs = allMessages.filter(m => !m.direct && m.channel_idx == channelIdx);
-      if (!readChannels) readChannels = {};
-      readChannels[channelIdx] = msgs.map(m => m.timestamp);
-      saveReadChannels();
-      fetchMessagesAndNodes();
-    }
-    function isDMRead(ts) {
-      return readDMs.includes(ts);
-    }
-    function isChannelMsgRead(ts, channelIdx) {
-      return readChannels && readChannels[channelIdx] && readChannels[channelIdx].includes(ts);
+
+    let logEventSource = null;
+    let logReconnectAttempts = 0;
+    let logAutoScroll = true;
+    let logUserScrolling = false;
+    let logScrollTimeout = null;
+    let logScrollBound = false;
+    let logLastMessageAt = Date.now();
+    let heartbeatTimer = null;
+    let adminPopoverPreviousFocus = null;
+    let adminPopoverOutsideHandler = null;
+    let collapsedPanelState = new Set();
+    let configOverviewState = { sections: [], selectedId: null, pendingData: null, metadata: {} };
+    const CONFIG_LOCKED_KEYS = new Set(['ai_provider']);
+    const DEFAULT_LANGUAGE_OPTIONS = [
+      { value: 'english', label: 'English' },
+      { value: 'spanish', label: 'Spanish' },
+    ];
+    const DEFAULT_PERSONALITY_OPTIONS = [{ value: 'trail_scout', label: 'Trail Scout' }];
+    let configSelectInitialized = false;
+    let radioState = { connected: false, radio_id: null, hops: null, channels: [] };
+
+    function $(id) { return document.getElementById(id); }
+
+    // --------------------
+    // Radio Settings (UI)
+    // --------------------
+    function setRadioHopWidgetsEnabled(enabled) {
+      const input = $("radioHopLimit");
+      const btn = $("radioHopSave");
+      if (input) input.disabled = !enabled;
+      if (btn) btn.disabled = !enabled;
     }
 
-    // --- Ticker Dismissal State ---
-    function setTickerDismissed(ts) {
-      // Store the timestamp of the dismissed message and expiry
-      localStorage.setItem("tickerDismissed", JSON.stringify({ts: ts, until: Date.now() + 30000}));
-    }
-    function isTickerDismissed(ts) {
-      let obj = {};
-      try { obj = JSON.parse(localStorage.getItem("tickerDismissed") || "{}"); } catch(e){}
-      if (!obj.ts || !obj.until) return false;
-      // Only dismiss if the same message and not expired
-      return obj.ts === ts && Date.now() < obj.until;
-    }
-
-    // --- Timezone Offset State ---
-    function getTimezoneOffset() {
-      let tz = localStorage.getItem("meshtastic_ui_tz_offset");
-      if (tz === null || isNaN(Number(tz))) return 0;
-      return Number(tz);
-    }
-    function setTimezoneOffset(val) {
-      localStorage.setItem("meshtastic_ui_tz_offset", String(val));
-    }
-
-    // Globals for reply targets
-    var lastDMTarget = null;
-    var lastChannelTarget = null;
-  let allNodes = [];
-  let allMessages = [];
-  let fetchIntervalId = null; // guard to avoid multiple intervals
-    let lastMessageTimestamp = null;
-    let tickerTimeout = null;
-    let tickerLastShownTimestamp = null;
-    let nodeGPSInfo = """ + node_gps_info_json + """;
-    let myGPS = """ + my_gps_json + """;
-
-    // --- Node Sorting ---
-    let nodeSortKey = localStorage.getItem("nodeSortKey") || "name";
-    let nodeSortDir = localStorage.getItem("nodeSortDir") || "asc";
-
-    function setNodeSort(key, dir) {
-      nodeSortKey = key;
-      nodeSortDir = dir;
-      localStorage.setItem("nodeSortKey", key);
-      localStorage.setItem("nodeSortDir", dir);
-      updateNodesUI(allNodes, false);
-    }
-
-    function compareNodes(a, b) {
-      // Helper for null/undefined
-      function safe(v) { return v === undefined || v === null ? "" : v; }
-      // For distance, use haversine if both have GPS, else sort GPS-enabled first
-      if (nodeSortKey === "distance") {
-        let aGPS = nodeGPSInfo[String(a.id)];
-        let bGPS = nodeGPSInfo[String(b.id)];
-        let aHas = aGPS && aGPS.lat != null && aGPS.lon != null;
-        let bHas = bGPS && bGPS.lat != null && bGPS.lon != null;
-        if (!aHas && !bHas) return 0;
-        if (aHas && !bHas) return -1;
-        if (!aHas && bHas) return 1;
-        let distA = calcDistance(myGPS.lat, myGPS.lon, aGPS.lat, aGPS.lon);
-        let distB = calcDistance(myGPS.lat, myGPS.lon, bGPS.lat, bGPS.lon);
-        return (distA - distB) * (nodeSortDir === "asc" ? 1 : -1);
+    async function loadRadioState() {
+      try {
+        const res = await fetch(RADIO_STATE_URL, { method: 'GET' });
+        const data = await res.json();
+        if (!data || !data.radio) {
+          throw new Error('Invalid radio payload');
+        }
+        radioState = data.radio;
+        renderRadioPanel(radioState);
+      } catch (err) {
+        console.warn('Radio state failed:', err);
+        const status = $("radioChannelsStatus");
+        if (status) {
+          status.textContent = 'Radio unavailable';
+          status.setAttribute('data-tone', 'error');
+        }
+        setRadioHopWidgetsEnabled(false);
       }
-      if (nodeSortKey === "gps") {
-        let aGPS = nodeGPSInfo[String(a.id)];
-        let bGPS = nodeGPSInfo[String(b.id)];
-        let aHas = aGPS && aGPS.lat != null && aGPS.lon != null;
-        let bHas = bGPS && bGPS.lat != null && bGPS.lon != null;
-        if (aHas && !bHas) return nodeSortDir === "asc" ? -1 : 1;
-        if (!aHas && bHas) return nodeSortDir === "asc" ? 1 : -1;
-        return 0;
-      }
-      if (nodeSortKey === "name") {
-        let cmp = safe(a.shortName).localeCompare(safe(b.shortName), undefined, {sensitivity:"base"});
-        return cmp * (nodeSortDir === "asc" ? 1 : -1);
-      }
-      if (nodeSortKey === "beacon") {
-        let aGPS = nodeGPSInfo[String(a.id)];
-        let bGPS = nodeGPSInfo[String(b.id)];
-        let aTime = aGPS && aGPS.beacon_time ? Date.parse(aGPS.beacon_time.replace(" UTC","Z")) : 0;
-        let bTime = bGPS && bGPS.beacon_time ? Date.parse(bGPS.beacon_time.replace(" UTC","Z")) : 0;
-        return (bTime - aTime) * (nodeSortDir === "asc" ? -1 : 1);
-      }
-      if (nodeSortKey === "hops") {
-        let aGPS = nodeGPSInfo[String(a.id)];
-        let bGPS = nodeGPSInfo[String(b.id)];
-        let aH = aGPS && aGPS.hops != null ? aGPS.hops : 99;
-        let bH = bGPS && bGPS.hops != null ? bGPS.hops : 99;
-        return (aH - bH) * (nodeSortDir === "asc" ? 1 : -1);
-      }
-      return 0;
     }
 
-    // Haversine formula (km)
-    function calcDistance(lat1, lon1, lat2, lon2) {
-      if (
-        lat1 == null || lon1 == null ||
-        lat2 == null || lon2 == null
-      ) return 99999;
-      let toRad = x => x * Math.PI / 180;
-      let R = 6371;
-      let dLat = toRad(lat2 - lat1);
-      let dLon = toRad(lon2 - lon1);
-      let a = Math.sin(dLat/2) * Math.sin(dLat/2) +
-              Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
-              Math.sin(dLon/2) * Math.sin(dLon/2);
-      let c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-      return R * c;
+    function renderRadioPanel(state) {
+      const hop = $("radioHopLimit");
+      const hopStatus = $("radioHopStatus");
+      setRadioHopWidgetsEnabled(!!state.connected);
+      if (hop) {
+        hop.value = (state && typeof state.hops === 'number') ? String(state.hops) : '';
+      }
+      if (hopStatus) {
+        hopStatus.textContent = state.connected ? '' : 'Disconnected';
+        hopStatus.removeAttribute('data-tone');
+      }
+      renderRadioChannels(state && Array.isArray(state.channels) ? state.channels : []);
     }
 
-    // --- UI Settings State ---
-    let uiSettings = {
-      themeColor: "#ffa500",
-      hueRotateEnabled: false,
-      hueRotateSpeed: 10,
-      soundURL: ""
+    function channelRoleBadge(role) {
+      switch (String(role || 'DISABLED')) {
+        case 'PRIMARY': return '<span class="config-type-badge">Primary</span>';
+        case 'SECONDARY': return '<span class="config-type-badge">Secondary</span>';
+        default: return '<span class="config-type-badge">Disabled</span>';
+      }
+    }
+
+    function buildChannelRowHTML(ch) {
+      const idx = Number(ch.index);
+      const disabled = !ch.enabled;
+      const deletable = !!ch.deletable;
+      const name = ch.name || '';
+      const psk = ch.psk || '—';
+      const uplink = !!ch.uplink;
+      const downlink = !!ch.downlink;
+      const role = ch.role || 'DISABLED';
+      return `
+        <div class="config-row" data-ch-index="${idx}" ${disabled ? 'data-disabled="true"' : ''}>
+          <div class="config-key">
+            <div class="config-key-heading">
+              <strong>Ch ${idx}</strong>
+              ${channelRoleBadge(role)}
+            </div>
+          </div>
+          <div class="config-value">
+            <div class="config-display-line">
+              <div style="display:flex; gap:10px; align-items:center; flex-wrap: wrap;">
+                <label style="display:flex; gap:6px; align-items:center;">
+                  <span style="min-width:36px; color:var(--text-secondary)">Name</span>
+                  <input type="text" class="config-input" data-ch-field="name" style="width:220px;" value="${name.replace(/&/g,'&amp;').replace(/</g,'&lt;')}">
+                </label>
+                <label style="display:flex; gap:6px; align-items:center;">
+                  <span style="min-width:36px; color:var(--text-secondary)">PSK</span>
+                  <span data-ch-field="psk-label" title="Channel key">${psk}</span>
+                  <button type="button" class="config-edit-btn" data-ch-action="psk-generate">Generate</button>
+                  <button type="button" class="config-edit-btn" data-ch-action="psk-enter">Enter…</button>
+                </label>
+                <label class="switch" title="Uplink enabled">
+                  <input type="checkbox" data-ch-field="uplink" ${uplink ? 'checked' : ''}>
+                  <span class="slider"></span>
+                </label>
+                <label class="switch" title="Downlink enabled">
+                  <input type="checkbox" data-ch-field="downlink" ${downlink ? 'checked' : ''}>
+                  <span class="slider"></span>
+                </label>
+                <button type="button" class="config-save-btn" data-ch-action="save">Save</button>
+                <button type="button" class="admin-remove-btn" data-ch-action="remove" ${deletable ? '' : 'disabled'}>Remove</button>
+                <span class="config-status" data-ch-field="status"></span>
+              </div>
+            </div>
+          </div>
+        </div>`;
+    }
+
+    function renderRadioChannels(channels) {
+      const host = $("radioChannelsList");
+      if (!host) return;
+      const list = Array.isArray(channels) ? channels : [];
+      // Show only channels that actually exist on the radio (enabled)
+      const active = list.filter(ch => !!ch && (ch.enabled === true));
+      if (!active.length) {
+        host.innerHTML = '<p class="config-empty">No active channels.</p>';
+      } else {
+        host.innerHTML = active.map(buildChannelRowHTML).join('');
+      }
+      // Wire actions
+      host.querySelectorAll('[data-ch-action="save"]').forEach(btn => btn.addEventListener('click', onChannelSave));
+      host.querySelectorAll('[data-ch-action="remove"]').forEach(btn => btn.addEventListener('click', onChannelRemove));
+      host.querySelectorAll('[data-ch-action="psk-generate"]').forEach(btn => btn.addEventListener('click', onChannelPskGenerate));
+      host.querySelectorAll('[data-ch-action="psk-enter"]').forEach(btn => btn.addEventListener('click', onChannelPskEnter));
+    }
+
+    async function onChannelSave(event) {
+      const row = event.currentTarget.closest('.config-row[data-ch-index]');
+      if (!row) return;
+      const idx = Number(row.dataset.chIndex);
+      const name = row.querySelector('[data-ch-field="name"]').value;
+      const uplink = row.querySelector('[data-ch-field="uplink"]').checked;
+      const downlink = row.querySelector('[data-ch-field="downlink"]').checked;
+      const status = row.querySelector('[data-ch-field="status"]');
+      status.textContent = 'Saving…';
+      status.removeAttribute('data-tone');
+      try {
+        const res = await fetch(RADIO_UPDATE_CHANNEL_URL, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ index: idx, name, uplink, downlink })
+        });
+        const data = await res.json();
+        if (!data || !data.ok) throw new Error(data && data.error ? data.error : 'Update failed');
+        status.textContent = 'Saved';
+        renderRadioStateDeferred();
+      } catch (err) {
+        status.textContent = String(err.message || err);
+        status.setAttribute('data-tone', 'error');
+      }
+    }
+
+    async function onChannelRemove(event) {
+      const row = event.currentTarget.closest('.config-row[data-ch-index]');
+      if (!row) return;
+      const idx = Number(row.dataset.chIndex);
+      const status = row.querySelector('[data-ch-field="status"]');
+      status.textContent = 'Removing…';
+      status.removeAttribute('data-tone');
+      try {
+        const res = await fetch(RADIO_REMOVE_CHANNEL_URL, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ index: idx })
+        });
+        const data = await res.json();
+        if (!data || !data.ok) throw new Error(data && data.error ? data.error : 'Remove failed');
+        status.textContent = 'Removed';
+        renderRadioStateDeferred();
+      } catch (err) {
+        status.textContent = String(err.message || err);
+        status.setAttribute('data-tone', 'error');
+      }
+    }
+
+    async function onChannelPskGenerate(event) {
+      const row = event.currentTarget.closest('.config-row[data-ch-index]');
+      if (!row) return;
+      const idx = Number(row.dataset.chIndex);
+      const status = row.querySelector('[data-ch-field="status"]');
+      const warn = '⚠️ Generating a new key will reset this channel\'s PSK and may desynchronize other radios until they update. Continue?';
+      const ok = confirm(warn);
+      if (!ok) {
+        status.textContent = 'Cancelled';
+        status.removeAttribute('data-tone');
+        return;
+      }
+      status.textContent = 'Generating…';
+      status.removeAttribute('data-tone');
+      try {
+        const res = await fetch(RADIO_UPDATE_CHANNEL_URL, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ index: idx, psk: 'random' })
+        });
+        const data = await res.json();
+        if (!data || !data.ok) throw new Error(data && data.error ? data.error : 'Key generation failed');
+        status.textContent = 'Key updated';
+        renderRadioStateDeferred();
+      } catch (err) {
+        status.textContent = String(err.message || err);
+        status.setAttribute('data-tone', 'error');
+      }
+    }
+
+    async function onChannelPskEnter(event) {
+      const row = event.currentTarget.closest('.config-row[data-ch-index]');
+      if (!row) return;
+      const idx = Number(row.dataset.chIndex);
+      const value = prompt('Enter channel key (psk). Allowed: none, default, random, simpleN, hex/base64');
+      if (value === null) return;
+      const status = row.querySelector('[data-ch-field="status"]');
+      status.textContent = 'Updating…';
+      status.removeAttribute('data-tone');
+      try {
+        const res = await fetch(RADIO_UPDATE_CHANNEL_URL, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ index: idx, psk: value.trim() })
+        });
+        const data = await res.json();
+        if (!data || !data.ok) throw new Error(data && data.error ? data.error : 'Update failed');
+        status.textContent = 'Key updated';
+        renderRadioStateDeferred();
+      } catch (err) {
+        status.textContent = String(err.message || err);
+        status.setAttribute('data-tone', 'error');
+      }
+    }
+
+    function initRadioPanel() {
+      const hopBtn = $("radioHopSave");
+      const hopInput = $("radioHopLimit");
+      const addBtn = $("radioAddChannel");
+      if (hopBtn) {
+        hopBtn.addEventListener('click', async () => {
+          const value = Number(hopInput && hopInput.value !== '' ? hopInput.value : NaN);
+          const status = $("radioHopStatus");
+          if (!Number.isFinite(value)) {
+            if (status) { status.textContent = 'Enter a value 0–7'; status.setAttribute('data-tone', 'error'); }
+            return;
+          }
+          if (status) { status.textContent = 'Saving…'; status.removeAttribute('data-tone'); }
+          try {
+            const res = await fetch(RADIO_HOPS_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hop_limit: value }) });
+            const data = await res.json();
+            if (!data || !data.ok) throw new Error(data && data.error ? data.error : 'Save failed');
+            if (status) { status.textContent = 'Saved'; status.removeAttribute('data-tone'); }
+            renderRadioStateDeferred();
+          } catch (err) {
+            if (status) { status.textContent = String(err.message || err); status.setAttribute('data-tone', 'error'); }
+          }
+        });
+      }
+      if (addBtn) {
+        addBtn.addEventListener('click', async () => {
+          const name = prompt('Name for the new channel?');
+          const status = $("radioChannelsStatus");
+          // If user cancels the prompt, do nothing and clear any stale status
+          if (name === null) {
+            if (status) { status.textContent = ''; status.removeAttribute('data-tone'); }
+            return;
+          }
+          if (status) { status.textContent = 'Adding…'; status.removeAttribute('data-tone'); }
+          try {
+            const res = await fetch(RADIO_ADD_CHANNEL_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: (name || '').trim() || undefined, psk: 'random' }) });
+            const data = await res.json();
+            if (!data || !data.ok) throw new Error(data && data.error ? data.error : 'Add failed');
+            if (status) { status.textContent = 'Channel added'; }
+            renderRadioStateDeferred();
+          } catch (err) {
+            if (status) { status.textContent = String(err.message || err); status.setAttribute('data-tone', 'error'); }
+          }
+        });
+      }
+    }
+
+    let radioRenderTimer = null;
+    function renderRadioStateDeferred() {
+      if (radioRenderTimer) clearTimeout(radioRenderTimer);
+      radioRenderTimer = setTimeout(loadRadioState, 400);
+    }
+
+    function formatPercent(value) {
+      if (value === null || value === undefined || isNaN(value)) return "—";
+      return value.toFixed(0) + "%";
+    }
+
+    function formatNumber(value) {
+      if (value === null || value === undefined || isNaN(value)) return "—";
+      return new Intl.NumberFormat().format(value);
+    }
+
+    function formatMs(value) {
+      if (value === null || value === undefined || isNaN(value)) return "—";
+      if (value >= 1000) {
+        return (value / 1000).toFixed(2) + " s";
+      }
+      return value.toFixed(0) + " ms";
+    }
+
+    let tooltipEl = null;
+    const tooltipState = {
+      anchor: null,
+      hideTimer: null,
+      touchTimer: null,
     };
-    let hueRotateInterval = null;
-    let currentHue = 0;
 
-    function toggleMode(force) {
-      if (typeof force !== "undefined") {
-        document.getElementById('modeSwitch').checked = force === 'direct';
+    function ensureTooltipHost() {
+      if (tooltipEl && tooltipEl.isConnected) {
+        return tooltipEl;
       }
-      const dm = document.getElementById('modeSwitch').checked;
-      document.getElementById('dmField').style.display = dm ? 'block' : 'none';
-      document.getElementById('channelField').style.display = dm ? 'none' : 'block';
-      document.getElementById('modeLabel').textContent = dm ? 'Direct' : 'Broadcast';
-    }
-
-    // Defensive toggle function: ensures the settings panel can be
-    // toggled even if other JS earlier in the page throws an error
-    // and prevents the normal event listeners from being installed.
-    function toggleSettings() {
-      try {
-        console && console.debug && console.debug('toggleSettings called');
-        const panel = document.getElementById('settingsPanel');
-        const toggle = document.getElementById('settingsToggle');
-        if (!panel || !toggle) return;
-        if (panel.style.display === 'none' || panel.style.display === '') {
-          panel.style.display = 'block';
-          toggle.textContent = "Hide UI Settings";
-        } else {
-          panel.style.display = 'none';
-          toggle.textContent = "Show UI Settings";
+      if (!tooltipEl) {
+        tooltipEl = document.createElement('div');
+        tooltipEl.className = 'dashboard-tooltip';
+        tooltipEl.id = 'dashboardTooltip';
+        tooltipEl.setAttribute('role', 'tooltip');
+        tooltipEl.hidden = true;
+      }
+      const attach = () => {
+        if (!document.body) {
+          requestAnimationFrame(attach);
+          return;
         }
-      } catch (e) { console && console.error && console.error('toggleSettings error', e); }
+        if (!tooltipEl.isConnected) {
+          document.body.appendChild(tooltipEl);
+        }
+      };
+      attach();
+      return tooltipEl;
     }
 
-    // Expose toggleSettings to the global scope so inline onclick handlers
-    // still work even if other JS errors prevent event bindings below.
-    try { window.toggleSettings = toggleSettings; } catch (e) { console && console.error && console.error('expose toggleSettings failed', e); }
+    function hideTooltip() {
+      const host = ensureTooltipHost();
+      if (tooltipState.hideTimer) {
+        clearTimeout(tooltipState.hideTimer);
+        tooltipState.hideTimer = null;
+      }
+      if (!host.classList.contains('is-visible')) {
+        host.hidden = true;
+        host.textContent = '';
+        tooltipState.anchor = null;
+        return;
+      }
+      host.classList.remove('is-visible');
+      tooltipState.hideTimer = setTimeout(() => {
+        host.hidden = true;
+        host.textContent = '';
+        tooltipState.anchor = null;
+      }, 140);
+    }
 
-    // Defensive DOM wiring: run after DOMContentLoaded
-    document.addEventListener("DOMContentLoaded", function() {
-      // Defensive bindings: check elements exist before using them so one
-      // missing element doesn't break all other UI wiring.
-      const modeSwitchEl = document.getElementById('modeSwitch');
-      if (modeSwitchEl) modeSwitchEl.addEventListener('change', function() { toggleMode(); });
+    function positionTooltip(target, placement) {
+      const host = ensureTooltipHost();
+      const rect = target.getBoundingClientRect();
+      let left = rect.left + rect.width / 2;
+      let top = rect.top - 12;
+      host.style.transform = 'translate(-50%, -8px)';
+      if (placement === 'right') {
+        left = rect.right + 12;
+        top = rect.top + rect.height / 2;
+        host.style.transform = 'translate(0, -50%)';
+      } else if (placement === 'bottom') {
+        left = rect.left + rect.width / 2;
+        top = rect.bottom + 12;
+        host.style.transform = 'translate(-50%, 0)';
+      }
+      host.style.left = `${Math.round(left)}px`;
+      host.style.top = `${Math.round(top)}px`;
+    }
 
-      const settingsToggleEl = document.getElementById('settingsToggle');
-      const settingsPanelEl = document.getElementById('settingsPanel');
-      if (settingsToggleEl) {
-        settingsToggleEl.addEventListener('click', function() {
-          if (!settingsPanelEl) return;
-          if (settingsPanelEl.style.display === 'none' || settingsPanelEl.style.display === '') {
-            settingsPanelEl.style.display = 'block';
-            settingsToggleEl.textContent = "Hide UI Settings";
-          } else {
-            settingsPanelEl.style.display = 'none';
-            settingsToggleEl.textContent = "Show UI Settings";
+    function showTooltip(target, text, options = {}) {
+      if (!target || !text) {
+        return;
+      }
+      const host = ensureTooltipHost();
+      const placement = options.placement || target.dataset.explainerPlacement || 'top';
+      if (tooltipState.hideTimer) {
+        clearTimeout(tooltipState.hideTimer);
+        tooltipState.hideTimer = null;
+      }
+      host.textContent = text;
+      host.hidden = false;
+      positionTooltip(target, placement);
+      requestAnimationFrame(() => {
+        host.classList.add('is-visible');
+      });
+      tooltipState.anchor = target;
+    }
+
+    function handleExplainerEnter(event) {
+      const el = event.currentTarget;
+      const text = el && el.dataset ? el.dataset.explainer : '';
+      if (!text) return;
+      showTooltip(el, text);
+    }
+
+    function handleExplainerLeave() {
+      hideTooltip();
+    }
+
+    function handleExplainerTouch(event) {
+      const el = event.currentTarget;
+      const text = el && el.dataset ? el.dataset.explainer : '';
+      if (!text) return;
+      showTooltip(el, text);
+      if (tooltipState.touchTimer) {
+        clearTimeout(tooltipState.touchTimer);
+      }
+      tooltipState.touchTimer = setTimeout(() => {
+        hideTooltip();
+      }, 2500);
+    }
+
+    function bindExplainer(element, text, options = {}) {
+      if (!element || !text) {
+        return;
+      }
+      ensureTooltipHost();
+      element.dataset.explainer = text;
+      if (options.placement) {
+        element.dataset.explainerPlacement = options.placement;
+      }
+      element.setAttribute('aria-describedby', 'dashboardTooltip');
+      element.addEventListener('mouseenter', handleExplainerEnter);
+      element.addEventListener('mouseleave', handleExplainerLeave);
+      element.addEventListener('focus', handleExplainerEnter);
+      element.addEventListener('blur', handleExplainerLeave);
+      element.addEventListener('touchstart', handleExplainerTouch, { passive: true });
+    }
+
+    window.addEventListener('scroll', () => {
+      if (!tooltipState.anchor) {
+        return;
+      }
+      hideTooltip();
+    }, true);
+    window.addEventListener('resize', hideTooltip);
+
+    function reportJsIssue(kind, details) {
+      const payload = {
+        kind,
+        url: window.location.href,
+        userAgent: navigator.userAgent,
+        timestamp: Date.now(),
+        details,
+      };
+      try {
+        const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+        if (navigator.sendBeacon && navigator.sendBeacon(JS_ERROR_URL, blob)) {
+          return;
+        }
+      } catch (err) {}
+      try {
+        fetch(JS_ERROR_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          keepalive: true,
+        }).catch(() => {});
+      } catch (err) {}
+    }
+
+    function bindGlobalErrorHandlers() {
+      window.addEventListener('error', event => {
+        if (!event) return;
+        const info = {
+          message: event.message || String(event.error || 'Unknown error'),
+          source: event.filename || null,
+          lineno: event.lineno || null,
+          colno: event.colno || null,
+          stack: event.error && event.error.stack ? String(event.error.stack) : null,
+        };
+        reportJsIssue('error', info);
+      });
+      window.addEventListener('unhandledrejection', event => {
+        if (!event) return;
+        const reason = event.reason;
+        const info = {
+          message: reason && reason.message ? String(reason.message) : String(reason || 'Promise rejection'),
+          stack: reason && reason.stack ? String(reason.stack) : null,
+        };
+        reportJsIssue('unhandledrejection', info);
+      });
+    }
+
+    function setValueWithDelta(id, payload, { allowNegative = true } = {}) {
+      const el = $(id);
+      if (!el) return;
+      if (!payload || payload.value === null || payload.value === undefined || isNaN(payload.value)) {
+        el.textContent = '—';
+        return;
+      }
+      const valueNumber = Number(payload.value);
+      const valueText = formatNumber(valueNumber);
+      let deltaHtml = '';
+      const deltaValue = payload.delta;
+      if (deltaValue === null || deltaValue === undefined || isNaN(deltaValue)) {
+        deltaHtml = '<span class="delta delta-flat">—</span>';
+      } else if (deltaValue > 0) {
+        deltaHtml = `<span class="delta delta-up">▲ ${formatNumber(deltaValue)}</span>`;
+      } else if (deltaValue < 0 && allowNegative) {
+        deltaHtml = `<span class="delta delta-down">▼ ${formatNumber(Math.abs(deltaValue))}</span>`;
+      } else {
+        deltaHtml = '<span class="delta delta-flat">—</span>';
+      }
+      el.innerHTML = `<span class="stat-value-number">${valueText}</span>${deltaHtml}`;
+    }
+
+    const PANEL_LAYOUT_STORAGE_KEY = 'mesh-dashboard-layout-v1';
+    const COLLAPSE_STORAGE_KEY = 'mesh-dashboard-collapsed-v1';
+    let dragPanelRef = null;
+    const dragPlaceholder = document.createElement('div');
+    dragPlaceholder.className = 'panel-placeholder';
+
+    function savePanelLayout() {
+      const layout = {};
+      document.querySelectorAll('[data-panel-zone]').forEach(zone => {
+        const zoneId = zone.dataset.panelZone;
+        if (!zoneId) return;
+        layout[zoneId] = Array.from(zone.querySelectorAll('.panel[data-panel-id]')).map(panel => panel.dataset.panelId);
+      });
+      try {
+        localStorage.setItem(PANEL_LAYOUT_STORAGE_KEY, JSON.stringify(layout));
+      } catch (err) {
+        console.warn('Could not persist panel layout', err);
+      }
+    }
+
+    function applySavedPanelLayout() {
+      let saved;
+      try {
+        saved = localStorage.getItem(PANEL_LAYOUT_STORAGE_KEY);
+      } catch (err) {
+        console.warn('Could not read saved layout', err);
+        return;
+      }
+      if (!saved) {
+        return;
+      }
+      let layout;
+      try {
+        layout = JSON.parse(saved);
+      } catch (err) {
+        console.warn('Invalid saved layout payload', err);
+        return;
+      }
+      if (!layout || typeof layout !== 'object') {
+        return;
+      }
+      Object.entries(layout).forEach(([zoneId, ids]) => {
+        if (!Array.isArray(ids)) {
+          return;
+        }
+        const zone = document.querySelector(`[data-panel-zone="${zoneId}"]`);
+        if (!zone) {
+          return;
+        }
+        ids.forEach(id => {
+          const panel = document.querySelector(`.panel[data-panel-id="${id}"]`);
+          if (panel) {
+            zone.appendChild(panel);
           }
         });
-      }
-      if (settingsPanelEl) {
-        settingsPanelEl.style.display = 'none'; // Hide settings panel by default
-      }
-      if (settingsToggleEl) settingsToggleEl.textContent = "Show UI Settings";
+      });
+    }
 
-      const nodeSearchEl = document.getElementById('nodeSearch');
-      if (nodeSearchEl) nodeSearchEl.addEventListener('input', function() { filterNodes(this.value, false); });
-      const destNodeSearchEl = document.getElementById('destNodeSearch');
-      if (destNodeSearchEl) destNodeSearchEl.addEventListener('input', function() { filterNodes(this.value, true); });
-
-      // Node sort controls
-      const nodeSortKeyEl = document.getElementById('nodeSortKey');
-      const nodeSortDirEl = document.getElementById('nodeSortDir');
-      if (nodeSortKeyEl) nodeSortKeyEl.addEventListener('change', function() { setNodeSort(this.value, nodeSortDir); });
-      if (nodeSortDirEl) nodeSortDirEl.addEventListener('change', function() { setNodeSort(nodeSortKey, this.value); });
-
-      // --- UI Settings: Load from localStorage ---
-      try { loadUISettings(); } catch (e) { console && console.error && console.error('loadUISettings failed', e); }
-
-      // Set initial values in settings panel
-      document.getElementById('uiColorPicker').value = uiSettings.themeColor;
-      document.getElementById('hueRotateEnabled').checked = uiSettings.hueRotateEnabled;
-      document.getElementById('hueRotateSpeed').value = uiSettings.hueRotateSpeed;
-      document.getElementById('soundURL').value = uiSettings.soundURL;
-
-      // Apply settings on load
-      applyThemeColor(uiSettings.themeColor);
-      if (uiSettings.hueRotateEnabled) startHueRotate(uiSettings.hueRotateSpeed);
-      setIncomingSound(uiSettings.soundURL);
-
-      // Apply button
-      document.getElementById('applySettingsBtn').addEventListener('click', function() {
-        // Read values
-        uiSettings.themeColor = document.getElementById('uiColorPicker').value;
-        uiSettings.hueRotateEnabled = document.getElementById('hueRotateEnabled').checked;
-        uiSettings.hueRotateSpeed = parseFloat(document.getElementById('hueRotateSpeed').value);
-        // For soundURL, only allow local file path from file input
-        var fileInput = document.getElementById('soundFile');
-        if (fileInput && fileInput.files.length > 0) {
-          var file = fileInput.files[0];
-          var url = URL.createObjectURL(file);
-          uiSettings.soundURL = url;
-          document.getElementById('soundURL').value = file.name;
+    function loadCollapsedPanelState() {
+      try {
+        const raw = localStorage.getItem(COLLAPSE_STORAGE_KEY);
+        if (!raw) {
+          return new Set();
         }
-        saveUISettings();
-        applyThemeColor(uiSettings.themeColor);
-        if (uiSettings.hueRotateEnabled) {
-          startHueRotate(uiSettings.hueRotateSpeed);
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) {
+          return new Set();
+        }
+        const filtered = parsed.filter(id => typeof id === 'string' && id);
+        return new Set(filtered);
+      } catch (err) {
+        console.warn('Could not read collapse state', err);
+        return new Set();
+      }
+    }
+
+    function persistCollapsedPanelState() {
+      try {
+        localStorage.setItem(COLLAPSE_STORAGE_KEY, JSON.stringify(Array.from(collapsedPanelState)));
+      } catch (err) {
+        console.warn('Could not persist collapse state', err);
+      }
+    }
+
+    function applyPanelCollapseState(panel, collapsed) {
+      if (!panel) {
+        return;
+      }
+      const panelId = panel.dataset.panelId || '';
+      panel.classList.toggle('collapsed', collapsed);
+      const button = panel.querySelector('.panel-collapse');
+      if (button) {
+        button.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+        button.setAttribute('aria-label', collapsed ? 'Expand panel' : 'Collapse panel');
+        const targetId = button.getAttribute('aria-controls');
+        if (targetId) {
+          const body = document.getElementById(targetId);
+          if (body) {
+            body.hidden = collapsed;
+          }
+        }
+      }
+      if (panelId) {
+        if (collapsed) {
+          collapsedPanelState.add(panelId);
         } else {
-          stopHueRotate();
+          collapsedPanelState.delete(panelId);
         }
-        setIncomingSound(uiSettings.soundURL);
-        // Save timezone offset
-        setTimezoneOffset(document.getElementById('timezoneSelect').value);
-        fetchMessagesAndNodes();
-      });
-
-      // Listen for file input change to update sound preview
-      document.getElementById('soundFile').addEventListener('change', function() {
-        if (this.files.length > 0) {
-          var file = this.files[0];
-          var url = URL.createObjectURL(file);
-          uiSettings.soundURL = url;
-          document.getElementById('soundURL').value = file.name;
-          setIncomingSound(url);
-        }
-      });
-
-      // Set initial sort controls
-      document.getElementById('nodeSortKey').value = nodeSortKey;
-      document.getElementById('nodeSortDir').value = nodeSortDir;
-
-      // Set timezone selector
-      let tzSel = document.getElementById('timezoneSelect');
-      let tz = getTimezoneOffset();
-      tzSel.value = tz;
-    });
-
-    // --- UI Settings Functions ---
-    function saveUISettings() {
-      // Only persist the file name for sound, not the blob URL
-      let settingsToSave = Object.assign({}, uiSettings);
-      if (settingsToSave.soundURL && settingsToSave.soundURL.startsWith('blob:')) {
-        settingsToSave.soundURL = document.getElementById('soundURL').value;
       }
-      localStorage.setItem("meshtastic_ui_settings", JSON.stringify(settingsToSave));
     }
-    function loadUISettings() {
+
+    function onPanelCollapseToggle(event) {
+      event.preventDefault();
+      const button = event.currentTarget;
+      const panel = button ? button.closest('.panel[data-panel-id]') : null;
+      if (!panel) {
+        return;
+      }
+      const shouldCollapse = !panel.classList.contains('collapsed');
+      applyPanelCollapseState(panel, shouldCollapse);
+      persistCollapsedPanelState();
+    }
+
+    function initPanelCollapse() {
+      collapsedPanelState = loadCollapsedPanelState();
+      document.querySelectorAll('.panel[data-collapsible="true"]').forEach(panel => {
+        const button = panel.querySelector('.panel-collapse');
+        if (!button) {
+          return;
+        }
+        button.addEventListener('click', onPanelCollapseToggle);
+        const panelId = panel.dataset.panelId || '';
+        const collapsed = panelId ? collapsedPanelState.has(panelId) : false;
+        applyPanelCollapseState(panel, collapsed);
+      });
+      persistCollapsedPanelState();
+    }
+
+    function panelAfterCursor(zone, y) {
+      const panels = Array.from(zone.querySelectorAll('.panel[data-panel-id]:not(.is-dragging)'));
+      for (const panel of panels) {
+        const rect = panel.getBoundingClientRect();
+        if (y < rect.top + rect.height / 2) {
+          return panel;
+        }
+      }
+      return null;
+    }
+
+    function onPanelDragStart(event) {
+      const panel = event.currentTarget;
+      const header = event.target.closest('.panel-header');
+      if (!header) {
+        event.preventDefault();
+        return;
+      }
+      dragPanelRef = panel;
+      panel.classList.add('is-dragging');
       try {
-        let s = localStorage.getItem("meshtastic_ui_settings");
-        if (s) {
-          let parsed = JSON.parse(s);
-          Object.assign(uiSettings, parsed);
-        }
-      } catch (e) {}
-    }
-    function applyThemeColor(color) {
-      document.documentElement.style.setProperty('--theme-color', color);
-    }
-    function startHueRotate(speed) {
-      stopHueRotate();
-      hueRotateInterval = setInterval(function() {
-        currentHue = (currentHue + 1) % 360;
-        document.body.style.filter = `hue-rotate(${currentHue}deg)`;
-      }, Math.max(5, 1000 / Math.max(1, speed)));
-    }
-    function stopHueRotate() {
-      if (hueRotateInterval) clearInterval(hueRotateInterval);
-      hueRotateInterval = null;
-      document.body.style.filter = "";
-      currentHue = 0;
-    }
-    function toggleHueRotate(enabled, speed) {
-      uiSettings.hueRotateEnabled = enabled;
-      uiSettings.hueRotateSpeed = speed;
-      saveUISettings();
-      if (enabled) startHueRotate(speed);
-      else stopHueRotate();
-    }
-    function setIncomingSound(url) {
-      let audio = document.getElementById('incomingSound');
-      audio.src = url || "";
-      uiSettings.soundURL = url;
-      saveUISettings();
+        event.dataTransfer.effectAllowed = 'move';
+        event.dataTransfer.setData('text/plain', panel.dataset.panelId || 'panel');
+      } catch (err) {}
+      dragPlaceholder.style.height = `${panel.offsetHeight}px`;
     }
 
-    function replyToMessage(mode, target) {
-      toggleMode(mode);
-      if (mode === 'direct') {
-        const dest = document.getElementById('destNode');
-        dest.value = target;
-        const name = dest.selectedOptions[0] ? dest.selectedOptions[0].text.split(' (')[0] : '';
-        document.getElementById('messageBox').value = '@' + name + ': ';
-      } else {
-        const ch = document.getElementById('channelSel');
-        ch.value = target;
-        document.getElementById('messageBox').value = '';
+    function onPanelDragEnd() {
+      if (dragPanelRef) {
+        dragPanelRef.classList.remove('is-dragging');
       }
+      dragPanelRef = null;
+      dragPlaceholder.remove();
+      document.querySelectorAll('[data-panel-zone]').forEach(zone => zone.classList.remove('drop-active'));
+      savePanelLayout();
     }
 
-    function dmToNode(nodeId, shortName, replyToTs) {
-      toggleMode('direct');
-      document.getElementById('destNode').value = nodeId;
-      if (replyToTs) {
-        // Prefill with quoted message if replying to a thread
-        let threadMsg = allMessages.find(m => m.timestamp === replyToTs);
-        let quoted = threadMsg ? `> ${threadMsg.message}\n` : '';
-        document.getElementById('messageBox').value = quoted + '@' + shortName + ': ';
-      } else {
-        document.getElementById('messageBox').value = '@' + shortName + ': ';
+    function onZoneDragOver(event) {
+      if (!dragPanelRef) {
+        return;
       }
-    }
-
-    function replyToLastDM() {
-      if (lastDMTarget !== null) {
-        const opt = document.querySelector(`#destNode option[value="${lastDMTarget}"]`);
-        const shortName = opt ? opt.text.split(' (')[0] : '';
-        dmToNode(lastDMTarget, shortName);
-      } else {
-        alert("No direct message target available.");
-      }
-    }
-
-    function replyToLastChannel() {
-      if (lastChannelTarget !== null) {
-        toggleMode('broadcast');
-        document.getElementById('channelSel').value = lastChannelTarget;
-        document.getElementById('messageBox').value = '';
-      } else {
-        alert("No broadcast channel target available.");
-      }
-    }
-
-    // Data fetch & UI updates
-    const CHANNEL_NAMES = """ + json.dumps(channel_names) + """;
-
-    function getNowUTC() {
-      return new Date(new Date().toISOString().slice(0, 19) + "Z");
-    }
-
-    function getTZAdjusted(tsStr) {
-      // tsStr is "YYYY-MM-DD HH:MM:SS UTC"
-      let tz = getTimezoneOffset();
-      if (!tsStr) return "";
-      let dt = new Date(tsStr.replace(" UTC", "Z"));
-      if (isNaN(dt.getTime())) return tsStr;
-      dt.setHours(dt.getHours() + tz);
-      let pad = n => n < 10 ? "0" + n : n;
-      return dt.getFullYear() + "-" + pad(dt.getMonth()+1) + "-" + pad(dt.getDate()) + " " +
-             pad(dt.getHours()) + ":" + pad(dt.getMinutes()) + ":" + pad(dt.getSeconds()) +
-             (tz === 0 ? " UTC" : (tz > 0 ? " UTC+" + tz : " UTC" + tz));
-    }
-
-    function isRecent(tsStr, minutes) {
-      if (!tsStr) return false;
-      let now = getNowUTC();
-      let msgTime = new Date(tsStr.replace(" UTC", "Z"));
-      return (now - msgTime) < minutes * 60 * 1000;
-    }
-
-    async function fetchMessagesAndNodes() {
+      event.preventDefault();
       try {
-        let msgs = await (await fetch("/messages")).json();
-        allMessages = msgs;
-        let nodes = await (await fetch("/nodes")).json();
-        allNodes = nodes;
-        updateMessagesUI(msgs);
-        updateNodesUI(nodes, false);
-        updateNodesUI(nodes, true);
-        updateDirectMessagesUI(msgs, nodes);
-        highlightRecentNodes(nodes);
-        showLatestMessageTicker(msgs);
-      } catch (e) { console.error(e); }
+        event.dataTransfer.dropEffect = 'move';
+      } catch (err) {}
+      const zone = event.currentTarget;
+      zone.classList.add('drop-active');
+      const after = panelAfterCursor(zone, event.clientY);
+      if (!dragPlaceholder.parentElement || dragPlaceholder.parentElement !== zone) {
+        zone.appendChild(dragPlaceholder);
+      }
+      if (after) {
+        zone.insertBefore(dragPlaceholder, after);
+      } else {
+        zone.appendChild(dragPlaceholder);
+      }
     }
 
-    function updateMessagesUI(messages) {
-      // Reverse the order to show the newest messages first
-      const groups = {};
-      messages.slice().reverse().forEach(m => {
-        if (!m.direct && m.channel_idx != null) {
-          (groups[m.channel_idx] = groups[m.channel_idx] || []).push(m);
+    function onZoneDrop(event) {
+      if (!dragPanelRef) {
+        return;
+      }
+      event.preventDefault();
+      const zone = event.currentTarget;
+      const reference = dragPlaceholder.parentElement === zone ? dragPlaceholder : null;
+      if (reference) {
+        zone.insertBefore(dragPanelRef, reference);
+      } else {
+        zone.appendChild(dragPanelRef);
+      }
+      dragPlaceholder.remove();
+      zone.classList.remove('drop-active');
+      savePanelLayout();
+    }
+
+    function onZoneDragLeave(event) {
+      const zone = event.currentTarget;
+      if (!dragPanelRef) {
+        return;
+      }
+      const rect = zone.getBoundingClientRect();
+      const outside = event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom;
+      if (outside) {
+        zone.classList.remove('drop-active');
+        if (dragPlaceholder.parentElement === zone) {
+          dragPlaceholder.remove();
         }
+      }
+    }
+
+    function initPanelDrag() {
+      document.querySelectorAll('.panel[data-panel-id]').forEach(panel => {
+        panel.setAttribute('draggable', 'true');
+        panel.addEventListener('dragstart', onPanelDragStart);
+        panel.addEventListener('dragend', onPanelDragEnd);
       });
+      document.querySelectorAll('[data-panel-zone]').forEach(zone => {
+        zone.addEventListener('dragover', onZoneDragOver);
+        zone.addEventListener('drop', onZoneDrop);
+        zone.addEventListener('dragleave', onZoneDragLeave);
+      });
+      document.querySelectorAll('.panel[data-panel-id] .panel-header').forEach(header => {
+        header.classList.add('panel-drag-handle');
+      });
+      applySavedPanelLayout();
+      savePanelLayout();
+    }
 
-      const channelDiv = document.getElementById("channelDiv");
-      channelDiv.innerHTML = "";
-      Object.keys(groups).sort().forEach(ch => {
-        const name = CHANNEL_NAMES[ch] || `Channel ${ch}`;
-        // Channel header with reply and mark all as read button
-        const headerWrap = document.createElement("div");
-        headerWrap.className = "channel-header";
-        const header = document.createElement("h3");
-        header.textContent = `${ch} – ${name}`;
-        header.style.margin = 0;
-        headerWrap.appendChild(header);
+    function normalizeCommandName(cmd) {
+      if (!cmd) return '';
+      let text = String(cmd).trim();
+      if (!text) return '';
+      if (!text.startsWith('/')) {
+        text = '/' + text.replace(/^\/+/, '');
+      }
+      return text.toLowerCase();
+    }
 
-        // Add reply button for channel
-        const replyBtn = document.createElement("button");
-        replyBtn.textContent = "Send to Channel";
-        replyBtn.className = "reply-btn";
-        replyBtn.onclick = function() {
-          replyToMessage('broadcast', ch);
-        };
-        headerWrap.appendChild(replyBtn);
+    function normalizeMessageMode(mode) {
+      if (!mode) return 'both';
+      const text = String(mode).trim().toLowerCase();
+      if (['both', 'dm_only', 'channel_only'].includes(text)) return text;
+      if (['dm', 'direct'].includes(text)) return 'dm_only';
+      if (['channels', 'channel'].includes(text)) return 'channel_only';
+      return 'both';
+    }
 
-        // Mark all as read for this channel
-        const markAllBtn = document.createElement("button");
-        markAllBtn.textContent = "Mark all as read";
-        markAllBtn.className = "mark-all-read-btn";
-        markAllBtn.onclick = function() {
-          markChannelAsRead(ch);
-        };
-        headerWrap.appendChild(markAllBtn);
+    function messageModeLabel(mode) {
+      switch (mode) {
+        case 'dm_only':
+          return 'DM only';
+        case 'channel_only':
+          return 'Channels only';
+        default:
+          return 'Channels + DMs';
+      }
+    }
 
-        channelDiv.appendChild(headerWrap);
+    function detectConfigType(value) {
+      if (value === null) return 'null';
+      if (Array.isArray(value)) return 'array';
+      return typeof value;
+    }
 
-        groups[ch].forEach(m => {
-          if (isChannelMsgRead(m.timestamp, ch)) return; // Hide read messages
-          const wrap = document.createElement("div");
-          wrap.className = "message";
-          if (isRecent(m.timestamp, 60)) wrap.classList.add("newMessage");
-          const ts = document.createElement("div");
-          ts.className = "timestamp";
-          ts.textContent = `📢 ${getTZAdjusted(m.timestamp)} | ${m.node}`;
-          const body = document.createElement("div");
-          body.textContent = m.message;
-          wrap.append(ts, body);
+    function formatConfigInputValue(value) {
+      if (value === null) {
+        return 'null';
+      }
+      if (typeof value === 'string') {
+        return value;
+      }
+      if (value === undefined) {
+        return '';
+      }
+      try {
+        return JSON.stringify(value, null, 2);
+      } catch (err) {
+        return String(value);
+      }
+    }
 
-          // Mark as read button
-          const markBtn = document.createElement("button");
-          markBtn.textContent = "Mark as read";
-          markBtn.className = "mark-read-btn";
-          markBtn.onclick = function() {
-            if (!readChannels[ch]) readChannels[ch] = [];
-            if (!readChannels[ch].includes(m.timestamp)) {
-              readChannels[ch].push(m.timestamp);
-              saveReadChannels();
-              fetchMessagesAndNodes();
+    function adjustConfigInputRows(textarea) {
+      if (!textarea) {
+        return;
+      }
+      const lines = textarea.value.split('\\n').length;
+      textarea.rows = Math.min(8, Math.max(2, lines));
+    }
+
+    function isConfigEditing() {
+      return document.querySelector('.config-row.is-editing') !== null;
+    }
+
+    function maybeApplyPendingConfigData() {
+      if (!configOverviewState.pendingData) {
+        return;
+      }
+      if (isConfigEditing()) {
+        return;
+      }
+      const pending = configOverviewState.pendingData;
+      configOverviewState.pendingData = null;
+      renderConfigOverview(pending);
+    }
+
+    async function submitConfigUpdate(key, valueText) {
+      let response;
+      try {
+        response = await fetch(CONFIG_UPDATE_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key, value: valueText })
+        });
+      } catch (err) {
+        throw new Error('Network error');
+      }
+      let data = {};
+      try {
+        data = await response.json();
+      } catch (err) {
+        data = {};
+      }
+      if (!response.ok || !data || data.ok === false) {
+        const message = data && data.error ? data.error : `HTTP ${response.status}`;
+        throw new Error(message);
+      }
+      return data.entry || {};
+    }
+
+    function createConfigRow(item) {
+      function buildConfigEditor(dataItem) {
+        const meta = configOverviewState.metadata || {};
+        const kind = dataItem && (dataItem.type || detectConfigType(dataItem.raw));
+
+        if (dataItem && dataItem.key === 'language_selection') {
+          const select = document.createElement('select');
+          select.className = 'config-select';
+          const provided = Array.isArray(meta.language_options) && meta.language_options.length
+            ? meta.language_options
+            : DEFAULT_LANGUAGE_OPTIONS;
+          const seen = new Set();
+          const ensureOption = (value, label) => {
+            const normalized = (value ?? '').toString();
+            if (!normalized || seen.has(normalized)) {
+              return;
             }
+            const optionEl = document.createElement('option');
+            optionEl.value = normalized;
+            optionEl.textContent = label || normalized;
+            select.appendChild(optionEl);
+            seen.add(normalized);
           };
-          wrap.appendChild(markBtn);
-
-          channelDiv.appendChild(wrap);
-        });
-        channelDiv.appendChild(document.createElement("hr"));
-      });
-
-      // Update global reply targets
-      lastDMTarget = null;
-      lastChannelTarget = null;
-      for (const m of messages) {
-        if (m.direct && m.node_id != null && lastDMTarget === null) {
-          lastDMTarget = m.node_id;
+          provided.forEach(opt => {
+            if (!opt || typeof opt !== 'object') return;
+            ensureOption(opt.value, opt.label || opt.value);
+          });
+          let currentValue = typeof dataItem.raw === 'string' ? dataItem.raw : '';
+          if (currentValue && !seen.has(currentValue)) {
+            ensureOption(currentValue, currentValue);
+          }
+          if (!currentValue && select.options.length) {
+            currentValue = select.options[0].value;
+          }
+          select.value = currentValue;
+          return {
+            element: select,
+            focus: () => select.focus(),
+            getValue: () => select.value,
+            setValue: value => {
+              let next = typeof value === 'string' ? value : '';
+              if (next && !seen.has(next)) {
+                ensureOption(next, next);
+              }
+              if (!next && select.options.length) {
+                next = select.options[0].value;
+              }
+              select.value = next;
+            },
+            setDisabled: state => { select.disabled = !!state; },
+          };
         }
-        if (!m.direct && m.channel_idx != null && lastChannelTarget === null) {
-          lastChannelTarget = m.channel_idx;
+
+        if (dataItem && dataItem.key === 'default_personality_id') {
+          const select = document.createElement('select');
+          select.className = 'config-select';
+          const provided = Array.isArray(meta.personality_options) && meta.personality_options.length
+            ? meta.personality_options
+            : DEFAULT_PERSONALITY_OPTIONS.slice();
+          const fallbackValue = typeof dataItem.raw === 'string' && dataItem.raw ? dataItem.raw : '';
+          if (!provided.length && fallbackValue) {
+            provided.push({ value: fallbackValue, label: fallbackValue });
+          }
+          const seen = new Set();
+          const ensureOption = (value, label) => {
+            const normalized = (value ?? '').toString();
+            if (!normalized || seen.has(normalized)) {
+              return;
+            }
+            const optionEl = document.createElement('option');
+            optionEl.value = normalized;
+            optionEl.textContent = label || normalized;
+            select.appendChild(optionEl);
+            seen.add(normalized);
+          };
+          provided.forEach(opt => {
+            if (!opt || typeof opt !== 'object') return;
+            ensureOption(opt.value, opt.label || opt.value);
+          });
+          let currentValue = typeof dataItem.raw === 'string' ? dataItem.raw : '';
+          if (currentValue && !seen.has(currentValue)) {
+            ensureOption(currentValue, currentValue);
+          }
+          if (!currentValue && select.options.length) {
+            currentValue = select.options[0].value;
+          }
+          select.value = currentValue;
+          return {
+            element: select,
+            focus: () => select.focus(),
+            getValue: () => select.value,
+            setValue: value => {
+              let next = typeof value === 'string' ? value : '';
+              if (next && !seen.has(next)) {
+                ensureOption(next, next);
+              }
+              if (!next && select.options.length) {
+                next = select.options[0].value;
+              }
+              select.value = next;
+            },
+            setDisabled: state => { select.disabled = !!state; },
+          };
         }
-        if (lastDMTarget != null && lastChannelTarget != null) break;
-      }
-    }
 
-    // --- DM Threaded UI ---
-    function updateDirectMessagesUI(messages, nodes) {
-      // Group DMs by node_id, then by thread (reply_to)
-      const dmDiv = document.getElementById("dmMessagesDiv");
-      dmDiv.innerHTML = "";
+        if (kind === 'automessage_quiet_hours') {
+          const wrapper = document.createElement('div');
+          wrapper.className = 'config-quiet-hours';
 
-      // Only direct messages, newest first
-      let dms = messages.filter(m => m.direct && !isDMRead(m.timestamp)).slice().reverse();
+          const hourOptions = Array.isArray(meta.hour_options) && meta.hour_options.length
+            ? meta.hour_options
+            : Array.from({ length: 24 }, (_, h) => ({ value: h, label: `${String(h).padStart(2, '0')}:00` }));
 
-      // Group by node_id
-      let threads = {};
-      dms.forEach(m => {
-        if (!threads[m.node_id]) threads[m.node_id] = [];
-        threads[m.node_id].push(m);
-      });
-
-      // Mark all as read button for DMs
-      if (dms.length > 0) {
-        const markAllBtn = document.createElement("button");
-        markAllBtn.textContent = "Mark all as read";
-        markAllBtn.className = "mark-all-read-btn";
-        markAllBtn.onclick = function() {
-          markAllDMsAsRead();
-        };
-        dmDiv.appendChild(markAllBtn);
-      }
-
-      Object.keys(threads).forEach(nodeId => {
-        const node = allNodes.find(n => n.id == nodeId);
-        const shortName = node ? node.shortName : nodeId;
-        const threadDiv = document.createElement("div");
-        threadDiv.className = "dm-thread";
-
-        // Find root messages (no reply_to)
-        let rootMsgs = threads[nodeId].filter(m => !m.reply_to);
-
-        rootMsgs.forEach(rootMsg => {
-          const wrap = document.createElement("div");
-          wrap.className = "message";
-          if (isRecent(rootMsg.timestamp, 60)) wrap.classList.add("newMessage");
-          const ts = document.createElement("div");
-          ts.className = "timestamp";
-          ts.textContent = `📩 ${getTZAdjusted(rootMsg.timestamp)} | ${rootMsg.node}`;
-          const body = document.createElement("div");
-          body.textContent = rootMsg.message;
-          wrap.append(ts, body);
-
-          // Add reply button for root
-          const replyBtn = document.createElement("button");
-          replyBtn.textContent = "Reply";
-          replyBtn.className = "reply-btn";
-          replyBtn.onclick = function() {
-            dmToNode(nodeId, shortName, rootMsg.timestamp);
-          };
-          wrap.appendChild(replyBtn);
-
-          // Mark as read button for root
-          const markBtn = document.createElement("button");
-          markBtn.textContent = "Mark as read";
-          markBtn.className = "mark-read-btn";
-          markBtn.onclick = function() {
-            markDMAsRead(rootMsg.timestamp);
-          };
-          wrap.appendChild(markBtn);
-
-          threadDiv.appendChild(wrap);
-
-          // Find replies to this root
-          let replies = threads[nodeId].filter(m => m.reply_to === rootMsg.timestamp);
-          if (replies.length) {
-            const repliesDiv = document.createElement("div");
-            repliesDiv.className = "thread-replies";
-            replies.forEach(replyMsg => {
-              const replyWrap = document.createElement("div");
-              replyWrap.className = "message";
-              if (isRecent(replyMsg.timestamp, 60)) replyWrap.classList.add("newMessage");
-              const rts = document.createElement("div");
-              rts.className = "timestamp";
-              rts.textContent = `↪️ ${getTZAdjusted(replyMsg.timestamp)} | ${replyMsg.node}`;
-              const rbody = document.createElement("div");
-              rbody.textContent = replyMsg.message;
-              replyWrap.append(rts, rbody);
-
-              // Reply to reply (threaded)
-              const replyBtn2 = document.createElement("button");
-              replyBtn2.textContent = "Reply";
-              replyBtn2.className = "reply-btn";
-              replyBtn2.onclick = function() {
-                dmToNode(nodeId, shortName, replyMsg.timestamp);
-              };
-              replyWrap.appendChild(replyBtn2);
-
-              // Mark as read button for reply
-              const markBtn2 = document.createElement("button");
-              markBtn2.textContent = "Mark as read";
-              markBtn2.className = "mark-read-btn";
-              markBtn2.onclick = function() {
-                markDMAsRead(replyMsg.timestamp);
-              };
-              replyWrap.appendChild(markBtn2);
-
-              repliesDiv.appendChild(replyWrap);
+          const buildHourSelect = value => {
+            const select = document.createElement('select');
+            select.className = 'config-select quiet-select';
+            const seen = new Set();
+            const ensureOption = (optValue, label) => {
+              const normalized = Number(optValue) % 24;
+              if (seen.has(normalized)) {
+                return;
+              }
+              const optionEl = document.createElement('option');
+              optionEl.value = normalized.toString();
+              optionEl.textContent = label || `${String(normalized).padStart(2, '0')}:00`;
+              select.appendChild(optionEl);
+              seen.add(normalized);
+            };
+            hourOptions.forEach(opt => {
+              if (!opt || typeof opt !== 'object') return;
+              ensureOption(opt.value, opt.label);
             });
-            threadDiv.appendChild(repliesDiv);
-          }
-        });
+            if (value !== undefined && value !== null) {
+              ensureOption(value, `${String(Number(value) % 24).padStart(2, '0')}:00`);
+            }
+            if (!select.options.length) {
+              ensureOption(0, '00:00');
+            }
+            const normalizedValue = value !== undefined && value !== null ? Number(value) % 24 : Number(select.options[0].value);
+            select.value = normalizedValue.toString();
+            return select;
+          };
 
-        dmDiv.appendChild(threadDiv);
-      });
-    }
+          const toggleLabel = document.createElement('label');
+          toggleLabel.className = 'quiet-toggle';
+          const toggle = document.createElement('input');
+          toggle.type = 'checkbox';
+          const toggleText = document.createElement('span');
+          toggleText.textContent = 'Enable quiet hours';
+          toggleLabel.appendChild(toggle);
+          toggleLabel.appendChild(toggleText);
 
-    function updateNodesUI(nodes, isDest) {
-      // isDest: false = available nodes panel, true = destination node dropdown
-      if (!isDest) {
-        const list = document.getElementById("nodeListDiv");
-        let filter = document.getElementById('nodeSearch').value.toLowerCase();
-        list.innerHTML = "";
-        let filtered = nodes.filter(n =>
-          (n.shortName && n.shortName.toLowerCase().includes(filter)) ||
-          (n.longName && n.longName.toLowerCase().includes(filter)) ||
-          String(n.id).toLowerCase().includes(filter)
-        );
-        // Sort
-        filtered.sort(compareNodes);
+          const rangeWrap = document.createElement('div');
+          rangeWrap.className = 'quiet-range';
+          const rangeLabel = document.createElement('span');
+          rangeLabel.textContent = 'Quiet from';
+          const startSelect = buildHourSelect(20);
+          const toLabel = document.createElement('span');
+          toLabel.textContent = 'to';
+          const endSelect = buildHourSelect(8);
 
-        filtered.forEach(n => {
-          const d = document.createElement("div");
-          d.className = "nodeItem";
-          if (isRecentNode(n.id)) d.classList.add("recentNode");
+          rangeWrap.appendChild(rangeLabel);
+          rangeWrap.appendChild(startSelect);
+          rangeWrap.appendChild(toLabel);
+          rangeWrap.appendChild(endSelect);
 
-          // Main line: Short name and ID
-          const mainLine = document.createElement("div");
-          mainLine.className = "nodeMainLine";
-          mainLine.innerHTML = `<span>${n.shortName || ""}</span> <span style="color:#ffa500;">(${n.id})</span>`;
-          d.appendChild(mainLine);
+          wrapper.appendChild(toggleLabel);
+          wrapper.appendChild(rangeWrap);
 
-          // Long name (if present)
-          if (n.longName && n.longName !== n.shortName) {
-            const longName = document.createElement("div");
-            longName.className = "nodeLongName";
-            longName.textContent = n.longName;
-            d.appendChild(longName);
-          }
+          const updateDisabled = () => {
+            const disabled = !toggle.checked;
+            startSelect.disabled = disabled;
+            endSelect.disabled = disabled;
+          };
 
-          // Info line 1: GPS/map, distance
-          const infoLine1 = document.createElement("div");
-          infoLine1.className = "nodeInfoLine";
-          let gps = nodeGPSInfo[String(n.id)];
-          if (gps && gps.lat != null && gps.lon != null) {
-            // Map button (emoji)
-            const mapA = document.createElement("a");
-            mapA.href = `https://www.google.com/maps/search/?api=1&query=${gps.lat},${gps.lon}`;
-            mapA.target = "_blank";
-            mapA.className = "nodeMapBtn";
-            mapA.title = "Show on Google Maps";
-            mapA.innerHTML = "🗺️";
-            infoLine1.appendChild(mapA);
-
-            // Distance
-            if (myGPS && myGPS.lat != null && myGPS.lon != null) {
-              let dist = calcDistance(myGPS.lat, myGPS.lon, gps.lat, gps.lon);
-              if (dist < 99999) {
-                const distSpan = document.createElement("span");
-                distSpan.className = "nodeGPS";
-                distSpan.title = "Approximate distance from connected node";
-                distSpan.innerHTML = `📏 ${dist.toFixed(2)} km`;
-                infoLine1.appendChild(distSpan);
+          const applyValue = value => {
+            let parsed = value;
+            if (typeof parsed === 'string') {
+              try {
+                parsed = JSON.parse(parsed);
+              } catch (err) {
+                parsed = {};
               }
             }
-          }
-          d.appendChild(infoLine1);
-
-          // Info line 2: Beacon/reporting time
-          const infoLine2 = document.createElement("div");
-          infoLine2.className = "nodeInfoLine";
-          if (gps && gps.beacon_time) {
-            const beacon = document.createElement("span");
-            beacon.className = "nodeBeacon";
-            beacon.title = "Last beacon/reporting time";
-            beacon.innerHTML = `🕒 ${getTZAdjusted(gps.beacon_time)}`;
-            infoLine2.appendChild(beacon);
-          }
-          d.appendChild(infoLine2);
-
-          // Info line 3: Hops
-          const infoLine3 = document.createElement("div");
-          infoLine3.className = "nodeInfoLine";
-          // Only show hops if available and not null/undefined/""
-          if (gps && gps.hops != null && gps.hops !== "" && gps.hops !== undefined) {
-            const hops = document.createElement("span");
-            hops.className = "nodeHops";
-            hops.title = "Hops from this node";
-            hops.innerHTML = `⛓️ ${gps.hops} hop${gps.hops==1?"":"s"}`;
-            infoLine3.appendChild(hops);
-            d.appendChild(infoLine3);
-          }
-          // If hops is not available, do not show this section at all
-
-          // DM button
-          const btn = document.createElement("button");
-          btn.textContent = "DM";
-          btn.className = "btn";
-          btn.onclick = () => dmToNode(n.id, n.shortName);
-          d.append(btn);
-
-          list.appendChild(d);
-        });
-      } else {
-        const sel  = document.getElementById("destNode");
-        const prevNode = sel.value;
-        sel.innerHTML  = "<option value=''>--Select Node--</option>";
-        let filter = document.getElementById('destNodeSearch').value.toLowerCase();
-        let filtered = nodes.filter(n =>
-          (n.shortName && n.shortName.toLowerCase().includes(filter)) ||
-          (n.longName && n.longName.toLowerCase().includes(filter)) ||
-          String(n.id).toLowerCase().includes(filter)
-        );
-        filtered.forEach(n => {
-          const opt = document.createElement("option");
-          opt.value = n.id;
-          opt.innerHTML = `${n.shortName} (${n.id})`;
-          sel.append(opt);
-        });
-        sel.value = prevNode;
-      }
-    }
-
-    function filterNodes(val, isDest) {
-      updateNodesUI(allNodes, isDest);
-    }
-
-    // Track recently discovered nodes (seen in last hour)
-    function isRecentNode(nodeId) {
-      // Find the latest message from this node
-      let found = allMessages.slice().reverse().find(m => m.node_id == nodeId);
-      if (!found) return false;
-      return isRecent(found.timestamp, 60);
-    }
-
-    function highlightRecentNodes(nodes) {
-      // Called after updateNodesUI
-      // No-op: handled by .recentNode class in updateNodesUI
-    }
-
-    // Show latest inbound message in ticker, dismissable, timeout after 30s, and persist dismiss across refreshes
-    function showLatestMessageTicker(messages) {
-      // Show both channel and direct inbound messages, but not outgoing (WebUI, AI_NODE_NAME)
-      // and not AI responses (reply_to is not null)
-      let inbound = messages.filter(m =>
-        m.node !== "WebUI" &&
-        m.node !== "Twilio" &&
-        m.node !== """ + json.dumps(AI_NODE_NAME) + """ &&
-        (!m.reply_to) // Only show original messages, not replies (AI responses)
-      );
-      if (!inbound.length) return hideTicker();
-      let latest = inbound[inbound.length - 1];
-      if (!latest || !latest.message) return hideTicker();
-
-      // If dismissed, don't show
-      if (isTickerDismissed(latest.timestamp)) return hideTicker();
-
-      // Only show ticker if not already shown for this message
-      if (tickerLastShownTimestamp === latest.timestamp) return;
-      tickerLastShownTimestamp = latest.timestamp;
-
-      let ticker = document.getElementById('ticker');
-      let tickerMsg = ticker.querySelector('p');
-      tickerMsg.textContent = latest.message;
-      ticker.style.display = 'block';
-
-      // Show dismiss button at far right, on top
-      let dismissBtn = ticker.querySelector('.dismiss-btn');
-      if (!dismissBtn) {
-        dismissBtn = document.createElement('button');
-        dismissBtn.textContent = "Dismiss";
-        dismissBtn.className = "dismiss-btn";
-        dismissBtn.onclick = function(e) {
-          e.stopPropagation();
-          ticker.style.display = 'none';
-          setTickerDismissed(latest.timestamp);
-          if (tickerTimeout) clearTimeout(tickerTimeout);
-        };
-        ticker.appendChild(dismissBtn);
-      } else {
-        // Always update dismiss button to dismiss this message
-        dismissBtn.onclick = function(e) {
-          e.stopPropagation();
-          ticker.style.display = 'none';
-          setTickerDismissed(latest.timestamp);
-          if (tickerTimeout) clearTimeout(tickerTimeout);
-        };
-      }
-
-      // Remove after 30s and persist dismiss
-      if (tickerTimeout) clearTimeout(tickerTimeout);
-      tickerTimeout = setTimeout(() => {
-        ticker.style.display = 'none';
-        setTickerDismissed(latest.timestamp);
-        tickerLastShownTimestamp = null;
-      }, 30000);
-    }
-
-    function hideTicker() {
-      let ticker = document.getElementById('ticker');
-      ticker.style.display = 'none';
-      tickerLastShownTimestamp = null;
-      if (tickerTimeout) {
-        clearTimeout(tickerTimeout);
-        tickerTimeout = null;
-      }
-    }
-
-    function pollStatus() {
-      fetch("/connection_status")
-        .then(r => r.json())
-        .then(d => {
-          const s = document.getElementById("connectionStatus");
-          if (d.status != "Connected") {
-            s.style.background = "red";
-            s.style.height = "40px";
-            s.textContent = `Connection Error: ${d.error}`;
-          } else {
-            s.style.background = "green";
-            s.style.height = "20px";
-            s.textContent = "Connected";
-          }
-        })
-        .catch(e => console.error(e));
-    }
-    setInterval(pollStatus, 5000);
-
-    function onPageLoad() {
-      if (!fetchIntervalId) {
-        fetchIntervalId = setInterval(fetchMessagesAndNodes, 10000); // every 10s
-      }
-      fetchMessagesAndNodes();
-      toggleMode(); // Set initial mode
-    }
-    window.addEventListener("load", onPageLoad);
-  </script>
-</head>
-<body onload="onPageLoad()">
-  <div id="connectionStatus"></div>
-  <div class="header-buttons"><a href="/logs" target="_blank">Logs</a></div>
-  <div id="ticker-container">
-    <div id="ticker"><p></p></div>
-  </div>
-  <audio id="incomingSound"></audio>
-
-  <div class="lcars-panel" id="sendForm">
-    <h2>Send a Message</h2>
-    <form method="POST" action="/ui_send">
-      <label>Message Mode:</label>
-      <label class="switch">
-        <input type="checkbox" id="modeSwitch">
-        <span class="slider round"></span>
-      </label>
-      <span id="modeLabel">Broadcast</span><br><br>
-
-      <div id="dmField" style="display:none;">
-        <label>Destination Node:</label><br>
-        <input type="text" id="destNodeSearch" placeholder="Search destination nodes..."><br>
-        <select id="destNode" name="destination_node"></select><br><br>
-      </div>
-
-      <div id="channelField" style="display:block;">
-        <label>Channel:</label><br>
-        <select id="channelSel" name="channel_index">
-"""
-    for i in range(8):
-        name = channel_names.get(str(i), f"Channel {i}")
-        html += f"          <option value='{i}'>{i} - {name}</option>\n"
-    html += """        </select><br><br>
-      </div>
-
-      <label>Message:</label><br>
-      <textarea id="messageBox" name="message" rows="3" style="width:80%;"></textarea>
-      <div id="charCounter">Characters: 0/1000, Chunks: 0/5</div><br>
-      <button type="submit">Send</button>
-      <button type="button" onclick="replyToLastDM()">Reply to Last DM</button>
-      <button type="button" onclick="replyToLastChannel()">Reply to Last Channel</button>
-    </form>
-  </div>
-
-  <div class="three-col">
-    <div class="col">
-      <div class="lcars-panel">
-        <h2>Channel Messages</h2>
-        <div id="channelDiv"></div>
-      </div>
-    </div>
-    <div class="col">
-      <div class="lcars-panel">
-        <h2>Available Nodes</h2>
-        <input type="text" id="nodeSearch" placeholder="Search nodes by name, id, or long name...">
-        <div class="nodeSortBar">
-          <label for="nodeSortKey">Sort by:</label>
-          <select id="nodeSortKey">
-            <option value="name">Name</option>
-            <option value="beacon">Last Reporting Time</option>
-            <option value="hops">Number of Hops</option>
-            <option value="gps">GPS Enabled</option>
-            <option value="distance">Distance</option>
-          </select>
-          <label for="nodeSortDir">Order:</label>
-          <select id="nodeSortDir">
-            <option value="asc">Ascending</option>
-            <option value="desc">Descending</option>
-          </select>
-        </div>
-        <div id="nodeListDiv"></div>
-      </div>
-    </div>
-    <div class="col">
-      <div class="lcars-panel">
-        <h2>Direct Messages</h2>
-        <div id="dmMessagesDiv"></div>
-      </div>
-    </div>
-  </div>
-
-  </div>
-
-    <div class="settings-toggle" id="settingsToggle" onclick="toggleSettings()">Show UI Settings</div>
-    <!-- Fallback toggleSettings: ensures the button works even if main script fails to load -->
-    <script>
-      if (typeof window.toggleSettings !== 'function') {
-        window.toggleSettings = function() {
-          try {
-            var panel = document.getElementById('settingsPanel');
-            var toggle = document.getElementById('settingsToggle');
-            if (!panel || !toggle) return;
-            if (panel.style.display === 'none' || panel.style.display === '') {
-              panel.style.display = 'block';
-              toggle.textContent = 'Hide UI Settings';
-            } else {
-              panel.style.display = 'none';
-              toggle.textContent = 'Show UI Settings';
+            if (!parsed || typeof parsed !== 'object') {
+              parsed = {};
             }
-          } catch (e) { console && console.error && console.error('fallback toggleSettings error', e); }
+            const enabled = parsed.enabled === true || parsed.enabled === 'true';
+            const start = parsed.start !== undefined ? Number(parsed.start) % 24 : Number(startSelect.value);
+            const end = parsed.end !== undefined ? Number(parsed.end) % 24 : Number(endSelect.value);
+            if (typeof start === 'number' && !Number.isNaN(start)) {
+              startSelect.value = (start % 24).toString();
+            }
+            if (typeof end === 'number' && !Number.isNaN(end)) {
+              endSelect.value = (end % 24).toString();
+            }
+            toggle.checked = enabled;
+            updateDisabled();
+          };
+
+          toggle.addEventListener('change', updateDisabled);
+
+          applyValue(dataItem.raw);
+
+          return {
+            element: wrapper,
+            focus: () => toggle.focus(),
+            getValue: () => ({
+              enabled: toggle.checked,
+              start: Number(startSelect.value) % 24,
+              end: Number(endSelect.value) % 24,
+            }),
+            setValue: applyValue,
+            setDisabled: state => {
+              const disabled = !!state;
+              toggle.disabled = disabled;
+              startSelect.disabled = disabled || !toggle.checked;
+              endSelect.disabled = disabled || !toggle.checked;
+            },
+          };
+        }
+
+        if (dataItem && dataItem.key === 'resend_dm_only') {
+          // Special radio: DM only vs Channels + DMs
+          const group = document.createElement('div');
+          group.className = 'config-bool-group';
+          const uniqueName = `cfg-resend-scope-${Math.random().toString(36).slice(2)}`;
+
+          const dmOption = document.createElement('label');
+          dmOption.className = 'config-bool-option';
+          const dmInput = document.createElement('input');
+          dmInput.type = 'radio';
+          dmInput.name = uniqueName;
+          dmInput.value = 'dm';
+          const dmText = document.createElement('span');
+          dmText.textContent = 'DM only';
+          dmOption.appendChild(dmInput);
+          dmOption.appendChild(dmText);
+
+          const bothOption = document.createElement('label');
+          bothOption.className = 'config-bool-option';
+          const bothInput = document.createElement('input');
+          bothInput.type = 'radio';
+          bothInput.name = uniqueName;
+          bothInput.value = 'both';
+          const bothText = document.createElement('span');
+          bothText.textContent = 'Channels + DMs';
+          bothOption.appendChild(bothInput);
+          bothOption.appendChild(bothText);
+
+          group.appendChild(dmOption);
+          group.appendChild(bothOption);
+
+          const setValue = value => {
+            const asBool = value === true || value === 'true' || value === 1 || value === '1';
+            dmInput.checked = !!asBool;
+            bothInput.checked = !asBool;
+          };
+
+          setValue(dataItem.raw);
+
+          return {
+            element: group,
+            focus: () => (dmInput.checked ? dmInput : bothInput).focus(),
+            getValue: () => (dmInput.checked ? 'true' : 'false'),
+            setValue,
+            setDisabled: state => {
+              dmInput.disabled = !!state;
+              bothInput.disabled = !!state;
+            },
+          };
+        }
+
+        if (kind === 'boolean') {
+          const group = document.createElement('div');
+          group.className = 'config-bool-group';
+          const uniqueName = `cfg-${(dataItem.key || 'setting').replace(/[^a-z0-9]/gi, '')}-${Math.random().toString(36).slice(2)}`;
+
+          const trueOption = document.createElement('label');
+          trueOption.className = 'config-bool-option';
+          const trueInput = document.createElement('input');
+          trueInput.type = 'radio';
+          trueInput.name = uniqueName;
+          trueInput.value = 'true';
+          const trueText = document.createElement('span');
+          trueText.textContent = 'Enabled';
+          trueOption.appendChild(trueInput);
+          trueOption.appendChild(trueText);
+
+          const falseOption = document.createElement('label');
+          falseOption.className = 'config-bool-option';
+          const falseInput = document.createElement('input');
+          falseInput.type = 'radio';
+          falseInput.name = uniqueName;
+          falseInput.value = 'false';
+          const falseText = document.createElement('span');
+          falseText.textContent = 'Disabled';
+          falseOption.appendChild(falseInput);
+          falseOption.appendChild(falseText);
+
+          group.appendChild(trueOption);
+          group.appendChild(falseOption);
+
+          const setValue = value => {
+            const normalized = value === true || value === 'true' || value === 1 || value === '1';
+            trueInput.checked = !!normalized;
+            falseInput.checked = !normalized;
+          };
+
+          setValue(dataItem.raw);
+
+          return {
+            element: group,
+            focus: () => (trueInput.checked ? trueInput : falseInput).focus(),
+            getValue: () => (trueInput.checked ? 'true' : 'false'),
+            setValue,
+            setDisabled: state => {
+              trueInput.disabled = !!state;
+              falseInput.disabled = !!state;
+            },
+          };
+        }
+
+        const textarea = document.createElement('textarea');
+        textarea.className = 'config-input';
+        textarea.value = formatConfigInputValue(dataItem.raw);
+        textarea.setAttribute('spellcheck', 'false');
+        textarea.dataset.key = dataItem.key || '';
+        adjustConfigInputRows(textarea);
+        textarea.addEventListener('input', () => adjustConfigInputRows(textarea));
+        return {
+          element: textarea,
+          focus: () => {
+            textarea.focus();
+            const len = textarea.value.length;
+            try { textarea.setSelectionRange(len, len); } catch (err) {}
+          },
+          getValue: () => textarea.value,
+          setValue: value => {
+            textarea.value = formatConfigInputValue(value);
+            adjustConfigInputRows(textarea);
+          },
+          setDisabled: state => { textarea.disabled = !!state; },
         };
       }
-    </script>
-  <div class="settings-panel" id="settingsPanel">
-    <h2>UI Settings</h2>
-    <label for="uiColorPicker">Theme Color:</label>
-    <input type="color" id="uiColorPicker" value="#ffa500"><br><br>
-    <label for="hueRotateEnabled">Enable Hue Rotation:</label>
-    <input type="checkbox" id="hueRotateEnabled"><br><br>
-    <label for="hueRotateSpeed">Hue Rotation Speed:</label>
-    <input type="range" id="hueRotateSpeed" min="5" max="60" step="0.1" value="10"><br><br>
-    <label for="soundFile">Incoming Message Sound (local file):</label>
-    <input type="file" id="soundFile" accept="audio/*"><br>
-    <input type="text" id="soundURL" placeholder="No file selected" readonly style="background:#222;color:#fff;border:none;"><br><br>
-    <label for="timezoneSelect">Timezone Offset (hours):</label>
-    <select id="timezoneSelect">
-"""
-    # Timezone selector: -12 to +14
-    for tz in range(-12, 15):
-        html += f'      <option value="{tz}">{tz:+d}</option>\n'
-    html += """    </select><br><br>
-    <button id="applySettingsBtn" type="button">Apply Settings</button>
-  </div>
-    </div>
 
-    <!-- Autostart toggle panel (fixed bottom-right) -->
-    <div class="autostart-panel">
-      <div class="autostart-box">
-        <label style="font-weight:bold;color:#fff;margin:0 6px 0 0;">Start MESH-MASTER on boot</label>
-        <label class="switch" style="margin:0;">
-          <input type="checkbox" id="autostartToggle">
-          <span class="slider round"></span>
-        </label>
-        <button id="saveAutostartBtn" class="btn" style="margin-left:6px;">Save</button>
-      </div>
-      <div style="color:#ccc;font-size:0.9em;margin-top:8px;max-width:420px;">
-        Note: This toggle configures Desktop (GUI) autostart via a .desktop file. On headless servers or
-        when the Desktop session doesn’t run at boot, use a systemd service instead. A helper installer
-        script is included in the repository under scripts/. 
-      </div>
-    </div>
-
-    <script>
-    // Autostart controls
-      async function loadAutostart() {
-        try {
-          let r = await fetch('/autostart');
-          let j = await r.json();
-          document.getElementById('autostartToggle').checked = !!j.start_on_boot;
-        } catch (e) { console.error(e); }
-      }
-      const saveAutostartBtn = document.getElementById('saveAutostartBtn');
-      const autostartToggleEl = document.getElementById('autostartToggle');
-      if (saveAutostartBtn) {
-        saveAutostartBtn.addEventListener('click', async function() {
+      // Wire Reset Defaults button
+      const resetBtn = document.getElementById('configResetDefaults');
+      if (resetBtn && !resetBtn._wired) {
+        resetBtn._wired = true;
+        resetBtn.addEventListener('click', async () => {
+          const sure = confirm('⚠️ Reset ALL settings to defaults? This will overwrite config.json.');
+          if (!sure) return;
           try {
-            let enabled = autostartToggleEl ? autostartToggleEl.checked : false;
-            let r = await fetch('/autostart/toggle', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({start_on_boot: enabled}) });
-            let j = await r.json();
-            alert('Autostart saved: ' + (j.start_on_boot ? 'Enabled' : 'Disabled'));
-          } catch (e) { alert('Failed to save autostart: ' + e); }
+            const res = await fetch(CONFIG_RESET_URL, { method: 'POST' });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            if (!data || data.ok !== true) throw new Error(data && data.error ? data.error : 'Unknown error');
+            alert('Defaults reset!');
+            // Trigger a fresh reload of metrics/config snapshot
+            loadMetrics();
+          } catch (err) {
+            alert('Failed to reset defaults: ' + err);
+          }
         });
       }
-      // Load initial state
-      loadAutostart();
 
-  // Expose defensive toggle to global window in case event binding fails
-  // (already exposed earlier near the toggleSettings definition)
-    </script>
+      const row = document.createElement('div');
+      row.className = 'config-row';
+      row.dataset.key = item.key || '';
+
+      let infoBtn = null;
+      const keySpan = document.createElement('span');
+      keySpan.className = 'config-key';
+      const keyHeading = document.createElement('div');
+      keyHeading.className = 'config-key-heading';
+      const keyLabel = document.createElement('span');
+      keyLabel.className = 'config-key-label';
+      keyLabel.textContent = item.label || item.key || '(unknown)';
+      keyHeading.appendChild(keyLabel);
+      if (item.explainer) {
+        infoBtn = document.createElement('button');
+        infoBtn.type = 'button';
+        infoBtn.className = 'config-info';
+        infoBtn.textContent = 'i';
+        infoBtn.setAttribute('aria-label', `About ${item.label || item.key || 'this setting'}`);
+        keyHeading.appendChild(infoBtn);
+      }
+      keySpan.appendChild(keyHeading);
+      if (item.key) {
+        const keyCode = document.createElement('span');
+        keyCode.className = 'config-key-code';
+        keyCode.textContent = item.key;
+        keySpan.appendChild(keyCode);
+      }
+      if (item.explainer) {
+        keySpan.classList.add('has-explainer');
+        bindExplainer(keySpan, item.explainer, { placement: 'right' });
+        if (infoBtn) {
+          bindExplainer(infoBtn, item.explainer);
+        }
+      }
+
+      const valueWrap = document.createElement('div');
+      valueWrap.className = 'config-value';
+
+      const displayLine = document.createElement('div');
+      displayLine.className = 'config-display-line';
+
+      const displaySpan = document.createElement('span');
+      displaySpan.className = 'config-display';
+      displaySpan.textContent = item.value || '—';
+      if (item.tooltip && item.tooltip !== item.value) {
+        displaySpan.title = item.tooltip;
+      }
+
+      const isLocked = CONFIG_LOCKED_KEYS.has(item.key);
+      const editorControl = !isLocked ? buildConfigEditor(item || {}) : null;
+      const isEditable = !!editorControl;
+
+      let editBtn = null;
+      if (isEditable) {
+        editBtn = document.createElement('button');
+        editBtn.type = 'button';
+        editBtn.className = 'config-edit-btn';
+        editBtn.textContent = 'Edit';
+      }
+
+      displayLine.appendChild(displaySpan);
+      if (isEditable && editBtn) {
+        displayLine.appendChild(editBtn);
+      }
+
+      valueWrap.appendChild(displayLine);
+      row.appendChild(keySpan);
+      row.appendChild(valueWrap);
+
+      let editArea = null;
+      let status = null;
+      let saveBtn = null;
+      let cancelBtn = null;
+
+      function setStatus(message, tone) {
+        if (!status) {
+          return;
+        }
+        status.textContent = message || '';
+        if (tone) {
+          status.dataset.tone = tone;
+        } else {
+          status.removeAttribute('data-tone');
+        }
+      }
+
+      function refreshDisplay() {
+        displaySpan.textContent = item.value || '—';
+        if (item.tooltip && item.tooltip !== item.value) {
+          displaySpan.title = item.tooltip;
+        } else {
+          displaySpan.removeAttribute('title');
+        }
+        keyLabel.textContent = item.label || item.key || '(unknown)';
+        if (item.explainer) {
+          keySpan.classList.add('has-explainer');
+          keySpan.dataset.explainer = item.explainer;
+          if (infoBtn) {
+            infoBtn.dataset.explainer = item.explainer;
+          }
+        } else {
+          keySpan.classList.remove('has-explainer');
+          keySpan.removeAttribute('data-explainer');
+          if (infoBtn) {
+            infoBtn.removeAttribute('data-explainer');
+          }
+        }
+      }
+
+      refreshDisplay();
+
+      if (isEditable && editorControl) {
+        editArea = document.createElement('div');
+        editArea.className = 'config-edit-area';
+        editArea.hidden = true;
+
+        const actions = document.createElement('div');
+        actions.className = 'config-actions';
+
+        cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button';
+        cancelBtn.className = 'config-cancel-btn';
+        cancelBtn.textContent = 'Cancel';
+
+        saveBtn = document.createElement('button');
+        saveBtn.type = 'button';
+        saveBtn.className = 'config-save-btn';
+        saveBtn.textContent = 'Save';
+
+        status = document.createElement('span');
+        status.className = 'config-status';
+
+        actions.appendChild(cancelBtn);
+        actions.appendChild(saveBtn);
+        editArea.appendChild(editorControl.element);
+        editArea.appendChild(actions);
+        editArea.appendChild(status);
+        valueWrap.appendChild(editArea);
+
+        function exitEdit(revertValue) {
+          row.classList.remove('is-editing');
+          editArea.hidden = true;
+          displayLine.removeAttribute('aria-hidden');
+          if (revertValue) {
+            editorControl.setValue(item.raw);
+          }
+          setStatus('', null);
+          maybeApplyPendingConfigData();
+        }
+
+        function enterEdit() {
+          document.querySelectorAll('.config-row.is-editing').forEach(other => {
+            if (other !== row) {
+              const cancel = other.querySelector('.config-cancel-btn');
+              if (cancel) {
+                cancel.click();
+              }
+            }
+          });
+          row.classList.add('is-editing');
+          editArea.hidden = false;
+          displayLine.setAttribute('aria-hidden', 'true');
+          setStatus('', null);
+          requestAnimationFrame(() => {
+            editorControl.focus();
+          });
+        }
+
+        async function handleSave() {
+          if (row.dataset.saving === 'true') {
+            return;
+          }
+          row.dataset.saving = 'true';
+          if (saveBtn) saveBtn.disabled = true;
+          if (cancelBtn) cancelBtn.disabled = true;
+          if (editBtn) editBtn.disabled = true;
+          if (editorControl.setDisabled) editorControl.setDisabled(true);
+          setStatus('Saving…', null);
+          try {
+            const valueText = editorControl.getValue();
+            const entry = await submitConfigUpdate(item.key, valueText);
+            if (entry && typeof entry === 'object') {
+              item.raw = entry.hasOwnProperty('raw') ? entry.raw : item.raw;
+              item.value = entry.hasOwnProperty('value') ? entry.value : item.value;
+              item.tooltip = entry.hasOwnProperty('tooltip') ? entry.tooltip : item.tooltip;
+              item.label = entry.hasOwnProperty('label') ? entry.label : item.label;
+              item.explainer = entry.hasOwnProperty('explainer') ? entry.explainer : item.explainer;
+              item.type = entry.type || detectConfigType(item.raw);
+              refreshDisplay();
+              editorControl.setValue(item.raw);
+            }
+            setStatus('Saved', 'success');
+            configOverviewState.pendingData = null;
+            setTimeout(() => {
+              setStatus('', null);
+              exitEdit(false);
+              loadMetrics();
+            }, 400);
+          } catch (err) {
+            console.error('Config update failed:', err);
+            setStatus(err && err.message ? err.message : 'Save failed', 'error');
+          } finally {
+            delete row.dataset.saving;
+            if (saveBtn) saveBtn.disabled = false;
+            if (cancelBtn) cancelBtn.disabled = false;
+            if (editBtn) editBtn.disabled = false;
+            if (editorControl.setDisabled) editorControl.setDisabled(false);
+          }
+        }
+
+        editBtn.addEventListener('click', enterEdit);
+        cancelBtn.addEventListener('click', () => exitEdit(true));
+        saveBtn.addEventListener('click', handleSave);
+        editArea.addEventListener('keydown', event => {
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            exitEdit(true);
+          } else if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+            event.preventDefault();
+            handleSave();
+          }
+        });
+      }
+
+      return row;
+    }
+
+    function renderConfigSection(sectionId) {
+      const list = $("configSettingsList");
+      if (!list) {
+        return;
+      }
+      list.innerHTML = '';
+      if (!configOverviewState.sections.length) {
+        list.innerHTML = '<p class="config-empty">No settings available.</p>';
+        return;
+      }
+      let current = configOverviewState.sections.find(section => section.id === sectionId);
+      if (!current) {
+        current = configOverviewState.sections[0];
+      }
+      if (!current) {
+        list.innerHTML = '<p class="config-empty">No settings available.</p>';
+        return;
+      }
+      configOverviewState.selectedId = current.id;
+      if (!Array.isArray(current.settings) || !current.settings.length) {
+        list.innerHTML = '<p class="config-empty">No values configured for this category.</p>';
+        return;
+      }
+      current.settings.forEach(item => {
+        const row = createConfigRow(item);
+        list.appendChild(row);
+      });
+    }
+
+    function onConfigCategoryChange(event) {
+      const select = event.currentTarget;
+      if (!select) return;
+      renderConfigSection(select.value);
+    }
+
+    function renderConfigOverview(data) {
+      if (isConfigEditing()) {
+        configOverviewState.pendingData = data;
+        return;
+      }
+      configOverviewState.pendingData = null;
+      const select = $("configCategorySelect");
+      const list = $("configSettingsList");
+      if (!select || !list) {
+        return;
+      }
+      configOverviewState.metadata = data && data.metadata && typeof data.metadata === 'object'
+        ? data.metadata
+        : {};
+      const sections = Array.isArray(data && data.sections) ? data.sections : [];
+      configOverviewState.sections = sections.map((section, index) => {
+        const safeId = section && section.id ? String(section.id) : `section-${index}`;
+        const rawSettings = Array.isArray(section && section.settings) ? section.settings : [];
+        const normalized = rawSettings.map((setting, idx) => {
+          const key = setting && setting.key ? String(setting.key) : `item-${index}-${idx}`;
+          const hasRaw = setting && Object.prototype.hasOwnProperty.call(setting, 'raw');
+          const rawValue = hasRaw ? setting.raw : (setting ? setting.value : null);
+          const valueText = setting && typeof setting.value === 'string'
+            ? setting.value
+            : (setting && setting.value !== undefined && setting.value !== null ? String(setting.value) : '—');
+          const tooltip = setting && typeof setting.tooltip === 'string' ? setting.tooltip : '';
+          const label = setting && typeof setting.label === 'string' ? setting.label : key;
+          const explainer = setting && typeof setting.explainer === 'string' ? setting.explainer : '';
+          const type = setting && setting.type ? String(setting.type) : detectConfigType(rawValue);
+          return {
+            key,
+            label,
+            value: valueText,
+            tooltip,
+            raw: rawValue,
+            type,
+            explainer,
+          };
+        });
+        return {
+          id: safeId,
+          label: section && section.label ? String(section.label) : `Section ${index + 1}`,
+          settings: normalized,
+        };
+      });
+      select.innerHTML = '';
+      if (!configOverviewState.sections.length) {
+        const option = document.createElement('option');
+        option.value = '';
+        option.textContent = 'No categories available';
+        select.appendChild(option);
+        list.innerHTML = '<p class="config-empty">Config snapshot unavailable.</p>';
+        return;
+      }
+      configOverviewState.sections.forEach(section => {
+        const option = document.createElement('option');
+        option.value = section.id;
+        option.textContent = section.label;
+        select.appendChild(option);
+      });
+      let selectedId = configOverviewState.selectedId;
+      if (!selectedId || !configOverviewState.sections.some(section => section.id === selectedId)) {
+        selectedId = configOverviewState.sections[0].id;
+      }
+      select.value = selectedId;
+      renderConfigSection(selectedId);
+      if (!configSelectInitialized) {
+        select.addEventListener('change', onConfigCategoryChange);
+        configSelectInitialized = true;
+      }
+    }
+
+    function pulseHeartbeat() {
+      if (!heartbeatIndicator) {
+        return;
+      }
+      if (heartbeatTimer) {
+        clearTimeout(heartbeatTimer);
+      }
+      heartbeatIndicator.classList.remove('pulse');
+      heartbeatIndicator.classList.remove('inactive');
+      void heartbeatIndicator.offsetWidth;
+      heartbeatIndicator.classList.add('pulse');
+      heartbeatTimer = setTimeout(() => heartbeatIndicator.classList.remove('pulse'), 700);
+    }
+
+    let featureState = {
+      aiEnabled: true,
+      disabledCommands: new Set(),
+      messageMode: 'both',
+      adminPassphrase: '',
+      baselineAdminPassphrase: '',
+      autoPingEnabled: true,
+      adminWhitelist: [],
+    };
+    let featureSaveTimer = null;
+    let featureSaving = false;
+    let featureStateReady = false;
+
+    function setFeaturesSaving(isSaving) {
+      featureSaving = !!isSaving;
+      const groups = $("commandGroups");
+      if (groups) {
+        if (featureSaving) {
+          groups.setAttribute('data-saving', 'true');
+        } else {
+          groups.removeAttribute('data-saving');
+        }
+      }
+      const aiToggle = $("aiToggle");
+      if (aiToggle) {
+        aiToggle.disabled = featureSaving;
+      }
+      const autoPingToggle = $("autoPingToggle");
+      if (autoPingToggle) {
+        autoPingToggle.disabled = featureSaving;
+      }
+      const passInput = $("adminPassphrase");
+      if (passInput) {
+        passInput.disabled = featureSaving;
+      }
+      const passButton = $("adminPassphraseSet");
+      if (passButton) {
+        passButton.disabled = featureSaving;
+      }
+      document.querySelectorAll('.admin-remove-btn').forEach(btn => {
+        btn.disabled = featureSaving;
+      });
+      document.querySelectorAll('.mode-buttons').forEach(group => {
+        if (featureSaving) {
+          group.setAttribute('data-saving', 'true');
+        } else {
+          group.removeAttribute('data-saving');
+        }
+      });
+      document.querySelectorAll('.mode-btn').forEach(btn => {
+        btn.disabled = featureSaving;
+      });
+      reflectAdminPassphraseWarning();
+    }
+
+    function updateFeaturesStatus() {
+      const statusEl = $("featuresStatus");
+      if (!statusEl) return;
+      const disabledCount = featureState.disabledCommands.size;
+      const modeLabel = messageModeLabel(featureState.messageMode);
+      const modeStatus = $("modeStatus");
+      if (modeStatus) {
+        modeStatus.textContent = modeLabel;
+      }
+      const parts = [modeLabel];
+      if (disabledCount) {
+        parts.push(`${disabledCount} command${disabledCount === 1 ? '' : 's'} disabled`);
+      }
+      if (!featureState.autoPingEnabled) {
+        parts.push('auto ping off');
+      }
+      statusEl.textContent = parts.join(' · ');
+    }
+
+    function renderFeatureAlerts(alerts) {
+      const box = $("featureAlerts");
+      if (!box) return;
+      box.innerHTML = '';
+      if (!alerts || !alerts.length) {
+        box.hidden = true;
+        return;
+      }
+      alerts.forEach(message => {
+        const pill = document.createElement('span');
+        pill.className = 'feature-pill';
+        pill.textContent = message;
+        box.appendChild(pill);
+      });
+      box.hidden = false;
+    }
+
+    function renderAdminList(admins) {
+      const list = $("adminList");
+      const empty = $("adminListEmpty");
+      if (!list || !empty) {
+        return;
+      }
+      list.innerHTML = '';
+      if (!admins || !admins.length) {
+        empty.hidden = false;
+        list.hidden = true;
+        return;
+      }
+      empty.hidden = true;
+      list.hidden = false;
+      admins.forEach(entry => {
+        const item = document.createElement('li');
+        item.className = 'admin-item';
+        const info = document.createElement('div');
+        info.className = 'admin-item-info';
+        const name = document.createElement('strong');
+        name.textContent = entry && entry.label ? entry.label : (entry && entry.key ? entry.key : 'Unknown');
+        info.appendChild(name);
+        if (entry && entry.key) {
+          const key = document.createElement('span');
+          key.className = 'admin-item-key';
+          key.textContent = entry.key;
+          info.appendChild(key);
+        }
+        item.appendChild(info);
+        const removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.className = 'admin-remove-btn';
+        removeBtn.textContent = 'Remove';
+        if (entry && entry.key) {
+          removeBtn.dataset.adminKey = entry.key;
+          removeBtn.addEventListener('click', () => removeAdmin(entry.key, entry.label || entry.key));
+        } else {
+          removeBtn.disabled = true;
+        }
+        item.appendChild(removeBtn);
+        list.appendChild(item);
+      });
+    }
+
+    function openAdminPopover() {
+      const popover = $("adminListPopover");
+      if (!popover || !popover.hidden) {
+        loadMetrics();
+        return;
+      }
+      adminPopoverPreviousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      popover.hidden = false;
+      const toggle = $("adminListToggle");
+      if (toggle) {
+        toggle.setAttribute('aria-expanded', 'true');
+      }
+      const closeBtn = $("adminListClose");
+      if (closeBtn) {
+        requestAnimationFrame(() => {
+          try { closeBtn.focus({ preventScroll: true }); } catch (err) {}
+        });
+      }
+      if (!adminPopoverOutsideHandler) {
+        adminPopoverOutsideHandler = (event) => {
+          const toggleNode = $("adminListToggle");
+          if (!popover.contains(event.target) && event.target !== toggleNode) {
+            closeAdminPopover({ restoreFocus: false });
+          }
+        };
+        document.addEventListener('mousedown', adminPopoverOutsideHandler);
+        document.addEventListener('touchstart', adminPopoverOutsideHandler);
+      }
+      loadMetrics();
+    }
+
+    function closeAdminPopover({ restoreFocus = true } = {}) {
+      const popover = $("adminListPopover");
+      if (!popover || popover.hidden) {
+        return;
+      }
+      popover.hidden = true;
+      const toggle = $("adminListToggle");
+      if (toggle) {
+        toggle.setAttribute('aria-expanded', 'false');
+      }
+      if (adminPopoverOutsideHandler) {
+        document.removeEventListener('mousedown', adminPopoverOutsideHandler);
+        document.removeEventListener('touchstart', adminPopoverOutsideHandler);
+        adminPopoverOutsideHandler = null;
+      }
+      if (restoreFocus && adminPopoverPreviousFocus && typeof adminPopoverPreviousFocus.focus === 'function') {
+        try { adminPopoverPreviousFocus.focus(); } catch (err) {}
+      }
+      adminPopoverPreviousFocus = null;
+    }
+
+    function onAdminListToggle(event) {
+      if (event) {
+        event.preventDefault();
+      }
+      const popover = $("adminListPopover");
+      if (!popover) {
+        return;
+      }
+      if (popover.hidden) {
+        openAdminPopover();
+      } else {
+        closeAdminPopover();
+      }
+    }
+
+    async function removeAdmin(key, label) {
+      if (!key) {
+        return;
+      }
+      const promptLabel = label || key;
+      if (!window.confirm(`Remove admin access for ${promptLabel}?`)) {
+        return;
+      }
+      setFeaturesSaving(true);
+      try {
+        const res = await fetch('/dashboard/admins/remove', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key }),
+        });
+        if (!res.ok) {
+          const errorText = await res.text();
+          throw new Error(`HTTP ${res.status} ${errorText}`);
+        }
+        const data = await res.json();
+        if (data && data.error) {
+          throw new Error(data.error);
+        }
+        renderFeatures(data);
+      } catch (err) {
+        console.error('Failed to remove admin:', err);
+        alert('Could not remove admin. Try again in a moment.');
+      } finally {
+        setFeaturesSaving(false);
+      }
+    }
+
+    async function onAdminPassphraseSet() {
+      await commitFeatureSave({ force: true });
+    }
+
+    function renderCommandGroups(categories) {
+      const container = $("commandGroups");
+      if (!container) return;
+      const previousOpen = new Set();
+      container.querySelectorAll('details.command-group').forEach(el => {
+        const id = el.dataset ? el.dataset.categoryId : null;
+        if (id && el.open) {
+          previousOpen.add(id);
+        }
+      });
+      container.innerHTML = '';
+      if (!categories || !categories.length) {
+        const empty = document.createElement('div');
+        empty.className = 'feature-empty';
+        empty.textContent = 'No command categories available.';
+        container.appendChild(empty);
+        return;
+      }
+
+      categories.forEach((cat, index) => {
+        const details = document.createElement('details');
+        details.className = 'command-group';
+        const catId = cat.id || `cat-${index}`;
+        details.dataset.categoryId = catId;
+        const shouldOpen = previousOpen.size ? previousOpen.has(catId) : true;
+        if (shouldOpen) {
+          details.open = true;
+        }
+        const summary = document.createElement('summary');
+        const commandCount = (cat.commands || []).length;
+        summary.textContent = `${cat.label || cat.id} (${commandCount})`;
+        details.appendChild(summary);
+
+        const list = document.createElement('div');
+        list.className = 'command-list';
+
+        (cat.commands || []).forEach(entry => {
+          const rawName = entry && entry.name ? entry.name : entry;
+          const name = normalizeCommandName(rawName);
+          if (!name) return;
+          const aliasSource = Array.isArray(entry && entry.aliases) ? entry.aliases : [];
+          const aliasList = aliasSource
+            .map(alias => normalizeCommandName(alias))
+            .filter(alias => alias && alias !== name);
+          const uniqueAliases = Array.from(new Set(aliasList));
+          const summary = entry && entry.summary ? String(entry.summary) : '';
+          const categoryName = entry && entry.category ? String(entry.category) : (cat.label || cat.id || '');
+          const item = document.createElement('label');
+          item.className = 'command-item';
+          item.dataset.command = name;
+          const checkbox = document.createElement('input');
+          checkbox.type = 'checkbox';
+          checkbox.dataset.command = name;
+          const isEnabled = !featureState.disabledCommands.has(name);
+          checkbox.checked = isEnabled;
+          item.classList.toggle('is-disabled', !isEnabled);
+          checkbox.addEventListener('change', onCommandToggle);
+          const span = document.createElement('span');
+          span.textContent = name;
+          if (summary || uniqueAliases.length || categoryName) {
+            const tooltipParts = [];
+            if (summary) {
+              tooltipParts.push(summary);
+            }
+            if (uniqueAliases.length) {
+              tooltipParts.push(`Also responds to: ${uniqueAliases.join(', ')}`);
+            }
+            if (categoryName) {
+              tooltipParts.push(`Category: ${categoryName}`);
+            }
+            const tooltipText = tooltipParts.join('\\n\\n');
+            bindExplainer(item, tooltipText, { placement: 'right' });
+            span.title = tooltipText;
+          }
+          item.appendChild(checkbox);
+          item.appendChild(span);
+          list.appendChild(item);
+        });
+
+        if (!list.childElementCount) {
+          const empty = document.createElement('div');
+          empty.className = 'feature-empty';
+          empty.textContent = 'No commands in this category.';
+          list.appendChild(empty);
+        }
+
+        details.appendChild(list);
+        container.appendChild(details);
+      });
+    }
+
+    function reflectAdminPassphraseWarning() {
+      const warning = $("adminPassphraseWarning");
+      const input = $("adminPassphrase");
+      if (!warning || !input) {
+        return;
+      }
+      const baseline = (featureState.baselineAdminPassphrase || '').trim();
+      const current = (input.value || '').trim();
+      const hasChange = featureStateReady && current !== baseline;
+      warning.hidden = !hasChange;
+      const setBtn = $("adminPassphraseSet");
+      if (setBtn) {
+        setBtn.disabled = featureSaving || !hasChange;
+      }
+    }
+
+    function updateMessageModeUI() {
+      const buttons = document.querySelectorAll('.mode-btn');
+      buttons.forEach(btn => {
+        const mode = normalizeMessageMode(btn.dataset.mode);
+        const active = mode === featureState.messageMode;
+        btn.classList.toggle('active', active);
+        btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+      });
+    }
+
+    function onModeButtonClick(event) {
+      const mode = normalizeMessageMode(event.currentTarget.dataset.mode);
+      if (!mode || mode === featureState.messageMode) {
+        return;
+      }
+      featureState.messageMode = mode;
+      updateMessageModeUI();
+      updateFeaturesStatus();
+      scheduleFeatureSave();
+    }
+
+    function renderFeatures(data) {
+      if (!data) return;
+      const disabled = (data.disabled_commands || []).map(normalizeCommandName);
+      featureState.aiEnabled = !!data.ai_enabled;
+      featureState.disabledCommands = new Set(disabled);
+      featureState.messageMode = normalizeMessageMode(data.message_mode);
+      featureState.adminPassphrase = data.admin_passphrase || '';
+      featureState.baselineAdminPassphrase = featureState.adminPassphrase;
+      featureState.autoPingEnabled = data.auto_ping_enabled === undefined ? true : !!data.auto_ping_enabled;
+      featureState.adminWhitelist = Array.isArray(data.admin_whitelist) ? data.admin_whitelist.slice() : [];
+
+      const aiToggle = $("aiToggle");
+      if (aiToggle) {
+        aiToggle.checked = featureState.aiEnabled;
+      }
+      const aiStatus = $("aiToggleStatus");
+      if (aiStatus) {
+        aiStatus.textContent = featureState.aiEnabled ? 'Enabled' : 'Disabled';
+      }
+
+      const autoPingToggle = $("autoPingToggle");
+      if (autoPingToggle) {
+        autoPingToggle.checked = featureState.autoPingEnabled;
+      }
+      const autoPingStatus = $("autoPingToggleStatus");
+      if (autoPingStatus) {
+        autoPingStatus.textContent = featureState.autoPingEnabled ? 'Enabled' : 'Disabled';
+      }
+
+      const passInput = $("adminPassphrase");
+      if (passInput && passInput.value !== featureState.adminPassphrase) {
+        passInput.value = featureState.adminPassphrase;
+      }
+
+      renderFeatureAlerts(data.alerts || []);
+      renderCommandGroups(data.categories || []);
+      renderAdminList(data.admins || []);
+      updateMessageModeUI();
+      updateFeaturesStatus();
+      featureStateReady = true;
+      reflectAdminPassphraseWarning();
+    }
+
+    function scheduleFeatureSave() {
+      if (!featureStateReady) {
+        return;
+      }
+      if (featureSaveTimer) {
+        clearTimeout(featureSaveTimer);
+      }
+      featureSaveTimer = setTimeout(commitFeatureSave, 500);
+    }
+
+    async function commitFeatureSave(options = {}) {
+      if (featureSaveTimer) {
+        clearTimeout(featureSaveTimer);
+        featureSaveTimer = null;
+      }
+      if (!featureStateReady && !options.force) {
+        return;
+      }
+
+      const payload = {
+        ai_enabled: featureState.aiEnabled,
+        disabled_commands: Array.from(featureState.disabledCommands),
+        message_mode: featureState.messageMode,
+        admin_passphrase: (featureState.adminPassphrase || '').trim(),
+        auto_ping_enabled: featureState.autoPingEnabled,
+      };
+
+      setFeaturesSaving(true);
+      try {
+        const res = await fetch('/dashboard/features', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+        const data = await res.json();
+        renderFeatures(data);
+      } catch (err) {
+        console.error('Feature save failed:', err);
+        alert('Updating feature toggles failed. Please try again.');
+      } finally {
+        setFeaturesSaving(false);
+      }
+    }
+
+    function onCommandToggle(event) {
+      const checkbox = event.target;
+      if (!checkbox || !checkbox.dataset) return;
+      const normalized = normalizeCommandName(checkbox.dataset.command);
+      if (!normalized) return;
+      if (checkbox.checked) {
+        featureState.disabledCommands.delete(normalized);
+      } else {
+        featureState.disabledCommands.add(normalized);
+      }
+      const label = checkbox.closest('.command-item');
+      if (label) {
+        label.classList.toggle('is-disabled', !checkbox.checked);
+      }
+      updateFeaturesStatus();
+      scheduleFeatureSave();
+    }
+
+    function onAiToggleChange(event) {
+      featureState.aiEnabled = !!event.target.checked;
+      const aiStatus = $("aiToggleStatus");
+      if (aiStatus) {
+        aiStatus.textContent = featureState.aiEnabled ? 'Enabled' : 'Disabled';
+      }
+      updateFeaturesStatus();
+      scheduleFeatureSave();
+    }
+
+    function onAutoPingToggleChange(event) {
+      featureState.autoPingEnabled = !!event.target.checked;
+      const autoPingStatus = $("autoPingToggleStatus");
+      if (autoPingStatus) {
+        autoPingStatus.textContent = featureState.autoPingEnabled ? 'Enabled' : 'Disabled';
+      }
+      updateFeaturesStatus();
+      scheduleFeatureSave();
+    }
+
+    function onAdminPassphraseInput(event) {
+      featureState.adminPassphrase = event.target.value;
+      reflectAdminPassphraseWarning();
+    }
+
+    function ensureLogbox() {
+      return $("logbox");
+    }
+
+    function maintainLogHistory() {
+      const logbox = ensureLogbox();
+      if (!logbox) return;
+      while (logbox.children.length > LOG_STREAM_MAX) {
+        logbox.removeChild(logbox.firstChild);
+      }
+    }
+
+    function decorateExistingLogLines() {
+      const logbox = ensureLogbox();
+      if (!logbox) return;
+      logbox.querySelectorAll('.log-line').forEach(line => line.classList.add('log-decorated'));
+      maintainLogHistory();
+      requestAnimationFrame(() => scrollActivityToBottom(true));
+    }
+
+    function scrollActivityToBottom(force = false) {
+      const logbox = ensureLogbox();
+      if (!logbox) return;
+      if (force || (logAutoScroll && !logUserScrolling)) {
+        logbox.scrollTo({ top: logbox.scrollHeight, behavior: force ? "auto" : "smooth" });
+      }
+    }
+
+    function appendActivityLine(html) {
+      const logbox = ensureLogbox();
+      if (!logbox) return;
+      const temp = document.createElement("div");
+      temp.innerHTML = html;
+      const line = temp.firstElementChild || temp;
+      line.classList.add("log-decorated", "animate-up");
+      logbox.appendChild(line);
+      setTimeout(() => line.classList.remove("animate-up"), 700);
+      maintainLogHistory();
+      scrollActivityToBottom();
+      logLastMessageAt = Date.now();
+    }
+
+    function bindLogScroll() {
+      const logbox = ensureLogbox();
+      if (!logbox || logScrollBound) return;
+      logScrollBound = true;
+      logbox.addEventListener("scroll", () => {
+        logUserScrolling = true;
+        clearTimeout(logScrollTimeout);
+        const nearBottom = logbox.scrollHeight - logbox.scrollTop <= logbox.clientHeight + 12;
+        if (nearBottom) {
+          logAutoScroll = true;
+          setActivityScrollLabel("Streaming", true);
+        } else {
+          logAutoScroll = false;
+          setActivityScrollLabel("Paused", false);
+        }
+        logScrollTimeout = setTimeout(() => { logUserScrolling = false; }, 600);
+      });
+    }
+
+    function setActivityScrollLabel(text, arrowOn) {
+      const status = $("scrollStatus");
+      const label = $("scrollLabel");
+      if (!status || !label) return;
+      label.textContent = text;
+      if (arrowOn) {
+        status.classList.add("on");
+      } else {
+        status.classList.remove("on");
+      }
+      if (heartbeatIndicator) {
+        heartbeatIndicator.classList.toggle('inactive', !arrowOn);
+      }
+    }
+
+    function scheduleLogReconnect() {
+      if (logReconnectAttempts >= LOG_RECONNECT_MAX) {
+        setActivityScrollLabel("Stream offline", false);
+        return;
+      }
+      const delay = Math.min(1000 * Math.pow(2, logReconnectAttempts), 10000);
+      logReconnectAttempts += 1;
+      setTimeout(initLogStream, delay);
+    }
+
+    function initLogStream() {
+      const logbox = ensureLogbox();
+      if (!logbox) return;
+      if (logEventSource) {
+        try { logEventSource.close(); } catch (e) {}
+      }
+      logEventSource = new EventSource("/logs_stream");
+      logEventSource.onopen = () => {
+        logReconnectAttempts = 0;
+        setActivityScrollLabel("Streaming", true);
+        logLastMessageAt = Date.now();
+      };
+      logEventSource.onmessage = (event) => {
+        if (!event.data) return;
+        if (event.data.includes("heartbeat") || event.data.includes("keepalive")) {
+          logLastMessageAt = Date.now();
+          pulseHeartbeat();
+          setActivityScrollLabel("Streaming", true);
+          logReconnectAttempts = 0;
+          return;
+        }
+        if (event.data.includes("💓 HB")) {
+          logLastMessageAt = Date.now();
+          pulseHeartbeat();
+          setActivityScrollLabel("Streaming", true);
+          logReconnectAttempts = 0;
+          return;
+        }
+        appendActivityLine(event.data);
+        if (logAutoScroll) {
+          setActivityScrollLabel("Streaming", true);
+        }
+      };
+      logEventSource.onerror = () => {
+        if (logEventSource) {
+          try { logEventSource.close(); } catch (e) {}
+          logEventSource = null;
+        }
+        scheduleLogReconnect();
+      };
+    }
+
+    function monitorLogStream() {
+      if (logAutoScroll) {
+        const elapsed = Date.now() - logLastMessageAt;
+        if (elapsed > LOG_WAIT_THRESHOLD_MS) {
+          setActivityScrollLabel("Waiting…", false);
+        } else {
+          setActivityScrollLabel("Streaming", true);
+        }
+      }
+      requestAnimationFrame(monitorLogStream);
+    }
+
+    function updateConnectionBanner(status) {
+      const banner = $("connectionBanner");
+      if (!banner) return;
+      const normalized = (status || "").toLowerCase();
+      banner.classList.remove("is-connected", "is-degraded", "is-disconnected", "is-unknown");
+      if (normalized === "connected") {
+        banner.classList.add("is-connected");
+        banner.textContent = "Connected";
+      } else if (normalized === "connecting" || normalized === "reconnecting") {
+        banner.classList.add("is-degraded");
+        banner.textContent = status;
+      } else if (normalized === "disconnected" || normalized === "error") {
+        banner.classList.add("is-disconnected");
+        banner.textContent = status || "Disconnected";
+      } else {
+        banner.classList.add("is-unknown");
+        banner.textContent = status || "Status unknown";
+      }
+    }
+
+    function renderGamesBreakdown(breakdown) {
+      const container = $("stat-games-breakdown");
+      if (!container) return;
+      container.innerHTML = "";
+      if (!breakdown || Object.keys(breakdown).length === 0) {
+        container.textContent = "No game sessions recorded in the last 24 hours.";
+        return;
+      }
+      Object.entries(breakdown).forEach(([name, count]) => {
+        const pill = document.createElement("span");
+        pill.textContent = `${name}: ${count}`;
+        container.appendChild(pill);
+      });
+    }
+
+    function renderOnboardRoster(roster) {
+      const container = $("onboardRoster");
+      if (!container) return;
+      container.innerHTML = '';
+      if (!roster || roster.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'onboard-roster-empty';
+        empty.textContent = 'No completed onboardings yet.';
+        container.appendChild(empty);
+        return;
+      }
+      roster.forEach(entry => {
+        const item = document.createElement('div');
+        item.className = 'onboard-roster-item';
+        const label = document.createElement('strong');
+        label.textContent = entry.label || entry.sender_key || 'Unknown';
+        const ts = document.createElement('span');
+        if (entry.completed_at) {
+          try {
+            const time = new Date(entry.completed_at);
+            ts.textContent = isNaN(time) ? entry.completed_at : time.toLocaleString();
+          } catch (err) {
+            ts.textContent = entry.completed_at;
+          }
+        } else {
+          ts.textContent = '';
+        }
+        item.appendChild(label);
+        if (ts.textContent) {
+          item.appendChild(ts);
+        }
+        container.appendChild(item);
+      });
+    }
+
+    async function loadMetrics() {
+      const statusEl = $("metricsStatus");
+      try {
+        if (statusEl) {
+          statusEl.textContent = "Refreshing…";
+        }
+        const res = await fetch(METRICS_URL, { cache: "no-store" });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        updateMetrics(data);
+        if (statusEl) {
+          statusEl.textContent = "Updated just now";
+        }
+      } catch (err) {
+        if (statusEl) {
+          statusEl.textContent = "Metrics unavailable";
+        }
+        updateConnectionBanner("Disconnected");
+        console.error("Metrics refresh failed:", err);
+      }
+    }
+
+    function updateMetrics(metrics) {
+      if (!metrics || typeof metrics !== "object") return;
+      const ts = metrics.timestamp ? new Date(metrics.timestamp) : null;
+      const timestampEl = $("metricsTimestamp");
+      if (timestampEl) {
+        timestampEl.textContent = ts && !isNaN(ts) ? `Snapshot · ${ts.toLocaleTimeString()}` : "Snapshot time unavailable";
+      }
+      updateConnectionBanner(metrics.connection_status);
+
+      const uptimeBadge = $("uptimeTicker");
+      if (uptimeBadge) {
+        const parts = [];
+        if (metrics.uptime_human) {
+          parts.push(metrics.uptime_human);
+        }
+        if (typeof metrics.restart_count === 'number') {
+          parts.push(`restarts ${formatNumber(metrics.restart_count)}`);
+        }
+        const queueValue = metrics.queue && typeof metrics.queue.value === 'number'
+          ? metrics.queue.value
+          : (typeof metrics.queue_size === 'number' ? metrics.queue_size : null);
+        if (queueValue !== null) {
+          let queueText = `queue ${formatNumber(queueValue)}`;
+          const delta = metrics.queue && typeof metrics.queue.delta === 'number' ? metrics.queue.delta : 0;
+          if (delta > 0) {
+            queueText += ' ▲';
+          } else if (delta < 0) {
+            queueText += ' ▼';
+          }
+          parts.push(queueText);
+        }
+        uptimeBadge.textContent = parts.length ? parts.join(' · ') : '—';
+      }
+
+      const messageActivity = metrics.message_activity || {};
+      setValueWithDelta('stat-msg-total', messageActivity.total || { value: 0, delta: 0 });
+      setValueWithDelta('stat-msg-direct', messageActivity.direct || { value: 0, delta: 0 });
+      setValueWithDelta('stat-msg-ai', messageActivity.ai || { value: 0, delta: 0 });
+
+      const nodeActivity = metrics.node_activity || {};
+      setValueWithDelta('stat-nodes-current', nodeActivity.current || { value: 0, delta: 0 });
+      setValueWithDelta('stat-nodes-new', nodeActivity.new_24h || { value: 0, delta: 0 });
+      setValueWithDelta('stat-active-users', metrics.active_users || { value: 0, delta: 0 });
+      setValueWithDelta('stat-new-onboards', metrics.new_onboards || { value: 0, delta: 0 });
+      setValueWithDelta('stat-games', metrics.games || { value: 0, delta: 0 });
+
+      if (metrics.games && metrics.games.breakdown) {
+        renderGamesBreakdown(metrics.games.breakdown);
+      } else {
+        renderGamesBreakdown({});
+      }
+
+      // Ack summary
+      try {
+        const ack = (metrics.ack && metrics.ack.dm) ? metrics.ack.dm : {};
+        const firstRate = (typeof ack.first_rate === 'number') ? `${ack.first_rate}%` : '—';
+        const resendRate = (typeof ack.resend_rate === 'number') ? `${ack.resend_rate}%` : '—';
+        const events = (typeof ack.events === 'number') ? ack.events : ((ack.first_total || 0) + (ack.resend_total || 0));
+        const setText = (id, text) => { const el = $(id); if (el) el.textContent = text; };
+        setText('stat-ack-dm-first', firstRate);
+        setText('stat-ack-dm-resend', resendRate);
+        setText('stat-ack-dm-events', (events || 0).toString());
+      } catch (err) {}
+
+      if (metrics.onboarding && Array.isArray(metrics.onboarding.roster)) {
+        renderOnboardRoster(metrics.onboarding.roster);
+      } else {
+        renderOnboardRoster([]);
+      }
+
+      if (metrics.features) {
+        renderFeatures(metrics.features);
+      }
+      if (metrics.config_overview) {
+        renderConfigOverview(metrics.config_overview);
+      }
+    }
+
+    window.addEventListener("beforeunload", () => {
+      if (logEventSource) {
+        try { logEventSource.close(); } catch (e) {}
+      }
+    });
+
+    document.addEventListener("DOMContentLoaded", () => {
+      bindGlobalErrorHandlers();
+      decorateExistingLogLines();
+      bindLogScroll();
+      initLogStream();
+      initPanelDrag();
+      initPanelCollapse();
+      if (initialMetrics && Object.keys(initialMetrics).length) {
+        updateMetrics(initialMetrics);
+        const statusEl = $("metricsStatus");
+        if (statusEl) {
+          statusEl.textContent = "Snapshot ready";
+        }
+      }
+      document.querySelectorAll('.mode-btn').forEach(btn => {
+        btn.addEventListener('click', onModeButtonClick);
+      });
+      updateMessageModeUI();
+      const aiToggle = $("aiToggle");
+      if (aiToggle) {
+        aiToggle.addEventListener('change', onAiToggleChange);
+      }
+      const autoPingToggle = $("autoPingToggle");
+      if (autoPingToggle) {
+        autoPingToggle.addEventListener('change', onAutoPingToggleChange);
+      }
+      const passButton = $("adminPassphraseSet");
+      if (passButton) {
+        passButton.addEventListener('click', onAdminPassphraseSet);
+      }
+      const adminToggle = $("adminListToggle");
+      if (adminToggle) {
+        adminToggle.addEventListener('click', onAdminListToggle);
+        adminToggle.setAttribute('aria-expanded', 'false');
+        adminToggle.setAttribute('aria-controls', 'adminListPopover');
+        adminToggle.setAttribute('aria-haspopup', 'dialog');
+      }
+      const adminClose = $("adminListClose");
+      if (adminClose) {
+        adminClose.addEventListener('click', () => closeAdminPopover());
+      }
+      document.addEventListener('keydown', event => {
+        if (event.key === 'Escape') {
+          const popRef = $("adminListPopover");
+          if (popRef && !popRef.hidden) {
+            closeAdminPopover();
+          }
+        }
+      });
+      const passInput = $("adminPassphrase");
+      if (passInput) {
+        passInput.addEventListener('input', onAdminPassphraseInput);
+      }
+      loadMetrics();
+      setInterval(loadMetrics, METRICS_POLL_MS);
+      initRadioPanel();
+      loadRadioState();
+      setInterval(loadRadioState, RADIO_STATE_POLL_MS);
+      monitorLogStream();
+    });
+  </script>
 </body>
 </html>
 """
-    return html
+    page_html = page_html.replace("__METRICS__", metrics_bootstrap_attr)
+    return page_html
 
+
+
+@app.route('/dashboard/config/update', methods=['POST'])
+def update_dashboard_config():
+    data = request.get_json(force=True)
+    key = data.get('key')
+    if not key or not isinstance(key, str):
+        return jsonify({'ok': False, 'error': 'Missing config key.'}), 400
+
+    incoming = data.get('value')
+    if isinstance(incoming, str):
+        value_text = incoming
+    elif incoming is None:
+        value_text = ''
+    else:
+        try:
+            value_text = json.dumps(incoming)
+        except Exception:
+            value_text = str(incoming)
+
+    synthetic_quiet = (key == 'automessage_quiet_hours')
+
+    with CONFIG_LOCK:
+        if not synthetic_quiet and key not in config:
+            return jsonify({'ok': False, 'error': f"'{key}' is not a recognized config option."}), 404
+        try:
+            new_value = _parse_config_update_value(value_text)
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': f"Unable to interpret value: {exc}"}), 400
+
+        if synthetic_quiet:
+            if isinstance(new_value, str):
+                try:
+                    new_value = json.loads(new_value)
+                except Exception:
+                    new_value = {}
+            if not isinstance(new_value, dict):
+                return jsonify({'ok': False, 'error': 'Quiet hours update requires an object payload.'}), 400
+            enabled = bool(new_value.get('enabled'))
+            try:
+                quiet_start = int(new_value.get('start', config.get('mail_quiet_start_hour', 20))) % 24
+            except Exception:
+                quiet_start = int(config.get('mail_quiet_start_hour', 20) or 20) % 24
+            try:
+                quiet_end = int(new_value.get('end', config.get('mail_quiet_end_hour', 8))) % 24
+            except Exception:
+                quiet_end = int(config.get('mail_quiet_end_hour', 8) or 8) % 24
+            if enabled and quiet_start == quiet_end:
+                enabled = False
+            config['mail_notify_quiet_hours_enabled'] = bool(enabled)
+            config['mail_quiet_start_hour'] = quiet_start
+            config['mail_quiet_end_hour'] = quiet_end
+            if enabled:
+                config['notify_active_start_hour'] = quiet_end % 24
+                config['notify_active_end_hour'] = quiet_start % 24
+            else:
+                config['notify_active_start_hour'] = 0
+                config['notify_active_end_hour'] = 0
+            try:
+                write_atomic(CONFIG_FILE, json.dumps(config, indent=2, sort_keys=True))
+            except Exception as exc:
+                return jsonify({'ok': False, 'error': f"Failed to write config.json: {exc}"}), 500
+
+            display_label = "Disabled (24/7 reminders)"
+            tooltip = "Quiet hours disabled; reminders may send at any time."
+            if enabled:
+                display_label = f"Quiet {_format_hour_label(quiet_start)} → {_format_hour_label(quiet_end)}"
+                tooltip = (
+                    f"Quiet hours enabled. Reminders pause from {_format_hour_label(quiet_start)}"
+                    f" to {_format_hour_label(quiet_end)} local time."
+                )
+            entry = {
+                'key': 'automessage_quiet_hours',
+                'value': display_label,
+                'tooltip': tooltip,
+                'raw': {
+                    'enabled': bool(enabled),
+                    'start': quiet_start,
+                    'end': quiet_end,
+                },
+                'type': 'automessage_quiet_hours',
+                'explainer': _build_config_explainer('automessage_quiet_hours', display_label, tooltip),
+            }
+            clean_log("Config 'automessage_quiet_hours' updated via dashboard", "🛠️", show_always=True, rate_limit=False)
+            return jsonify({'ok': True, 'entry': entry})
+
+        current_value = config.get(key)
+        if new_value == current_value:
+            display, tooltip = _format_config_value(key, current_value)
+            entry = {
+                'key': key,
+                'value': display,
+                'tooltip': tooltip,
+                'raw': current_value,
+                'type': _config_value_kind(current_value),
+            }
+            return jsonify({'ok': True, 'entry': entry})
+
+        original_value = current_value
+        config[key] = new_value
+        try:
+            write_atomic(CONFIG_FILE, json.dumps(config, indent=2, sort_keys=True))
+        except Exception as exc:
+            config[key] = original_value
+            return jsonify({'ok': False, 'error': f"Failed to write config.json: {exc}"}), 500
+
+    clean_log(f"Config '{key}' updated via dashboard", "🛠️", show_always=True, rate_limit=False)
+    display, tooltip = _format_config_value(key, new_value)
+    entry = {
+        'key': key,
+        'value': display,
+        'tooltip': tooltip,
+        'raw': new_value,
+        'type': _config_value_kind(new_value),
+    }
+    return jsonify({'ok': True, 'entry': entry})
+
+
+@app.route('/dashboard/config/reset', methods=['POST'])
+def reset_dashboard_config():
+    # Replace config.json with an empty object (defaults handled by code fallbacks)
+    global config
+    with CONFIG_LOCK:
+        try:
+            config = {}
+            write_atomic(CONFIG_FILE, json.dumps(config, indent=2, sort_keys=True))
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': f"Failed to reset: {exc}"}), 500
+    clean_log("Defaults reset!", "⚠️", show_always=True, rate_limit=False)
+    return jsonify({'ok': True})
+
+
+@app.route('/dashboard/js-error', methods=['POST'])
+def log_dashboard_js_error():
+    data = request.get_json(silent=True) or {}
+    kind = str(data.get('kind') or 'error')
+    details = data.get('details') or {}
+    message = details.get('message') or data.get('message') or 'Unknown JS error'
+    source = details.get('source') or ''
+    lineno = details.get('lineno')
+    colno = details.get('colno')
+    stack = details.get('stack') or data.get('stack')
+    parts = [f"Dashboard JS {kind}: {message}"]
+    if source:
+        location = f"{source}:{lineno or '?'}:{colno or '?'}"
+        parts.append(location)
+    if stack:
+        first_line = str(stack).splitlines()[0]
+        parts.append(first_line)
+    clean_log(" | ".join(parts), "⚠️", show_always=True, rate_limit=False)
+    return jsonify({'ok': True})
+
+
+# ---------------------------------
+# Radio Settings (LoRa + Channels)
+# ---------------------------------
+_RADIO_OPS_LOCK = threading.Lock()
+
+
+def _get_local_node():
+    try:
+        return getattr(interface, 'localNode', None) if interface is not None else None
+    except Exception:
+        return None
+
+
+def _ensure_channels(node, timeout: float = 2.0):
+    try:
+        if getattr(node, 'channels', None) is None:
+            node.requestChannels(0)
+        start = time.time()
+        while getattr(node, 'channels', None) is None and (time.time() - start) < max(0.2, timeout):
+            time.sleep(0.05)
+    except Exception:
+        pass
+
+
+def _build_radio_state_dict() -> Dict[str, Any]:
+    state: Dict[str, Any] = {
+        'connected': False,
+        'radio_id': None,
+        'node_num': None,
+        'long_name': None,
+        'short_name': None,
+        'hops': None,
+        'channels': [],
+        'max_channels': 8,
+    }
+    if interface is None or connection_status != "Connected":
+        return state
+    node = _get_local_node()
+    if node is None:
+        return state
+    try:
+        # Ensure basic config is present
+        try:
+            interface.waitForConfig()
+        except Exception:
+            pass
+        info = getattr(interface, 'myInfo', None)
+        node_num = getattr(info, 'my_node_num', None) if info is not None else None
+        state['connected'] = True
+        state['node_num'] = int(node_num) if node_num is not None else None
+        state['radio_id'] = str(node_num) if node_num is not None else None
+        try:
+            state['long_name'] = interface.getLongName()
+            state['short_name'] = interface.getShortName()
+        except Exception:
+            pass
+        # Hop limit lives under localConfig.lora.hop_limit
+        try:
+            lora = node.localConfig.lora
+            state['hops'] = int(getattr(lora, 'hop_limit', 0))
+        except Exception:
+            state['hops'] = None
+
+        # Channels
+        _ensure_channels(node)
+        channels = getattr(node, 'channels', None) or []
+        out_rows: List[Dict[str, Any]] = []
+        for idx in range(8):
+            try:
+                ch = channels[idx] if idx < len(channels) else None
+            except Exception:
+                ch = None
+            role_name = 'DISABLED'
+            name = ''
+            psk_label = 'unencrypted'
+            uplink = True
+            downlink = True
+            channel_num = None
+            enabled = False
+            if ch is not None:
+                try:
+                    role_enum = getattr(ch, 'role', meshtastic_channel_pb2.Channel.Role.DISABLED)
+                    role_name = meshtastic_channel_pb2.Channel.Role.Name(role_enum)
+                except Exception:
+                    role_name = 'DISABLED'
+                try:
+                    settings = getattr(ch, 'settings', None)
+                    if settings is not None:
+                        name = getattr(settings, 'name', '') or ''
+                        psk = getattr(settings, 'psk', b'') or b''
+                        try:
+                            psk_label = meshtastic_util.pskToString(psk)
+                        except Exception:
+                            psk_label = 'secret' if psk else 'unencrypted'
+                        uplink = bool(getattr(settings, 'uplink_enabled', True))
+                        downlink = bool(getattr(settings, 'downlink_enabled', True))
+                        channel_num = getattr(settings, 'channel_num', None)
+                except Exception:
+                    pass
+                enabled = (role_name != 'DISABLED')
+            out_rows.append({
+                'index': idx,
+                'role': role_name,
+                'name': name,
+                'psk': psk_label,
+                'uplink': uplink,
+                'downlink': downlink,
+                'channel_num': channel_num,
+                'enabled': enabled,
+                'deletable': (role_name == 'SECONDARY'),
+            })
+        state['channels'] = out_rows
+    except Exception as exc:
+        state['error'] = str(exc)
+    return state
+
+
+@app.route('/dashboard/radio/state', methods=['GET'])
+def get_radio_state():
+    state = _build_radio_state_dict()
+    code = 200 if state.get('connected') else 503
+    return jsonify({'ok': bool(state.get('connected')), 'radio': state}), code
+
+
+@app.route('/dashboard/radio/hops', methods=['POST'])
+def set_radio_hops():
+    data = request.get_json(force=True) or {}
+    try:
+        hop_limit = int(data.get('hop_limit'))
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Invalid hop_limit'}), 400
+    if hop_limit < 0 or hop_limit > 7:
+        return jsonify({'ok': False, 'error': 'hop_limit must be between 0 and 7'}), 400
+    node = _get_local_node()
+    if interface is None or node is None:
+        return jsonify({'ok': False, 'error': 'Radio not connected'}), 503
+    with _RADIO_OPS_LOCK:
+        try:
+            interface.waitForConfig()
+        except Exception:
+            pass
+        try:
+            node.localConfig.lora.hop_limit = int(hop_limit)
+            node.writeConfig('lora')
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': f'Failed to set hop limit: {exc}'}), 500
+    clean_log(f"Radio hop limit set to {hop_limit}", "🛠️", show_always=True, rate_limit=False)
+    return jsonify({'ok': True, 'hop_limit': hop_limit})
+
+
+def _psk_from_text(text: Optional[str]) -> Optional[bytes]:
+    if text is None:
+        return None
+    s = str(text).strip()
+    if not s:
+        return None
+    try:
+        return meshtastic_util.fromPSK(s)
+    except Exception:
+        return None
+
+
+@app.route('/dashboard/radio/channel/add', methods=['POST'])
+def add_radio_channel():
+    data = request.get_json(force=True) or {}
+    name = str(data.get('name') or '').strip() or 'New Channel'
+    psk_text = data.get('psk')  # 'random' | 'default' | 'none' | 'simpleN' | raw hex/base64
+    uplink = bool(data.get('uplink', True))
+    downlink = bool(data.get('downlink', True))
+    channel_num = data.get('channel_num')
+    try:
+        channel_num = int(channel_num) if channel_num is not None else None
+    except Exception:
+        channel_num = None
+    node = _get_local_node()
+    if interface is None or node is None:
+        return jsonify({'ok': False, 'error': 'Radio not connected'}), 503
+    with _RADIO_OPS_LOCK:
+        _ensure_channels(node)
+        channels = getattr(node, 'channels', None)
+        if not channels:
+            return jsonify({'ok': False, 'error': 'Unable to read channels'}), 500
+        target_idx = None
+        for i, ch in enumerate(channels[:8]):
+            role = getattr(ch, 'role', meshtastic_channel_pb2.Channel.Role.DISABLED)
+            if role == meshtastic_channel_pb2.Channel.Role.DISABLED:
+                target_idx = i
+                break
+        if target_idx is None:
+            return jsonify({'ok': False, 'error': 'All 8 channels are already in use'}), 400
+        # Prepare PSK
+        psk_bytes = _psk_from_text(psk_text) if psk_text else meshtastic_util.genPSK256()
+        try:
+            ch = channels[target_idx]
+            ch.role = meshtastic_channel_pb2.Channel.Role.SECONDARY
+            if ch.settings is None:
+                ch.settings = meshtastic_channel_pb2.ChannelSettings()
+            ch.settings.name = name
+            ch.settings.uplink_enabled = uplink
+            ch.settings.downlink_enabled = downlink
+            if channel_num is not None:
+                ch.settings.channel_num = int(channel_num)
+            ch.settings.psk = psk_bytes
+            node.writeChannel(target_idx)
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': f'Failed to add channel: {exc}'}), 500
+    clean_log(f"Added secondary channel at index {target_idx}", "🛠️", show_always=True, rate_limit=False)
+    return jsonify({'ok': True, 'channel': _build_radio_state_dict().get('channels', [])[target_idx]})
+
+
+@app.route('/dashboard/radio/channel/update', methods=['POST'])
+def update_radio_channel():
+    data = request.get_json(force=True) or {}
+    try:
+        index = int(data.get('index'))
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Missing or invalid channel index'}), 400
+    name = data.get('name')
+    uplink = data.get('uplink')
+    downlink = data.get('downlink')
+    psk_text = data.get('psk')  # if provided, will be applied; 'random' or explicit
+    node = _get_local_node()
+    if interface is None or node is None:
+        return jsonify({'ok': False, 'error': 'Radio not connected'}), 503
+    with _RADIO_OPS_LOCK:
+        _ensure_channels(node)
+        channels = getattr(node, 'channels', None)
+        if not channels or index < 0 or index >= len(channels):
+            return jsonify({'ok': False, 'error': 'Channel index out of range'}), 400
+        ch = channels[index]
+        role = getattr(ch, 'role', meshtastic_channel_pb2.Channel.Role.DISABLED)
+        if role == meshtastic_channel_pb2.Channel.Role.DISABLED:
+            return jsonify({'ok': False, 'error': 'Channel is disabled'}), 400
+        try:
+            if ch.settings is None:
+                ch.settings = meshtastic_channel_pb2.ChannelSettings()
+            if name is not None:
+                ch.settings.name = str(name)
+            if uplink is not None:
+                ch.settings.uplink_enabled = bool(uplink)
+            if downlink is not None:
+                ch.settings.downlink_enabled = bool(downlink)
+            if psk_text is not None:
+                pb = _psk_from_text(psk_text) if psk_text else meshtastic_util.genPSK256()
+                if pb is not None:
+                    ch.settings.psk = pb
+            node.writeChannel(index)
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': f'Failed to update channel: {exc}'}), 500
+    clean_log(f"Updated channel {index}", "🛠️", show_always=True, rate_limit=False)
+    return jsonify({'ok': True, 'channel': _build_radio_state_dict().get('channels', [])[index]})
+
+
+@app.route('/dashboard/radio/channel/remove', methods=['POST'])
+def remove_radio_channel():
+    data = request.get_json(force=True) or {}
+    try:
+        index = int(data.get('index'))
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Missing or invalid channel index'}), 400
+    node = _get_local_node()
+    if interface is None or node is None:
+        return jsonify({'ok': False, 'error': 'Radio not connected'}), 503
+    with _RADIO_OPS_LOCK:
+        _ensure_channels(node)
+        channels = getattr(node, 'channels', None)
+        if not channels or index < 0 or index >= len(channels):
+            return jsonify({'ok': False, 'error': 'Channel index out of range'}), 400
+        ch = channels[index]
+        role = getattr(ch, 'role', meshtastic_channel_pb2.Channel.Role.DISABLED)
+        if role != meshtastic_channel_pb2.Channel.Role.SECONDARY:
+            return jsonify({'ok': False, 'error': 'Only SECONDARY channels can be deleted'}), 400
+        try:
+            node.deleteChannel(index)
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': f'Failed to delete channel: {exc}'}), 500
+    clean_log(f"Deleted channel at index {index}", "🛠️", show_always=True, rate_limit=False)
+    return jsonify({'ok': True, 'channels': _build_radio_state_dict().get('channels', [])})
 
 
 @app.route('/autostart', methods=['GET'])
 def get_autostart():
     cfg = safe_load_json(CONFIG_FILE, {})
-    return jsonify({'start_on_boot': bool(cfg.get('start_on_boot', False))})
+    return jsonify({'start_on_boot': bool(cfg.get('start_on_boot', True))})
 
 
 @app.route('/autostart/toggle', methods=['POST'])
 def toggle_autostart():
     data = request.get_json(force=True)
-    desired = bool(data.get('start_on_boot', False))
+    desired = bool(data.get('start_on_boot', True))
     # Update config.json
     try:
         cfg = safe_load_json(CONFIG_FILE, {})
@@ -12159,7 +17714,7 @@ def keepalive_worker():
             time.sleep(10)
 
 def main():
-    global interface, restart_count, server_start_time, reset_event
+    global interface, restart_count, server_start_time, reset_event, ALARM_TIMER_MANAGER
     server_start_time = server_start_time or datetime.now(timezone.utc)
     restart_count += 1
     add_script_log(f"Server restarted. Restart count: {restart_count}")
@@ -12199,11 +17754,23 @@ def main():
     # Start keepalive worker to prevent USB idle timeout without RF noise
     threading.Thread(target=keepalive_worker, daemon=True).start()
 
+    if ALARM_TIMER_MANAGER is None:
+        try:
+            ALARM_TIMER_MANAGER = AlarmTimerManager(
+                storage_path="data/alarms_timers.json",
+                clean_log=clean_log,
+                send_direct_fn=send_direct_chunks,
+            )
+            ALARM_TIMER_MANAGER.start()
+        except Exception:
+            pass
+
     # Start monitors (connection watchdog and scheduled refresh)
     threading.Thread(target=connection_monitor, args=(20,), daemon=True).start()
     threading.Thread(target=scheduled_refresh_monitor, daemon=True).start()
     # Heartbeat thread for visibility
     threading.Thread(target=heartbeat_worker, args=(30,), daemon=True).start()
+    threading.Thread(target=location_cleanup_worker, daemon=True).start()
 
     while True:
         try:
@@ -12230,6 +17797,11 @@ def main():
             print("Subscribing to on_receive callback...")
             # Only subscribe to the main topic to avoid duplicate callbacks
             pub.subscribe(on_receive, "meshtastic.receive")
+            try:
+                if ALARM_TIMER_MANAGER is not None:
+                    ALARM_TIMER_MANAGER.set_interface(interface)
+            except Exception:
+                pass
             clean_log(f"AI provider: {AI_PROVIDER}", "🧠", show_always=True)
             if HOME_ASSISTANT_ENABLED:
                 print(f"Home Assistant multi-mode is ENABLED. Channel index: {HOME_ASSISTANT_CHANNEL_INDEX}")

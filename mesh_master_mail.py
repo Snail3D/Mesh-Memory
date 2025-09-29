@@ -6,10 +6,12 @@ import json
 import os
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 LockType = threading.Lock
+
+MAIL_RETENTION_SECONDS = 30 * 24 * 60 * 60  # 30 days
 
 
 class MailStore:
@@ -47,6 +49,58 @@ class MailStore:
                 self._data = {}
         except Exception:
             self._data = {}
+        with self._lock:
+            if self._prune_locked():
+                self._persist()
+
+    def _parse_timestamp(self, value: Any) -> Optional[datetime]:
+        if not value:
+            return None
+        if isinstance(value, (int, float)):
+            try:
+                return datetime.fromtimestamp(float(value), tz=timezone.utc)
+            except Exception:
+                return None
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                if text.endswith('Z'):
+                    text = text[:-1] + '+00:00'
+                dt = datetime.fromisoformat(text)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+            except Exception:
+                return None
+        return None
+
+    def _is_mail_expired(self, timestamp: Any) -> bool:
+        ts = self._parse_timestamp(timestamp)
+        if ts is None:
+            return False
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=MAIL_RETENTION_SECONDS)
+        return ts < cutoff
+
+    def _prune_locked(self) -> bool:
+        """Remove messages older than the retention window. Returns True if data changed."""
+        changed = False
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=MAIL_RETENTION_SECONDS)
+        for mailbox, messages in list(self._data.items()):
+            if not isinstance(messages, list):
+                continue
+            filtered: List[dict] = []
+            for msg in messages:
+                timestamp = msg.get('timestamp')
+                ts = self._parse_timestamp(timestamp)
+                if ts is not None and ts < cutoff:
+                    changed = True
+                    continue
+                filtered.append(msg)
+            if len(filtered) != len(messages):
+                self._data[mailbox] = filtered
+        return changed
 
     def _persist(self) -> None:
         tmp_path = f"{self._path}.tmp"
@@ -88,6 +142,8 @@ class MailStore:
         entry.setdefault("id", str(uuid.uuid4()))
         key = self._mailbox_key(mailbox_name)
         with self._lock:
+            if self._prune_locked():
+                self._persist()
             messages = self._data.get(key)
             created = False
             if messages is None:
@@ -107,6 +163,8 @@ class MailStore:
     def get_last(self, mailbox: str, limit: int = 3) -> List[dict]:
         key = self._mailbox_key(mailbox)
         with self._lock:
+            if self._prune_locked():
+                self._persist()
             items = self._data.get(key, [])
             if limit <= 0:
                 return []
@@ -115,6 +173,8 @@ class MailStore:
     def get_all(self, mailbox: str) -> List[dict]:
         key = self._mailbox_key(mailbox)
         with self._lock:
+            if self._prune_locked():
+                self._persist()
             items = self._data.get(key, [])
             return [dict(item) for item in items]
 
@@ -126,6 +186,8 @@ class MailStore:
     def mailbox_count(self, mailbox: str) -> int:
         key = self._mailbox_key(mailbox)
         with self._lock:
+            if self._prune_locked():
+                self._persist()
             return len(self._data.get(key, []))
 
     def clear_mailbox(self, mailbox: str) -> bool:

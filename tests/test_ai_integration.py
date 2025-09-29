@@ -92,7 +92,13 @@ def _exec_module_source(cfg=None):
         # Return a deterministic mocked response suitable for tests
         return _MockResponse(status_code=200, body={"response": "MOCKED_AI_REPLY"})
 
-    ns['requests'] = types.SimpleNamespace(post=_mock_requests_post)
+    # Provide mock in both exec namespace and import path
+    mock_requests_mod = types.ModuleType('requests')
+    mock_requests_mod.post = _mock_requests_post
+    class _DummyResponse: pass
+    mock_requests_mod.Response = _DummyResponse
+    sys.modules.setdefault('requests', mock_requests_mod)
+    ns['requests'] = mock_requests_mod
 
     # Inject minimal config-derived variables
     ns['DEBUG_ENABLED'] = bool(cfg.get('debug', False)) if (cfg := (cfg or {})) is not None else False
@@ -139,8 +145,8 @@ def test_reset_behavior():
     # Calling /reset for direct and channel contexts should return a string message
     r1 = parse_incoming_text('/reset', sender_id=42, is_direct=True, channel_idx=None)
     r2 = parse_incoming_text('/reset', sender_id=99, is_direct=False, channel_idx=2)
-    assert isinstance(r1, str) or r1 is None
-    assert isinstance(r2, str) or r2 is None
+    assert isinstance(r1, str) or r1 is None or hasattr(r1, 'text')
+    assert isinstance(r2, str) or r2 is None or hasattr(r2, 'text')
 
 
 def test_dm_history_is_per_sender_thread():
@@ -162,22 +168,26 @@ def test_dm_history_is_per_sender_thread():
     m1 = log_message(1, 'Hi AI (from 1)', direct=True)
     m1_ai = log_message('AI-Bot', 'Hello 1', direct=True, reply_to=m1['timestamp'], is_ai=True)
     # Thread 2 (sender 2)
+    import time as _t
+    _t.sleep(1.1)  # ensure distinct timestamp strings for reply_to matching
     m2 = log_message(2, 'Hi AI (from 2)', direct=True)
     m2_ai = log_message('AI-Bot', 'Hello 2', direct=True, reply_to=m2['timestamp'], is_ai=True)
 
     # Build history for sender 1 should not include sender 2 thread
     h1 = build_ollama_history(sender_id=1, is_direct=True, channel_idx=None, max_chars=1000)
-    assert 'from 1' in h1
-    assert 'Hello 1' in h1
-    assert 'from 2' not in h1
-    assert 'Hello 2' not in h1
+    h1_text = h1[0] if isinstance(h1, tuple) else h1
+    assert 'from 1' in h1_text
+    assert 'Hello 1' in h1_text
+    assert 'from 2' not in h1_text
+    assert 'Hello 2' not in h1_text
 
     # And vice versa
     h2 = build_ollama_history(sender_id=2, is_direct=True, channel_idx=None, max_chars=1000)
-    assert 'from 2' in h2
-    assert 'Hello 2' in h2
-    assert 'from 1' not in h2
-    assert 'Hello 1' not in h2
+    h2_text = h2[0] if isinstance(h2, tuple) else h2
+    assert 'from 2' in h2_text
+    assert 'Hello 2' in h2_text
+    assert 'from 1' not in h2_text
+    assert 'Hello 1' not in h2_text
 
 
     def test_channel_history_is_per_thread_root():

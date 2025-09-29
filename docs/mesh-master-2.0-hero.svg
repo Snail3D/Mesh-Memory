@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" role="img" aria-labelledby="title desc">
+  <title id="title">Mesh Master 2.0 hero artwork</title>
+  <desc id="desc">Night gradient background with stylised radio mesh nodes orbiting the Mesh Master 2.0 title.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#090e1a"/>
+      <stop offset="55%" stop-color="#11213c"/>
+      <stop offset="100%" stop-color="#1d3a52"/>
+    </linearGradient>
+    <radialGradient id="pulse" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%" stop-color="#5fe3ff" stop-opacity="0.45"/>
+      <stop offset="100%" stop-color="#5fe3ff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="core" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%" stop-color="#9cf7ff"/>
+      <stop offset="100%" stop-color="#42a9ff"/>
+    </radialGradient>
+  </defs>
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <g fill="#0f1f33" opacity="0.65">
+    <circle cx="180" cy="520" r="140"/>
+    <circle cx="1120" cy="500" r="180"/>
+    <circle cx="420" cy="120" r="220"/>
+  </g>
+  <g fill="#ffffff" opacity="0.28">
+    <circle cx="256" cy="180" r="2"/>
+    <circle cx="420" cy="60" r="2.5"/>
+    <circle cx="1080" cy="140" r="2.5"/>
+    <circle cx="940" cy="420" r="2.5"/>
+    <circle cx="720" cy="120" r="2"/>
+    <circle cx="320" cy="400" r="2"/>
+    <circle cx="560" cy="500" r="2.5"/>
+    <circle cx="860" cy="280" r="3"/>
+    <circle cx="1040" cy="360" r="2.2"/>
+  </g>
+  <g fill="none" stroke="#45c4ff" stroke-width="1.2" stroke-dasharray="6 10" opacity="0.65">
+    <path d="M340 340 C520 160, 760 160, 940 320"/>
+    <path d="M240 440 C520 520, 760 520, 1040 420"/>
+    <path d="M220 240 C420 80, 860 80, 1060 260"/>
+  </g>
+  <g>
+    <g transform="translate(380 180)">
+      <text x="0" y="0" fill="#8ad9ff" font-family="'Orbitron', 'Segoe UI', sans-serif" font-size="32" letter-spacing="6">OFF-GRID AI SUITE</text>
+      <text x="-20" y="115" fill="#f7fbff" font-family="'Russo One', 'Segoe UI', sans-serif" font-size="120" letter-spacing="4">MESH MASTER</text>
+      <text x="-20" y="205" fill="#89f5ff" font-family="'Russo One', 'Segoe UI', sans-serif" font-size="96" letter-spacing="8">2.0</text>
+      <text x="-18" y="260" fill="#b5d7f5" font-family="'Montserrat', 'Segoe UI', sans-serif" font-size="26">Persistent memory · Mesh mail hub · Cooperative games · Real-time ops</text>
+    </g>
+  </g>
+  <g transform="translate(160 420)">
+    <circle r="80" fill="url(#pulse)"/>
+    <circle r="34" fill="url(#core)"/>
+    <path d="M-32 -12 L-6 -12 L-6 -30 L6 -30 L6 -12 L32 -12 L32 12 L6 12 L6 30 L-6 30 L-6 12 L-32 12 Z" fill="#06152b"/>
+    <path d="M-20 -40 C-4 -32, 4 -32, 20 -40" stroke="#5fe3ff" stroke-width="4" fill="none" stroke-linecap="round"/>
+    <path d="M-20 40 C-4 32, 4 32, 20 40" stroke="#5fe3ff" stroke-width="4" fill="none" stroke-linecap="round"/>
+  </g>
+  <g transform="translate(1080 360)">
+    <circle r="90" fill="url(#pulse)"/>
+    <circle r="40" fill="url(#core)"/>
+    <path d="M-26 -12 L-8 -12 L-8 -36 L8 -36 L8 -12 L26 -12 L26 12 L8 12 L8 36 L-8 36 L-8 12 L-26 12 Z" fill="#06152b"/>
+    <circle cx="-46" cy="0" r="6" fill="#5fe3ff"/>
+    <circle cx="46" cy="0" r="6" fill="#5fe3ff"/>
+    <path d="M-46 0 Q0 -34 46 0" stroke="#5fe3ff" stroke-width="4" fill="none" stroke-linecap="round"/>
+  </g>
+</svg>

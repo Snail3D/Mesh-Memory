@@ -4,6 +4,7 @@ from .mail_manager import MailManager
 from .replies import PendingReply
 from .games import GameManager
 from .offline_wiki import OfflineWikiStore, OfflineWikiArticle
+from .onboarding_manager import OnboardingManager
 
 __all__ = [
     "MailManager",
@@ -11,4 +12,5 @@ __all__ = [
     "GameManager",
     "OfflineWikiStore",
     "OfflineWikiArticle",
+    "OnboardingManager",
 ]
