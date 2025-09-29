@@ -1,6 +1,6 @@
-# MESH MASTER v2.0.0 — Off-Grid AI Operations Suite
+# MESH MASTER v1.99.0 — Off-Grid AI Operations Suite
 
-**MESH MASTER 2.0** is the next evolution of the Mesh-AI project: a resilient AI copilot for Meshtastic LoRa meshes that remembers conversations, coordinates teams, and keeps the network moving even when the wider internet is gone. Version 2.0 doubles down on collaboration with the new Mesh Mail hub, a suite of llama-powered games for morale and training, richer offline knowledge, and a refreshed web command center.
+**MESH MASTER 1.99** is the next evolution of the Mesh-AI project: a resilient AI copilot for Meshtastic LoRa meshes that remembers conversations, coordinates teams, and keeps the network moving even when the wider internet is gone. Version 1.99 doubles down on collaboration with the new Mesh Mail hub, a suite of llama-powered games for morale and training, richer offline knowledge, and a refreshed web command center.
 
 > **Disclaimer**  
 > This project is an independent community effort and is **not associated** with the official Meshtastic project. Always maintain backup communication paths for real emergencies.
@@ -9,7 +9,7 @@
 
 ---
 
-## 2.0 Headline Upgrades
+## 1.99 Headline Upgrades
 - **Mesh Mail** — PIN-protected inboxes, multi-user notifications, and one-shot llama summaries keep longer messages flowing across the mesh.
 - **Game Hub** — Chess & Checkers duels, Blackjack, Yahtzee rounds, Tic-Tac-Toe, Hangman, Wordle, Word Ladder, Adventure stories, Cipher drills, Bingo, Morse, Rock–Paper–Scissors, Coinflip, Quiz Battle, and more—all DM-friendly and multilingual.
 - **Adaptive Personalities & Context Capsules** — `/aipersonality` and `/save`/`/recall` tune the assistant instantly while persistent archives keep continuity across restarts.
