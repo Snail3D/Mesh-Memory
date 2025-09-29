@@ -24,7 +24,7 @@
 ### Persistent Mesh Intelligence
 - End-to-end message history survives restarts (`messages_archive.json`) with configurable limits.  
 - Background async workers keep RX/TX responsive while Ollama generates replies.  
-- System prompt, personalities, and MOTD can be adjusted at runtime via DM-only admin commands.
+- Tone and personalities can be adjusted at runtime with `/vibe`; the core system prompt is fixed. MOTD can be updated via DM-only admin commands.
 
 ### Mesh Mail & Collaboration
 - Direct-message `/m mailbox message` to drop mail; guided flow creates boxes, sets optional PINs, and captures owner metadata.  
@@ -126,11 +126,11 @@ Create the `state` directory (and `touch` the files listed above) before the fir
 
 - **AI conversations** — `/ai`, `/bot`, `/query`, or `/data` (DM or configured channels).  
 - **Mesh mail** — `/m <mailbox> <message>`, `/c <mailbox> [question]`, `/emailhelp`, `/wipe ...`.  
-- **Quick knowledge** — `/bible`, `/chucknorris`, `/elpaso`, `/meshtastic`, `/offline wiki`, `/web <query>`, `/wiki <topic>`.  
+- **Quick knowledge** — `/bible`, `/chucknorris`, `/elpaso`, `/meshtastic`, `/offline wiki`, `/web <query>`, `/wiki <topic>`, `/drudge`, `/weather`.  
 - **Personality & context** — `/aipersonality` (list/set/prompt/reset), `/save [topic]`, `/recall <topic>`, `/exit`.  
 - **Games** — `/games`, `/hangman start`, `/wordle start`, `/wordladder start cold warm`, `/adventure start`, `/cipher start`, `/quizbattle start`, `/morse start`, `/rps`, `/coinflip`.  
 - **Location & status** — `/test`, `/motd`, Meshtastic “Request Position,” `/reset`, `/about`.  
-- **Admin (DM-only)** — `/changeprompt`, `/changemotd`, `/showprompt`, `/printprompt`.
+- **Admin (DM-only)** — `/vibe`, `/changemotd`, `/showprompt`, `/printprompt`.
 
 All commands are case-insensitive. Special commands buffer ~3 seconds before responding to reduce radio congestion.
 
@@ -181,7 +181,7 @@ Additional knobs:
 - **Feature toggles:** `feature_flags.json` can disable commands or switch `message_mode` to `broadcast`, `dm`, or `both`.  
 - **Offline wiki:** configure `offline_wiki_dir`, `offline_wiki_summary_chars`, and `offline_wiki_context_chars` to control local article size.
 
-Remember to restart the service (or use `/changeprompt`/`/changemotd`) after editing configs that lack runtime setters.
+Remember to restart the service after editing configs that lack runtime setters.
 
 ---
 

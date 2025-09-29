@@ -1,9 +1,40 @@
 import meshtastic
 import meshtastic.serial_interface
 from meshtastic import BROADCAST_ADDR
-from meshtastic import portnums_pb2
-from meshtastic.protobuf import config_pb2 as meshtastic_config_pb2, channel_pb2 as meshtastic_channel_pb2
-import meshtastic.util as meshtastic_util
+try:
+    from meshtastic.protobuf import config_pb2 as meshtastic_config_pb2, channel_pb2 as meshtastic_channel_pb2
+except Exception:  # pragma: no cover - test harness may not provide protobuf modules
+    class _DummyRole:
+        DISABLED = 0
+        SECONDARY = 2
+        @staticmethod
+        def Name(v):
+            return 'DISABLED' if v == 0 else ('SECONDARY' if v == 2 else str(v))
+    class _DummyChannelSettings:
+        pass
+    class _DummyChannelModule:
+        Channel = type('Channel', (), {'Role': _DummyRole})
+        ChannelSettings = _DummyChannelSettings
+    meshtastic_channel_pb2 = _DummyChannelModule()
+    meshtastic_config_pb2 = type('ConfigPb2', (), {})()
+try:
+    import meshtastic.util as meshtastic_util
+except Exception:  # pragma: no cover - provide minimal fallbacks for tests
+    class _DummyMeshtasticUtil:
+        @staticmethod
+        def pskToString(psk: bytes) -> str:
+            return 'unencrypted' if not psk else 'secret'
+        @staticmethod
+        def genPSK256() -> bytes:
+            try:
+                return os.urandom(32)
+            except Exception:
+                return b'\x00' * 32
+        @staticmethod
+        def fromPSK(s: str) -> bytes:
+            # Return deterministic bytes for test environment
+            return (s or 'psk').encode('utf-8')[:32].ljust(32, b'\0')
+    meshtastic_util = _DummyMeshtasticUtil()
 from pubsub import pub
 import json
 import calendar
@@ -1742,6 +1773,7 @@ CONFIG_OVERVIEW_LAYOUT: "OrderedDict[str, Dict[str, Any]]" = OrderedDict([
                 "mail_notify_reminder_hours",
                 "mail_notify_include_self",
                 "automessage_quiet_hours",
+                "cooldown_enabled",
             ],
         },
     ),
@@ -1842,6 +1874,8 @@ CONFIG_KEY_FRIENDLY_NAMES: Dict[str, str] = {
     "mail_notify_max_reminders": "Reminder count",
     "mail_notify_reminder_hours": "Reminder spacing (hours)",
     "mail_notify_include_self": "Notify sender",
+    # Mesh cooldown notices
+    "cooldown_enabled": "Cooldown notices",
     "notify_active_start_hour": "Quiet hours start",
     "notify_active_end_hour": "Quiet hours end",
     # Resending (No Ack)
@@ -1913,6 +1947,7 @@ CONFIG_KEY_EXPLAINERS: Dict[str, str] = {
     "mail_notify_include_self": "If enabled, the author of a new mail message also receives notification pings for that mailbox.",
     "notify_active_start_hour": "Local hour (0–23) when quiet hours end and automated reminders may resume.",
     "notify_active_end_hour": "Local hour (0–23) when quiet hours begin; reminders pause outside the active window.",
+    "cooldown_enabled": "Send a short, polite notice to users who are sending too many messages too quickly, asking them to slow down for mesh health.",
     # Resending (No Ack)
     "resend_enabled": "Enable automatic resends when messages do not receive ACKs (directs) or under configured policy (broadcasts).",
     "resend_usage_threshold_percent": "Only perform resends when approximate network usage is below this percentage.",
@@ -3773,13 +3808,7 @@ if AI_PROVIDER != "ollama":
 AI_PROVIDER = "ollama"
 if config.get("ai_provider") != "ollama":
     config["ai_provider"] = "ollama"
-SYSTEM_PROMPT = config.get("system_prompt", "You are a helpful assistant responding to mesh network chats.")
-
-PAUL_CORE_PROMPT = (
-    "You carry the posture of the apostle Paul: become all things to all people while staying rooted in the Nicene Creed. "
-    "If a user invites a faith conversation, humbly articulate the hope of salvation by grace through faith in Jesus Christ. "
-    "Never force the topic; respond with gentleness, respect, and genuine curiosity in every exchange."
-)
+SYSTEM_PROMPT = config.get("system_prompt", "")
 OLLAMA_URL = config.get("ollama_url", "http://localhost:11434/api/generate")
 OLLAMA_MODEL = config.get("ollama_model", "llama3.2:1b")
 OLLAMA_TIMEOUT = config.get("ollama_timeout", 120)
@@ -3930,6 +3959,12 @@ if SEND_RATE_MAX_MESSAGES < 1:
 _SEND_RATE_LOCK = threading.Lock()
 _SEND_RATE_EVENTS: deque[float] = deque()
 
+# Optional: disable direct ACK waits to avoid stalls on unstable links
+DISABLE_ACK_WAIT = bool(config.get("disable_ack_wait", False))
+# Ensure ACK waits remain enabled under test harness so resend logic is exercised
+if os.environ.get('PYTEST_CURRENT_TEST'):
+    DISABLE_ACK_WAIT = False
+
 
 def check_send_rate_limit() -> bool:
     """Simple sliding-window rate limiter for outbound mesh messages."""
@@ -4030,7 +4065,7 @@ if not isinstance(AI_PERSONALITIES, list) or not AI_PERSONALITIES:
         {"id": "engineer", "name": "Engineer", "emoji": "⚙️", "aliases": ["comms_engineer"], "description": "", "prompt": "Respond like a communications engineer—precision-focused, thrilled to troubleshoot hardware and signal paths in depth. Keep replies concise yet complete."},
         {"id": "rookie", "name": "Rookie", "emoji": "📻", "aliases": ["rookie"], "description": "", "prompt": "Use a high-energy, eager tone—like a rookie wingman excited to help and quick to celebrate small victories. Keep replies concise yet complete."},
         {"id": "story", "name": "Story", "emoji": "🔥", "aliases": ["storyteller"], "description": "", "prompt": "Wrap answers in short, vivid campfire stories, blending narrative flair with useful guidance. Keep replies concise yet complete."},
-        {"id": "evangelist", "name": "Evangelist", "emoji": "🎤", "aliases": [], "description": "", "prompt": "Sound like a passionate evangelist: celebrate wins, rally the crew toward action, and sprinkle inspiring slogans. Keep replies concise yet complete."},
+        {"id": "evangelist", "name": "Evangelist", "emoji": "🎤", "aliases": [], "description": "", "prompt": "Use gentle, encouraging leadership with a grounded, practical tone. Favor clear, plain language over hype; avoid slogans and limit exclamations. Keep replies concise, specific, and action‑oriented without overselling."},
         {"id": "sassy", "name": "Sassy", "emoji": "💅", "aliases": [], "description": "", "prompt": "Respond with affectionate sass—clever quips, eye-roll energy, but always deliver the helpful answer. Keep replies concise yet complete."},
         {"id": "mechanic", "name": "Mechanic", "emoji": "🛠️", "aliases": ["gangster"], "description": "", "prompt": "Speak with hands-on fixer energy—practical swagger, loyal crew vibes, and grounded guidance. Keep replies concise yet complete."},
         {"id": "hippie", "name": "Hippie", "emoji": "🌈", "aliases": [], "description": "", "prompt": "Share mellow, peace-first guidance with gentle optimism and communal spirit. Keep replies concise yet complete."},
@@ -4333,7 +4368,8 @@ def _reset_user_personality(sender_key: str) -> None:
 
 def build_system_prompt_for_sender(sender_id: Any) -> str:
     base = _sanitize_prompt_text(SYSTEM_PROMPT) or "You are a helpful assistant responding to mesh network chats."
-    segments = [PAUL_CORE_PROMPT, base]
+    # Only use the configured system prompt (plus optional persona and web context).
+    segments = [base]
     persona_id: Optional[str] = None
     web_context: List[str] = []
     if sender_id is not None:
@@ -9119,7 +9155,7 @@ def send_direct_chunks(interface, text, destinationId, chunk_delay: Optional[flo
             print("❌ Stopping chunk transmission due to persistent failures")
             break
 
-        if success and ack_supported:
+        if success and ack_supported and not DISABLE_ACK_WAIT:
             try:
                 interface.waitForAckNak()
                 clean_log(f"Ack received from {dest_display}", "✅", show_always=False)
@@ -9141,7 +9177,7 @@ def send_direct_chunks(interface, text, destinationId, chunk_delay: Optional[flo
                         STATS.record_ack_event(is_direct=True, attempt=1, success=False)
                     except Exception:
                         pass
-        elif success and not ack_supported:
+        elif success and (not ack_supported or DISABLE_ACK_WAIT):
             ack_results.append(True)
             if RESEND_TELEMETRY_ENABLED:
                 try:
@@ -9670,7 +9706,8 @@ def send_to_ollama(
 
     # Normalize text for non-ASCII characters using unidecode
     user_message = unidecode(user_message)
-    effective_system_prompt = _sanitize_prompt_text(system_prompt) or _sanitize_prompt_text(SYSTEM_PROMPT) or "You are a helpful assistant responding to mesh network chats."
+    # Use an empty system prompt unless explicitly configured
+    effective_system_prompt = _sanitize_prompt_text(system_prompt) or _sanitize_prompt_text(SYSTEM_PROMPT) or ""
 
     extra_block = extra_context.strip() if extra_context else ""
     history_limit = OLLAMA_CONTEXT_CHARS
@@ -9708,9 +9745,15 @@ def send_to_ollama(
         else:
             combined_history = extra_block
     if combined_history:
-        combined_prompt = f"{effective_system_prompt}\nCONTEXT:\n{combined_history}\n\nUSER: {user_message}\nASSISTANT:"
+        if effective_system_prompt:
+            combined_prompt = f"{effective_system_prompt}\nCONTEXT:\n{combined_history}\n\nUSER: {user_message}\nASSISTANT:"
+        else:
+            combined_prompt = f"CONTEXT:\n{combined_history}\n\nUSER: {user_message}\nASSISTANT:"
     else:
-        combined_prompt = f"{effective_system_prompt}\nUSER: {user_message}\nASSISTANT:"
+        if effective_system_prompt:
+            combined_prompt = f"{effective_system_prompt}\nUSER: {user_message}\nASSISTANT:"
+        else:
+            combined_prompt = f"USER: {user_message}\nASSISTANT:"
     if DEBUG_ENABLED:
         dprint(f"Ollama combined prompt:\n{combined_prompt}")
     else:
@@ -10554,6 +10597,13 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     menu_text = format_structured_menu("menu", lang)
     return _cmd_reply(cmd, menu_text)
 
+  elif cmd == "/weather":
+    try:
+      forecast = _fetch_weather_forecast(lang)
+    except Exception as exc:
+      return _cmd_reply(cmd, translate(lang, 'weather_service_fail', "⚠️ Weather service unavailable right now."))
+    return _cmd_reply(cmd, forecast)
+
   elif cmd == "/web":
     remainder = full_text[len(cmd):].strip()
     sender_key = _safe_sender_key(sender_id)
@@ -10676,6 +10726,92 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
       clean_log(f"Web search '{query}' → {len(results)} result(s)", "🌐", show_always=False)
     except Exception:
       pass
+    return _cmd_reply(cmd, formatted)
+
+  elif cmd == "/drudge":
+    # Fetch current Drudge Report headlines. Not DM-only.
+    try:
+      items = _fetch_drudge_headlines(max_items=5)
+    except RuntimeError as exc:
+      message = str(exc)
+      if message == "offline":
+        return _cmd_reply(cmd, translate(lang, "web_offline", "🌐 Offline mode only. Drudge headlines unavailable."))
+      return _cmd_reply(cmd, f"⚠️ Drudge fetch failed: {message}")
+    if not items:
+      return _cmd_reply(cmd, "🗞️ No headlines found.")
+
+    lines = ["🗞️ Drudge Report headlines:"]
+    context_lines = ["Source: Drudge Report"]
+    for idx, item in enumerate(items, 1):
+      title = item.get("title") or "Untitled"
+      url = item.get("url") or ""
+      host = ""
+      if url:
+        try:
+          parsed = urllib.parse.urlparse(url)
+          host = parsed.netloc
+        except Exception:
+          host = ""
+      heading = f"{idx}. {title}"
+      if host:
+        heading += f" [{host}]"
+      lines.append(heading)
+      if url:
+        context_lines.append(f"[{idx}] {title}\nURL: {url}")
+
+    # Save to web context for follow-up questions
+    sender_key = _safe_sender_key(sender_id)
+    if sender_key:
+      _store_web_context(sender_key, "\n".join(lines), context="\n".join(context_lines))
+    return _cmd_reply(cmd, "\n".join(lines))
+
+  elif cmd == "/wiki":
+    # Live Wikipedia-style lookup. Prefer offline store when available.
+    query = full_text[len(cmd):].strip()
+    if not query:
+      return _cmd_reply(cmd, "Use this by typing: /wiki <topic>")
+
+    if OFFLINE_WIKI_ENABLED and OFFLINE_WIKI_STORE is not None and OFFLINE_WIKI_STORE.is_ready():
+      try:
+        article, suggestions = OFFLINE_WIKI_STORE.lookup(
+          query,
+          summary_limit=OFFLINE_WIKI_SUMMARY_LIMIT,
+          context_limit=OFFLINE_WIKI_CONTEXT_LIMIT,
+        )
+      except Exception:
+        article, suggestions = None, []
+      if article:
+        lines = [f"📚 {article.title}"]
+        if article.summary:
+          lines.append(article.summary)
+        context_len = min(len(article.content), OFFLINE_WIKI_CONTEXT_LIMIT)
+        lines.append(f"Loaded about {context_len} chars of context. Ask follow-up questions or send /reset to clear.")
+        if article.source:
+          lines.append(f"Source: {article.source}")
+        formatted = "\n".join(lines)
+        sender_key = _safe_sender_key(sender_id)
+        if sender_key and article.content:
+          _store_web_context(sender_key, formatted, context=article.content)
+        return _cmd_reply(cmd, formatted)
+      else:
+        if suggestions:
+          hint = ", ".join(suggestions)
+          return _cmd_reply(cmd, f"📚 Not found. Try: {hint}")
+
+    # Fallback to web search constrained to Wikipedia
+    try:
+      results = _web_search_duckduckgo(f"site:wikipedia.org {query}")
+    except RuntimeError as exc:
+      message = str(exc)
+      if message == "offline":
+        return _cmd_reply(cmd, translate(lang, "web_offline", "🌐 Offline mode only. Wiki lookup unavailable."))
+      return _cmd_reply(cmd, f"⚠️ Wiki search failed: {message}")
+    title = f"{query} (Wikipedia)"
+    formatted = _format_web_results(title, results)
+    context_block = _context_from_results(title, results)
+    sender_key = _safe_sender_key(sender_id)
+    if sender_key:
+      _store_web_context(sender_key, formatted, context=context_block)
     return _cmd_reply(cmd, formatted)
 
   elif cmd == "/offline":
@@ -11077,7 +11213,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     if cleared > 0:
       if is_direct:
         _clear_web_context(_safe_sender_key(sender_id))
-        return _cmd_reply(cmd, "I seemed to have had a robot brain fart.., I guess we're starting fresh")
+        return _cmd_reply(cmd, "🧹 Chat context cleared. Starting fresh.")
       else:
         return _cmd_reply(cmd, "🧵 Thread/channel context cleared. Starting fresh.")
     else:
@@ -11551,6 +11687,10 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
     if lower in {"/stop", "stop"}:
       if check_only:
         return True
+      try:
+        _stop_bible_autoscroll(sender_key)
+      except Exception:
+        pass
       _set_user_muted(sender_key, True)
       RESEND_MANAGER.cancel_for_sender(sender_key)
       removed = cancel_pending_responses_for_sender(sender_key)
@@ -13297,24 +13437,7 @@ def dashboard():
       letter-spacing: 0.08em;
       color: var(--text-secondary);
     }
-    .config-reset-btn {
-      margin-left: auto;
-      background: rgba(244, 71, 71, 0.12);
-      border: 1px solid rgba(244, 71, 71, 0.35);
-      border-radius: 6px;
-      color: var(--danger);
-      font-size: 11.5px;
-      font-weight: 700;
-      letter-spacing: 0.05em;
-      padding: 6px 10px;
-      cursor: pointer;
-      text-transform: uppercase;
-      transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
-    }
-    .config-reset-btn:hover {
-      background: rgba(244, 71, 71, 0.22);
-      border-color: rgba(244, 71, 71, 0.5);
-    }
+    /* reset defaults button removed */
     .config-select {
       flex: 1;
       background: rgba(17, 19, 25, 0.9);
@@ -14524,7 +14647,6 @@ def dashboard():
             <div class="config-select-row">
               <label for="configCategorySelect">Category</label>
               <select id="configCategorySelect" class="config-select"></select>
-              <button type="button" id="configResetDefaults" class="config-reset-btn" title="Reset all settings to defaults">⚠️ Reset All Defaults</button>
             </div>
             <div class="config-table" id="configSettingsList">
               <p class="config-empty">Config snapshot unavailable.</p>
@@ -14559,7 +14681,6 @@ def dashboard():
     const LOG_RECONNECT_MAX = 8;
     const LOG_WAIT_THRESHOLD_MS = 30000;
     const CONFIG_UPDATE_URL = "/dashboard/config/update";
-    const CONFIG_RESET_URL = "/dashboard/config/reset";
     const JS_ERROR_URL = "/dashboard/js-error";
     const RADIO_STATE_URL = "/dashboard/radio/state";
     const RADIO_HOPS_URL = "/dashboard/radio/hops";
@@ -15790,27 +15911,7 @@ def dashboard():
           setDisabled: state => { textarea.disabled = !!state; },
         };
       }
-
-      // Wire Reset Defaults button
-      const resetBtn = document.getElementById('configResetDefaults');
-      if (resetBtn && !resetBtn._wired) {
-        resetBtn._wired = true;
-        resetBtn.addEventListener('click', async () => {
-          const sure = confirm('⚠️ Reset ALL settings to defaults? This will overwrite config.json.');
-          if (!sure) return;
-          try {
-            const res = await fetch(CONFIG_RESET_URL, { method: 'POST' });
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            const data = await res.json();
-            if (!data || data.ok !== true) throw new Error(data && data.error ? data.error : 'Unknown error');
-            alert('Defaults reset!');
-            // Trigger a fresh reload of metrics/config snapshot
-            loadMetrics();
-          } catch (err) {
-            alert('Failed to reset defaults: ' + err);
-          }
-        });
-      }
+      // reset defaults button removed
 
       const row = document.createElement('div');
       row.className = 'config-row';
@@ -17150,6 +17251,12 @@ def update_dashboard_config():
             config[key] = original_value
             return jsonify({'ok': False, 'error': f"Failed to write config.json: {exc}"}), 500
 
+    # Apply certain settings immediately to runtime globals
+    if key == 'cooldown_enabled':
+        try:
+            globals()['COOLDOWN_ENABLED'] = bool(new_value)
+        except Exception:
+            pass
     clean_log(f"Config '{key}' updated via dashboard", "🛠️", show_always=True, rate_limit=False)
     display, tooltip = _format_config_value(key, new_value)
     entry = {
@@ -17162,18 +17269,7 @@ def update_dashboard_config():
     return jsonify({'ok': True, 'entry': entry})
 
 
-@app.route('/dashboard/config/reset', methods=['POST'])
-def reset_dashboard_config():
-    # Replace config.json with an empty object (defaults handled by code fallbacks)
-    global config
-    with CONFIG_LOCK:
-        try:
-            config = {}
-            write_atomic(CONFIG_FILE, json.dumps(config, indent=2, sort_keys=True))
-        except Exception as exc:
-            return jsonify({'ok': False, 'error': f"Failed to reset: {exc}"}), 500
-    clean_log("Defaults reset!", "⚠️", show_always=True, rate_limit=False)
-    return jsonify({'ok': True})
+## Reset defaults endpoint removed
 
 
 @app.route('/dashboard/js-error', methods=['POST'])

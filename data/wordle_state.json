@@ -1,9 +1,16 @@
 {
   "current": {
     "completed": [],
-    "day_key": "2025-09-28",
-    "target": "crows",
+    "day_key": "2025-09-29",
+    "target": "pulse",
     "winners": []
   },
-  "history": []
+  "history": [
+    {
+      "completed": [],
+      "day_key": "2025-09-28",
+      "target": "crows",
+      "winners": []
+    }
+  ]
 }

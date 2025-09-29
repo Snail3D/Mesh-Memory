@@ -1,0 +1,567 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7b3b77e..b4808d0 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,11 @@
+ 
+ All notable changes to this project will be documented in this file.
+ 
++## [1.99.1] - 2025-09-29
++
++Fixes
++- Mesh Mail: Y/N reply to launch a new mailbox could be ignored in some cases. Routing now prioritizes pending mailbox creation confirmations (even if other flows are active) and accepts confirmations outside DMs. Also broadened confirmation parsing (supports "si"/"sí").
++
+ ## [1.99.0] - 2025-09-29
+ 
+ Highlights
+diff --git a/config.json b/config.json
+index 739208a..45ddc63 100644
+--- a/config.json
++++ b/config.json
+@@ -1,69 +1,27 @@
+ {
+-  "ai_node_name": "Mesh Master",
++  "ai_chill_mode": false,
+   "ai_provider": "ollama",
+-  "async_response_queue_max": 25,
+-  "bible_progress_file": "data/bible_progress.json",
+-  "channel_names": {
+-    "0": "LongFast",
+-    "1": "SnailNet",
+-    "2": "Channel 2",
+-    "3": "Channel 3",
+-    "4": "Channel 4",
+-    "5": "Channel 5",
+-    "6": "Channel 6",
+-    "7": "Channel 7",
+-    "8": "Channel 8",
+-    "9": "Channel 9"
+-  },
+-  "chunk_buffer_seconds": 1,
+-  "chunk_size": 200,
+-  "clean_logs": true,
+-  "debug": false,
+-  "default_personality_id": "trail_scout",
+-  "home_assistant_channel_index": 1,
+-  "home_assistant_enable_pin": false,
+-  "home_assistant_enabled": false,
+-  "home_assistant_secure_pin": "1234",
+-  "home_assistant_timeout": 90,
+-  "home_assistant_token": "INPUT HA TOKEN HERE",
+-  "home_assistant_url": "http://homeassistant.local:8123/api/conversation/process",
+-  "language_selection": "english",
+-  "local_location_string": "@East El Paso",
+-  "mail_search_timeout": 120,
+-  "mail_notify_enabled": true,
+-  "mail_notify_reminders_enabled": true,
+-  "mail_notify_reminder_hours": 1.0,
+-  "mail_notify_max_reminders": 3,
+-  "mail_notify_include_self": false,
++  "chunk_buffer_seconds": 8,
+   "mail_notify_quiet_hours_enabled": true,
+-  "mail_quiet_start_hour": 20,
+   "mail_quiet_end_hour": 8,
+-  "notify_active_start_hour": 8,
++  "mail_quiet_start_hour": 20,
++  "max_ai_chunks": 3,
++  "chunk_size": 160,
+   "notify_active_end_hour": 20,
+-  "max_ai_chunks": 5,
+-  "max_message_log": 0,
+-  "meshtastic_kb_cache_ttl": 600,
+-  "meshtastic_kb_max_context_chars": 3200,
+-  "meshtastic_knowledge_file": "data/meshtastic_knowledge.txt",
+-  "ollama_context_chars": 1600,
+-  "ollama_max_messages": 8,
+-  "ollama_model": "llama3.2:1b",
+-  "ollama_num_ctx": 1536,
+-  "ollama_timeout": 120,
+-  "ollama_url": "http://localhost:11434/api/generate",
+-  "ai_chill_mode": false,
+-  "ai_chill_queue_limit": 5,
+-  "reply_in_channels": true,
++  "notify_active_start_hour": 8,
++  "ollama_context_chars": 1500,
++  "ollama_num_ctx": 1500,
+   "reply_in_directs": true,
+-  "serial_baud": 38400,
+-  "serial_port": "/dev/serial/by-id/usb-RAKwireless_WisCore_RAK4631_Board_6E7F51E7975B5835-if00",
++  "resend_enabled": true,
++  "resend_usage_threshold_percent": 100.0,
++  "resend_dm_only": true,
++  "resend_broadcast_enabled": false,
++  "resend_system_attempts": 3,
++  "resend_system_interval_seconds": 15,
++  "resend_user_attempts": 3,
++  "resend_user_interval_seconds": 15,
++  "resend_suffix_enabled": true,
++  "reply_in_channels": true,
+   "start_on_boot": true,
+-  "system_prompt": "You are an offline chatbot serving a local meshtastic mesh network. Keep your responses concise by default unless the user asks for a longer response. Do your best to respond quickly.",
+-  "use_mesh_interface": false,
+-  "use_wifi": false,
+-  "user_ai_settings_file": "user_ai_settings.json",
+-  "wifi_host": "MESHTASTIC NODE IP HERE",
+-  "wifi_port": 4403
+-  ,
+-  "radio_settings_info": "Manage LoRa hop limit and channels in the Radio Settings panel."
++  "system_prompt": "You are a helpful assistant responding to mesh network chats."
+ }
+diff --git a/data/user_access.json b/data/user_access.json
+index d3fbaea..ea5e550 100644
+--- a/data/user_access.json
++++ b/data/user_access.json
+@@ -1,8 +1,10 @@
+ {
+   "muted": {
+-    "7": false
++    "7": false,
++    "!376be684": false
+   },
+   "blocked": {
+-    "7": false
++    "7": false,
++    "!376be684": false
+   }
+ }
+\ No newline at end of file
+diff --git a/data/wordle_state.json b/data/wordle_state.json
+index 3e66a78..0a911c6 100644
+--- a/data/wordle_state.json
++++ b/data/wordle_state.json
+@@ -1,9 +1,16 @@
+ {
+   "current": {
+     "completed": [],
+-    "day_key": "2025-09-28",
+-    "target": "crows",
++    "day_key": "2025-09-29",
++    "target": "pulse",
+     "winners": []
+   },
+-  "history": []
++  "history": [
++    {
++      "completed": [],
++      "day_key": "2025-09-28",
++      "target": "crows",
++      "winners": []
++    }
++  ]
+ }
+\ No newline at end of file
+diff --git a/mesh-master.py b/mesh-master.py
+index 8904d75..98c276a 100644
+--- a/mesh-master.py
++++ b/mesh-master.py
+@@ -1013,6 +1013,21 @@ def _display_sender_label(sender_key: Optional[str]) -> str:
+             pass
+     return str(sender_key)
+ 
++# Lightweight fallback for legacy trivia commands.
++def handle_trivia_command(cmd: str, category: str, args: str, sender_id, is_direct: bool, channel_idx, lang: str) -> str:
++    # Provide simple guidance to the current quiz engine.
++    # /quizbattle is the supported trivia game (DM only).
++    lines = [
++        "Trivia game is available via /quizbattle (DM only).",
++        "Commands:",
++        "• /quizbattle start — begin a rapid-fire round",
++        "• /quizbattle next — next question",
++        "• /quizbattle answer <number> — answer",
++        "• /quizbattle score — your best streak",
++        "• /quizbattle stop — end the round",
++    ]
++    return "\n".join(lines)
++
+ def clean_log(message, emoji="📝", show_always=False, rate_limit=True):
+     """Clean, emoji-enhanced logging for better human readability with rate limiting"""
+     message = _beautify_log_text(str(message))
+@@ -1775,6 +1790,80 @@ CONFIG_OVERVIEW_LAYOUT: "OrderedDict[str, Dict[str, Any]]" = OrderedDict([
+     ),
+ ])
+ 
++# Default values used to repopulate the dashboard when config keys are missing.
++DEFAULT_CONFIG_VALUES: Dict[str, Any] = {
++    # General
++    "debug": False,
++    "clean_logs": True,
++    "language_selection": "english",
++    "local_location_string": "",
++    "ai_node_name": "AI-Bot",
++    "start_on_boot": True,
++    "max_message_log": 10000,
++    "default_personality_id": "trail_scout",
++    "user_ai_settings_file": "user_ai_settings.json",
++    "mail_search_timeout": 120,
++    "async_response_queue_max": 20,
++    # Mesh Interface
++    "use_mesh_interface": True,
++    "serial_port": "",
++    "serial_baud": 921600,
++    # Wi-Fi
++    "use_wifi": False,
++    "wifi_host": "",
++    "wifi_port": 4403,
++    # AI Provider
++    "ai_provider": "ollama",
++    "system_prompt": "You are a helpful assistant responding to mesh network chats.",
++    "chunk_size": 200,
++    "max_ai_chunks": 5,
++    "chunk_buffer_seconds": 4,
++    "ai_chill_mode": False,
++    "ai_chill_queue_limit": 5,
++    # Ollama
++    "ollama_url": "http://localhost:11434/api/generate",
++    "ollama_model": "llama3.2:1b",
++    "ollama_timeout": 120,
++    "ollama_context_chars": 4000,
++    "ollama_num_ctx": 8192,
++    "ollama_max_messages": 20,
++    # Home Assistant
++    "home_assistant_enabled": False,
++    "home_assistant_url": "",
++    "home_assistant_token": "",
++    "home_assistant_timeout": 30,
++    "home_assistant_enable_pin": False,
++    "home_assistant_secure_pin": "1234",
++    "home_assistant_channel_index": -1,
++    # Messaging
++    "reply_in_channels": True,
++    "reply_in_directs": True,
++    "channel_names": {},
++    # Knowledge
++    "bible_progress_file": "data/bible_progress.json",
++    "meshtastic_knowledge_file": "data/meshtastic_knowledge.txt",
++    "meshtastic_kb_max_context_chars": 3200,
++    "meshtastic_kb_cache_ttl": 600,
++    # Automessages (quiet hours handled separately)
++    "mail_notify_enabled": True,
++    "mail_notify_reminders_enabled": True,
++    "mail_notify_max_reminders": 3,
++    "mail_notify_reminder_hours": 1.0,
++    "mail_notify_include_self": False,
++    # Resending (No Ack)
++    "resend_enabled": True,
++    "resend_usage_threshold_percent": 5.0,
++    "resend_dm_only": True,
++    "resend_broadcast_enabled": False,
++    "resend_suffix_enabled": True,
++    "resend_system_attempts": 3,
++    "resend_system_interval_seconds": 15,
++    "resend_user_attempts": 3,
++    "resend_user_interval_seconds": 15,
++    "resend_jitter_seconds": 8,
++    "resend_telemetry_enabled": True,
++}
++
+ CONFIG_HIDDEN_KEYS = {
+     "openai_api_key",
+     "openai_model",
+@@ -2018,6 +2107,30 @@ def _stringify_mapping(value: Dict[Any, Any]) -> str:
+ 
+ def _format_config_value(key: str, value: Any) -> Tuple[str, str]:
+     if key not in config:
++        # Populate from defaults if available so the UI isn't blank
++        if key in DEFAULT_CONFIG_VALUES:
++            dv = DEFAULT_CONFIG_VALUES.get(key)
++            if isinstance(dv, bool):
++                label = "Enabled" if dv else "Disabled"
++                return label, label
++            if isinstance(dv, (int, float)):
++                text = str(dv)
++                return text, text
++            if isinstance(dv, dict):
++                joined = _stringify_mapping(dv) if dv else "(empty)"
++                display = joined if len(joined) <= 80 else joined[:77].rstrip() + "…"
++                return display, joined
++            if isinstance(dv, (list, tuple, set)):
++                joined = ", ".join(str(item) for item in dv) if dv else "(empty)"
++                display = joined if len(joined) <= 80 else joined[:77].rstrip() + "…"
++                return display, joined
++            text = str(dv).strip()
++            if not text:
++                return "(empty)", "(empty)"
++            clean = text.replace("\n", " ⏎ ")
++            tooltip = clean
++            display = clean if len(clean) <= 120 else clean[:117].rstrip() + "…"
++            return display, tooltip
+         return "—", "—"
+     if value is None:
+         return "—", "—"
+@@ -2078,30 +2191,32 @@ def _build_config_overview() -> Dict[str, Any]:
+                 continue
+             if key in CONFIG_HIDDEN_KEYS:
+                 continue
+-            if key not in config:
+-                continue
++            present = key in config
+             seen.add(key)
+-            value = config.get(key)
+-            display, tooltip = _format_config_value(key, value)
++            if present:
++                val = config.get(key)
++            else:
++                val = DEFAULT_CONFIG_VALUES.get(key, None)
++            raw_val = "" if (val is None) else val
++            display, tooltip = _format_config_value(key, (val if present else None))
+             entries.append(
+                 {
+                     "key": key,
+                     "label": _humanize_config_key(key),
+                     "value": display,
+                     "tooltip": tooltip,
+-                    "raw": value,
+-                    "type": _config_value_kind(value),
++                    "raw": raw_val,
++                    "type": _config_value_kind(raw_val),
+                     "explainer": _build_config_explainer(key, display, tooltip),
+                 }
+             )
+-        if entries:
+-            sections.append(
+-                {
+-                    "id": section_id,
+-                    "label": section_info.get("label", section_id.replace("_", " ").title()),
+-                    "settings": entries,
+-                }
+-            )
++        sections.append(
++            {
++                "id": section_id,
++                "label": section_info.get("label", section_id.replace("_", " ").title()),
++                "settings": entries,
++            }
++        )
+ 
+     remaining_keys = [key for key in sorted(config.keys()) if key not in seen and key not in CONFIG_HIDDEN_KEYS]
+     if remaining_keys:
+@@ -10785,6 +10900,13 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
+     result = handle_trivia_command(cmd, category, args, sender_id, is_direct, channel_idx, lang)
+     return _cmd_reply(cmd, result)
+ 
++  elif cmd == "/weather":
++    msg = (
++      "🌦️ Weather command is offline in this build. "
++      "Use /whereami for GPS info, or set up a Home Assistant weather integration."
++    )
++    return _cmd_reply(cmd, msg)
++
+   elif cmd in ("/mathquiz", "/electricalquiz"):
+     category = {
+       "/mathquiz": "math",
+@@ -11016,8 +11138,28 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
+       return _cmd_reply(cmd, error_msg)
+ 
+   elif cmd == "/changeprompt":
+-    message = "🔒 The core system prompt is fixed. Use `/vibe set <name>` or `/vibe` to adjust tone."
+-    return _cmd_reply(cmd, message)
++    # Allow admins to update the overarching system prompt via DM
++    if not is_direct:
++      return _cmd_reply(cmd, translate(lang, 'dm_only', "❌ This command can only be used in a direct message."))
++    sender_key = _safe_sender_key(sender_id)
++    if not sender_key or sender_key not in AUTHORIZED_ADMINS:
++      return _cmd_reply(cmd, "🔒 Only admins can change the core system prompt.")
++    new_prompt = full_text[len(cmd):].strip()
++    if not new_prompt:
++      return _cmd_reply(cmd, "Usage: /changeprompt <your new system prompt>")
++    try:
++      # Persist to config.json and hot-apply
++      with CONFIG_LOCK:
++        config['system_prompt'] = new_prompt
++        write_atomic(CONFIG_FILE, json.dumps(config, indent=2, sort_keys=True))
++      try:
++        globals()['SYSTEM_PROMPT'] = new_prompt
++      except Exception:
++        pass
++      info_print(f"[Info] System prompt updated by {get_node_shortname(sender_id)}")
++      return _cmd_reply(cmd, translate(lang, 'changeprompt_success', "✅ System prompt updated."))
++    except Exception as e:
++      return _cmd_reply(cmd, translate(lang, 'changeprompt_error', "❌ Failed to update system prompt: {error}", error=e))
+ 
+   elif cmd in ["/showprompt", "/printprompt"]:
+     if not is_direct:
+@@ -11600,9 +11742,16 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
+   # If blocked, suppress everything except 'unblock' handled above
+   if sender_key and _is_user_blocked(sender_key):
+     return None if not check_only else False
+-  # If muted, suppress auto/AI replies; let commands still pass
++  # If muted, suppress auto/AI replies; let commands still pass.
++  # Exception: allow required replies to pending flows (e.g., mesh mail Y/N prompts).
+   if sender_key and _is_user_muted(sender_key) and not text.startswith('/'):
+-    return None if not check_only else False
++    try:
++      if MAIL_MANAGER and MAIL_MANAGER.has_pending_creation(sender_key):
++        pass  # allow this non-slash reply through
++      else:
++        return None if not check_only else False
++    except Exception:
++      return None if not check_only else False
+   if is_direct and message_mode == "channel_only":
+     if check_only:
+       return False
+@@ -11700,6 +11849,13 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
+     mailbox_reply = _handle_pending_mailbox_selection(sender_id, sender_key, text)
+     if mailbox_reply:
+       return mailbox_reply
++  # Prioritize mesh mail creation confirmations (Y/N) regardless of DM vs channel.
++  # This avoids losing the confirmation to other flows or AI handling.
++  if sender_key and MAIL_MANAGER.has_pending_creation(sender_key) and not text.startswith("/"):
++    if check_only:
++      return False
++    return MAIL_MANAGER.handle_creation_response(sender_key, text)
++  # Then handle onboarding session messages in DMs
+   if is_direct and sender_key and not text.startswith("/") and ONBOARDING_MANAGER.is_session_active(sender_key):
+     if check_only:
+       return False
+@@ -11715,10 +11871,6 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
+     )
+     if onboarding_reply:
+       return onboarding_reply
+-  if is_direct and sender_key and MAIL_MANAGER.has_pending_creation(sender_key) and not text.startswith("/"):
+-    if check_only:
+-      return False
+-    return MAIL_MANAGER.handle_creation_response(sender_key, text)
+   if is_direct and sender_key and sender_key in PENDING_WIPE_REQUESTS and not text.startswith("/"):
+     if check_only:
+       return False
+@@ -13297,24 +13449,8 @@ def dashboard():
+       letter-spacing: 0.08em;
+       color: var(--text-secondary);
+     }
+-    .config-reset-btn {
+-      margin-left: auto;
+-      background: rgba(244, 71, 71, 0.12);
+-      border: 1px solid rgba(244, 71, 71, 0.35);
+-      border-radius: 6px;
+-      color: var(--danger);
+-      font-size: 11.5px;
+-      font-weight: 700;
+-      letter-spacing: 0.05em;
+-      padding: 6px 10px;
+-      cursor: pointer;
+-      text-transform: uppercase;
+-      transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+-    }
+-    .config-reset-btn:hover {
+-      background: rgba(244, 71, 71, 0.22);
+-      border-color: rgba(244, 71, 71, 0.5);
+-    }
++    /* reset button removed */
++
+     .config-select {
+       flex: 1;
+       background: rgba(17, 19, 25, 0.9);
+@@ -14524,7 +14660,6 @@ def dashboard():
+             <div class="config-select-row">
+               <label for="configCategorySelect">Category</label>
+               <select id="configCategorySelect" class="config-select"></select>
+-              <button type="button" id="configResetDefaults" class="config-reset-btn" title="Reset all settings to defaults">⚠️ Reset All Defaults</button>
+             </div>
+             <div class="config-table" id="configSettingsList">
+               <p class="config-empty">Config snapshot unavailable.</p>
+@@ -14559,7 +14694,6 @@ def dashboard():
+     const LOG_RECONNECT_MAX = 8;
+     const LOG_WAIT_THRESHOLD_MS = 30000;
+     const CONFIG_UPDATE_URL = "/dashboard/config/update";
+-    const CONFIG_RESET_URL = "/dashboard/config/reset";
+     const JS_ERROR_URL = "/dashboard/js-error";
+     const RADIO_STATE_URL = "/dashboard/radio/state";
+     const RADIO_HOPS_URL = "/dashboard/radio/hops";
+@@ -15791,27 +15925,7 @@ def dashboard():
+         };
+       }
+ 
+-      // Wire Reset Defaults button
+-      const resetBtn = document.getElementById('configResetDefaults');
+-      if (resetBtn && !resetBtn._wired) {
+-        resetBtn._wired = true;
+-        resetBtn.addEventListener('click', async () => {
+-          const sure = confirm('⚠️ Reset ALL settings to defaults? This will overwrite config.json.');
+-          if (!sure) return;
+-          try {
+-            const res = await fetch(CONFIG_RESET_URL, { method: 'POST' });
+-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+-            const data = await res.json();
+-            if (!data || data.ok !== true) throw new Error(data && data.error ? data.error : 'Unknown error');
+-            alert('Defaults reset!');
+-            // Trigger a fresh reload of metrics/config snapshot
+-            loadMetrics();
+-          } catch (err) {
+-            alert('Failed to reset defaults: ' + err);
+-          }
+-        });
+-      }
+-
++      // (Reset defaults UI removed)
+       const row = document.createElement('div');
+       row.className = 'config-row';
+       row.dataset.key = item.key || '';
+@@ -17068,7 +17182,16 @@ def update_dashboard_config():
+ 
+     with CONFIG_LOCK:
+         if not synthetic_quiet and key not in config:
+-            return jsonify({'ok': False, 'error': f"'{key}' is not a recognized config option."}), 404
++            # Allow updates for known keys even if absent in config.json (fill-in defaults case)
++            recognized_keys: set[str] = set(DEFAULT_CONFIG_VALUES.keys())
++            try:
++                for _sec_id, _sec_info in CONFIG_OVERVIEW_LAYOUT.items():
++                    for _k in _sec_info.get('keys', []):
++                        recognized_keys.add(_k)
++            except Exception:
++                pass
++            if key not in recognized_keys:
++                return jsonify({'ok': False, 'error': f"'{key}' is not a recognized config option."}), 404
+         try:
+             new_value = _parse_config_update_value(value_text)
+         except Exception as exc:
+@@ -17150,6 +17273,16 @@ def update_dashboard_config():
+             config[key] = original_value
+             return jsonify({'ok': False, 'error': f"Failed to write config.json: {exc}"}), 500
+ 
++    # Apply hot runtime updates for select keys
++    try:
++        if key == 'ollama_num_ctx':
++            try:
++                globals()['OLLAMA_NUM_CTX'] = int(new_value)
++            except Exception:
++                pass
++    except Exception:
++        pass
++
+     clean_log(f"Config '{key}' updated via dashboard", "🛠️", show_always=True, rate_limit=False)
+     display, tooltip = _format_config_value(key, new_value)
+     entry = {
+@@ -17162,18 +17295,6 @@ def update_dashboard_config():
+     return jsonify({'ok': True, 'entry': entry})
+ 
+ 
+-@app.route('/dashboard/config/reset', methods=['POST'])
+-def reset_dashboard_config():
+-    # Replace config.json with an empty object (defaults handled by code fallbacks)
+-    global config
+-    with CONFIG_LOCK:
+-        try:
+-            config = {}
+-            write_atomic(CONFIG_FILE, json.dumps(config, indent=2, sort_keys=True))
+-        except Exception as exc:
+-            return jsonify({'ok': False, 'error': f"Failed to reset: {exc}"}), 500
+-    clean_log("Defaults reset!", "⚠️", show_always=True, rate_limit=False)
+-    return jsonify({'ok': True})
+ 
+ 
+ @app.route('/dashboard/js-error', methods=['POST'])
+diff --git a/mesh_master/mail_manager.py b/mesh_master/mail_manager.py
+index febf63c..f9ffc82 100644
+--- a/mesh_master/mail_manager.py
++++ b/mesh_master/mail_manager.py
+@@ -25,8 +25,8 @@ MISSING_MAILBOX_RESPONSES = [
+     "📪 No mailbox named '{mailbox}' so far. Kick things off with `/m {mailbox} hi there`.",
+ ]
+ 
+-YES_RESPONSES = {"y", "yes", "yeah", "yep"}
+-NO_RESPONSES = {"n", "no", "nope"}
++YES_RESPONSES = {"y", "yes", "yeah", "yep", "si", "sí", "affirmative", "aye"}
++NO_RESPONSES = {"n", "no", "nope", "nah"}
+ CANCEL_RESPONSES = {"cancel", "stop", "abort"}
+ 
+ PIN_WARNING_THRESHOLD = 15

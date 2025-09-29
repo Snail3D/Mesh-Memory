@@ -5,6 +5,7 @@
   "admin_passphrase": "rough",
   "auto_ping_enabled": true,
   "admin_whitelist": [
-    "!0c31e379"
+    "!0c31e379",
+    "!376be684"
   ]
 }
