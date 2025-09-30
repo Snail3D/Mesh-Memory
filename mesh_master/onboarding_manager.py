@@ -196,7 +196,7 @@ class OnboardingManager:
             except Exception as exc:
                 self.clean_log(f"Onboarding reminder send failed: {exc}", "⚠️")
         if sent_any:
-            self.clean_log("Onboarding reminders flushed", "🧭", show_always=False)
+            self.clean_log("Reminder sent", "🧭", show_always=False)
 
     # ------------------------------------------------------------------
     # Stage handlers

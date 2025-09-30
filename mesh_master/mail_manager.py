@@ -1345,11 +1345,7 @@ class MailManager:
             }
         )
         try:
-            self.clean_log(
-                f"Mailbox alert for {sender_key}: {summary}",
-                "📬",
-                show_always=False,
-            )
+            self.clean_log("Notification queued", "📬", show_always=False)
         except Exception:
             pass
         self.active_auto_notifications[sender_key] = {
@@ -1382,7 +1378,7 @@ class MailManager:
         while buffer:
             self.events.appendleft(buffer.pop())
         if processed_any:
-            self.clean_log("Mailbox notifications flushed", "📬", show_always=False)
+            self.clean_log("Notification sent", "📬", show_always=False)
 
     def _finalize_mailbox_creation(self, sender_key: str, state: Dict[str, Any], pin: Optional[str]) -> PendingReply:
         mailbox = state.get("mailbox")

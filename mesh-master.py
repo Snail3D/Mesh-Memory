@@ -60,6 +60,7 @@ import subprocess
 import math
 import textwrap
 import uuid
+from contextlib import suppress
 from typing import Optional, Set, Dict, Any, List, Tuple, Union, Sequence
 from dataclasses import dataclass, field
 # Optional system metrics libraries
@@ -89,6 +90,9 @@ from mesh_master import (
     OnboardingManager,
     PendingReply,
     OfflineWikiStore,
+    OfflineCrawlStore,
+    OfflineDDGStore,
+    UserEntryStore,
 )
 from mesh_master.alarm_timer_manager import AlarmTimerManager
 from mesh_master.command_utils import promote_bare_command
@@ -262,6 +266,10 @@ class StatsManager:
         self.game_events: deque[tuple[float, str]] = deque()
         self.user_events: deque[tuple[float, str]] = deque()
         self.new_onboards: deque[tuple[float, str]] = deque()
+        # Offline wiki activity (ts, title)
+        self.wiki_saved: deque[tuple[float, str]] = deque()
+        self.wiki_deleted: deque[tuple[float, str]] = deque()
+        self.wiki_served: deque[tuple[float, str]] = deque()
         self.message_totals: Dict[str, int] = {
             'total': 0,
             'channel': 0,
@@ -315,6 +323,24 @@ class StatsManager:
             self.game_events.append((now, game_type))
             self._prune(self.game_events, now)
 
+    def record_wiki_saved(self, title: str) -> None:
+        now = time.time()
+        with self.lock:
+            self.wiki_saved.append((now, title or ""))
+            self._prune(self.wiki_saved, now)
+
+    def record_wiki_deleted(self, title: str) -> None:
+        now = time.time()
+        with self.lock:
+            self.wiki_deleted.append((now, title or ""))
+            self._prune(self.wiki_deleted, now)
+
+    def record_wiki_served(self, title: str) -> None:
+        now = time.time()
+        with self.lock:
+            self.wiki_served.append((now, title or ""))
+            self._prune(self.wiki_served, now)
+
     def record_user_interaction(self, sender_key: Optional[str]) -> None:
         if not sender_key:
             return
@@ -353,6 +379,9 @@ class StatsManager:
                 self.game_events,
                 self.user_events,
                 self.new_onboards,
+                self.wiki_saved,
+                self.wiki_deleted,
+                self.wiki_served,
             ):
                 self._prune(dq, now)
 
@@ -400,6 +429,10 @@ class StatsManager:
 
             game_breakdown = Counter(kind for ts, kind in self.game_events if ts >= start_current)
 
+            # Helpers for 24h counts
+            def _count24(dq: deque) -> int:
+                return sum(1 for ts, _ in dq if ts >= start_current)
+
             snapshot = {
                 'ai_requests_24h': ai_requests_curr,
                 'ai_processed_24h': ai_processed,
@@ -417,6 +450,9 @@ class StatsManager:
                     {'sender_key': sender, 'timestamp': ts}
                     for sender, ts in recent_onboards
                 ],
+                'wiki_saved_24h': _count24(self.wiki_saved),
+                'wiki_deleted_24h': _count24(self.wiki_deleted),
+                'wiki_served_24h': _count24(self.wiki_served),
                 'previous': {
                     'ai_requests_24h': ai_requests_prev,
                     'ai_processed_24h': ai_responses_prev,
@@ -425,6 +461,9 @@ class StatsManager:
                     'games_24h': games_prev,
                     'active_users_24h': len(prev_user_set),
                     'new_onboards_24h': len(prev_onboard_set),
+                    'wiki_saved_24h': sum(1 for ts, _ in self.wiki_saved if start_previous <= ts < start_current),
+                    'wiki_deleted_24h': sum(1 for ts, _ in self.wiki_deleted if start_previous <= ts < start_current),
+                    'wiki_served_24h': sum(1 for ts, _ in self.wiki_served if start_previous <= ts < start_current),
                 },
             }
         return snapshot
@@ -848,6 +887,35 @@ def _gather_dashboard_metrics() -> Dict[str, Any]:
         'breakdown': stats_snapshot.get('games_breakdown', {}),
     }
 
+    # Offline wiki daily stats + avg freshness
+    try:
+        wiki_saved_curr = stats_snapshot.get('wiki_saved_24h', 0) or 0
+        wiki_deleted_curr = stats_snapshot.get('wiki_deleted_24h', 0) or 0
+        wiki_served_curr = stats_snapshot.get('wiki_served_24h', 0) or 0
+        wiki_saved_prev = stats_previous.get('wiki_saved_24h', 0) or 0
+        wiki_deleted_prev = stats_previous.get('wiki_deleted_24h', 0) or 0
+        wiki_served_prev = stats_previous.get('wiki_served_24h', 0) or 0
+        avg_age_days = None
+        store_for_avg = OFFLINE_WIKI_STORE if (OFFLINE_WIKI_STORE and OFFLINE_WIKI_STORE.is_ready()) else None
+        if store_for_avg is not None:
+            entries = store_for_avg.list_entries()
+            ages = [int(e.get('age_days')) for e in entries if isinstance(e.get('age_days'), int)]
+            if ages:
+                avg_age_days = round(sum(ages) / len(ages), 1)
+        wiki_metric = {
+            'saved': _value_delta(wiki_saved_curr, wiki_saved_prev),
+            'deleted': _value_delta(wiki_deleted_curr, wiki_deleted_prev),
+            'served': _value_delta(wiki_served_curr, wiki_served_prev),
+            'avg_age_days': avg_age_days,
+        }
+    except Exception:
+        wiki_metric = {
+            'saved': _value_delta(0, 0),
+            'deleted': _value_delta(0, 0),
+            'served': _value_delta(0, 0),
+            'avg_age_days': None,
+        }
+
     mail_metrics = {
         'sent_24h': _value_delta(
             stats_snapshot.get('mail_sent_24h', 0),
@@ -922,6 +990,7 @@ def _gather_dashboard_metrics() -> Dict[str, Any]:
         'active_users': active_users_metric,
         'new_onboards': new_onboards_metric,
         'games': games_metric,
+        'wiki': wiki_metric,
         'mail': mail_metrics,
         'ai_requests': ai_requests_metric,
         'ai_processed': ai_processed_metric,
@@ -1065,8 +1134,12 @@ def clean_log(message, emoji="📝", show_always=False, rate_limit=True):
         
         _last_message_time[message_key] = current_time
     
+    prefix = ""
+    if emoji:
+        prefix = f"{emoji} "
+    payload = f"{prefix}{message}".strip()
     if show_always or (not DEBUG_ENABLED and CLEAN_LOGS):
-        smooth_print(f"{emoji} {message}")  # Use smooth printing for better scrolling
+        smooth_print(payload)  # Use smooth printing for better scrolling
     elif not CLEAN_LOGS and not DEBUG_ENABLED:
         # Fall back to simple logging without emojis if clean_logs is disabled
         smooth_print(f"[Info] {message}")
@@ -1086,7 +1159,7 @@ def ai_log(message, provider="AI"):
             "home_assistant": "🏠"
         }
         emoji = provider_emojis.get(provider.lower(), "🤖")
-        clean_log(f"{provider.upper()}: {message}", emoji, show_always=True, rate_limit=False)
+        clean_log(f"{provider.upper()}: {message} {emoji}", emoji="", show_always=True, rate_limit=False)
     elif not DEBUG_ENABLED:
         # Simple logging without emojis if clean_logs is disabled
         print(f"[{provider.upper()}] {message}")
@@ -1187,7 +1260,6 @@ def _viewer_should_show(line: str) -> bool:
     "System running normally",
     "DISCLAIMER: This is beta software",
     "Messaging Dashboard Access: http://",
-    "📨 Message from ",
     "[AsyncAI]",
     "Offline wiki index has no entries",
   )
@@ -1213,6 +1285,15 @@ def _viewer_should_show(line: str) -> bool:
     "📤 Sending direct",
     "📤 Direct send",
     "Sent chunk ",
+    "DM message",
+    "Chat message",
+    "DM message sent",
+    "Chat message sent",
+    "Notification queued",
+    "Notification sent",
+    "Reminder sent",
+    "Added to archive",
+    "Shared archive file",
     "[AsyncAI]",
     "Processing:",
     "Generated response",
@@ -1262,6 +1343,65 @@ def _classify_log_line(line: str) -> str:
   if 'local time' in lowered or 'uptime' in lowered:
     return 'clock'
   return ''
+
+
+_LOG_HANDLE_PATTERN = re.compile(r'@[A-Za-z0-9_.-]+')
+_LOG_CHANNEL_PATTERN = re.compile(r'#(?:[A-Za-z0-9_.-]+)')
+_LOG_UUID_PATTERN = re.compile(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b', re.IGNORECASE)
+_LOG_MULTI_SPACE = re.compile(r'\s+')
+
+_LOG_SUMMARY_RULES: Sequence[Tuple[re.Pattern[str], str, Optional[str]]] = (
+    (re.compile(r'📨\s*message from', re.IGNORECASE), '📨 Message received', 'Message received'),
+    (re.compile(r'notification sent', re.IGNORECASE), '📬 Notification', 'Notification sent'),
+    (re.compile(r'reminder sent', re.IGNORECASE), '🧭 Reminder', 'Reminder sent'),
+    (re.compile(r'added to archive', re.IGNORECASE), '🗂️ Archive update', None),
+    (re.compile(r'shared archive', re.IGNORECASE), '🗂️ Archive share', None),
+    (re.compile(r'📤', re.IGNORECASE), '📤 Outbound relay', 'Reply dispatched to mesh'),
+    (re.compile(r'📡', re.IGNORECASE), '📡 Broadcast relay', 'Network-wide update sent'),
+    (re.compile(r'🦙|ollama', re.IGNORECASE), '🧠 AI synthesis', 'Assistant composing response'),
+    (re.compile(r'(\[ui\])|🖥️', re.IGNORECASE), '🖥️ Console action', None),
+    (re.compile(r'⚠️|❌|🚨|error|failed', re.IGNORECASE), '🚨 Alert', None),
+)
+
+
+def _mask_log_identifiers(text: str) -> str:
+  masked = _LOG_HANDLE_PATTERN.sub('@user', text)
+  masked = _LOG_CHANNEL_PATTERN.sub('#channel', masked)
+  masked = _LOG_UUID_PATTERN.sub('id', masked)
+  return masked
+
+
+def _extract_log_detail(text: str) -> str:
+  target = text
+  for splitter in (':', '→', '-', '—'):
+    if splitter in target:
+      parts = target.split(splitter, 1)
+      if len(parts) == 2:
+        target = parts[1]
+        break
+  target = _LOG_MULTI_SPACE.sub(' ', target).strip()
+  target = target.lstrip('📨📤📡🧠🖥️🚨 ').lstrip()
+  target = target.replace('@user', 'participant')
+  target = target.replace('#channel', 'channel')
+  return target
+
+
+def _summarize_log_line(line: str) -> str:
+  masked = _mask_log_identifiers(line)
+  for pattern, title, canned in _LOG_SUMMARY_RULES:
+    if pattern.search(masked):
+      detail = canned or _extract_log_detail(masked)
+      detail = detail.strip()
+      if detail:
+        display = _truncate_for_log(detail, 80)
+        if canned and display.lower() == str(canned).strip().lower():
+          return title
+        return f"{title} — {display}"
+      return title
+  detail = _extract_log_detail(masked)
+  if detail:
+    return _truncate_for_log(detail, 80)
+  return _truncate_for_log(masked, LOG_VIEWER_CHAR_LIMIT)
 
 
 def _humanize_uptime(delta: timedelta) -> str:
@@ -1581,17 +1721,22 @@ log.disabled = True
 BANNER = (
     "\033[38;5;214m"
     """
-███╗   ███╗███████╗███████╗██╗  ██╗             █████╗ ██╗
-████╗ ████║██╔════╝██╔════╝██║  ██║            ██╔══██╗██║
-██╔████╔██║█████╗  ███████╗███████║  █████╗    ███████║██║
-██║╚██╔╝██║██╔══╝  ╚════██║██╔══██║  ╚════╝    ██╔══██║██║
-██║ ╚═╝ ██║███████╗███████║██║  ██║            ██║  ██║██║
-╚═╝     ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝            ╚═╝  ╚═╝╚═╝
+███╗   ███╗███████╗███████╗██╗  ██╗
+████╗ ████║██╔════╝██╔════╝██║  ██║
+██╔████╔██║█████╗  ███████╗███████║
+██║╚██╔╝██║██╔══╝  ╚════██║██╔══██║
+██║ ╚═╝ ██║███████╗███████║██║  ██║
+╚═╝     ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝
 
-MESH-MASTER v1.99.0 by: MR_TBOT (https://mr-tbot.com)
-https://mesh-master.dev - (https://github.com/mr-tbot/mesh-master/)
-    \033[32m 
-Messaging Dashboard Access: http://localhost:5000/dashboard \033[38;5;214m
+███╗   ███╗ █████╗ ███████╗████████╗███████╗██████╗ 
+████╗ ████║██╔══██╗██╔════╝╚══██╔══╝██╔════╝██╔══██╗
+██╔████╔██║███████║███████╗   ██║   █████╗  ██████╔╝
+██║╚██╔╝██║██╔══██║╚════██║   ██║   ██╔══╝  ██╔══██╗
+██║ ╚═╝ ██║██║  ██║███████║   ██║   ███████╗██║  ██║
+╚═╝     ╚═╝╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝╚═╝  ╚═╝
+
+\033[36mMesh Master Operations Console\033[38;5;214m
+\033[32mMessaging Dashboard Access: http://localhost:5000/dashboard\033[38;5;214m
 """
     "\033[0m"
     "\033[31m"
@@ -1668,13 +1813,15 @@ CONFIG_LOCK = threading.Lock()
 
 
 CONFIG_OVERVIEW_LAYOUT: "OrderedDict[str, Dict[str, Any]]" = OrderedDict([
-    (        "general",
+(        "general",
         {
             "label": "General Settings",
             "keys": [
                 "debug",
                 "clean_logs",
                 "language_selection",
+                "auto_language_detect_enabled",
+                "auto_language_min_votes",
                 "local_location_string",
                 "ai_node_name",
                 "start_on_boot",
@@ -1763,6 +1910,26 @@ CONFIG_OVERVIEW_LAYOUT: "OrderedDict[str, Dict[str, Any]]" = OrderedDict([
         },
     ),
     (
+        "offline_wiki",
+        {
+            "label": "Offline Wiki",
+            "keys": [
+                "offline_wiki_enabled",
+                "offline_wiki_feed_enabled",
+                "offline_wiki_feed_char_limit",
+                "offline_wiki_max_articles",
+                "offline_wiki_autosave_from_wiki",
+                "offline_wiki_background_prefetch",
+                "offline_wiki_daily_cap",
+                "offline_wiki_prefetch_min_interval_sec",
+                "offline_wiki_dir",
+                "offline_wiki_index",
+                "offline_wiki_summary_chars",
+                "offline_wiki_context_chars",
+            ],
+        },
+    ),
+    (
         "automessages",
         {
             "label": "Automessages",
@@ -1805,6 +1972,22 @@ CONFIG_OVERVIEW_LAYOUT: "OrderedDict[str, Dict[str, Any]]" = OrderedDict([
             ],
         },
     ),
+    (
+        "context_feeds",
+        {
+            "label": "Context Feeds",
+            "keys": [
+                "web_ephemeral_feed_enabled",
+                "web_ephemeral_feed_max_results",
+                "web_fact_scrape_enabled",
+                "web_fact_scrape_timeout",
+                "feed_auto_tune_enabled",
+                "feed_queue_high",
+                "feed_min_budget",
+                "offline_wiki_multi_language",
+            ],
+        },
+    ),
 ])
 
 CONFIG_HIDDEN_KEYS = {
@@ -1827,6 +2010,8 @@ CONFIG_KEY_FRIENDLY_NAMES: Dict[str, str] = {
     "debug": "Debug logging",
     "clean_logs": "Clean log output",
     "language_selection": "Default language",
+    "auto_language_detect_enabled": "Auto-detect user language",
+    "auto_language_min_votes": "Auto-detect min votes",
     "local_location_string": "Location note",
     "ai_node_name": "AI callsign",
     "start_on_boot": "Auto-start on boot",
@@ -1868,6 +2053,19 @@ CONFIG_KEY_FRIENDLY_NAMES: Dict[str, str] = {
     "meshtastic_knowledge_file": "Mesh knowledge file",
     "meshtastic_kb_max_context_chars": "Knowledge context limit",
     "meshtastic_kb_cache_ttl": "Knowledge cache TTL",
+    # Offline wiki
+    "offline_wiki_enabled": "Offline wiki enabled",
+    "offline_wiki_dir": "Offline wiki directory",
+    "offline_wiki_index": "Offline wiki index file",
+    "offline_wiki_summary_chars": "Wiki summary chars",
+    "offline_wiki_context_chars": "Wiki context chars",
+    "offline_wiki_max_articles": "Wiki max articles",
+    "offline_wiki_autosave_from_wiki": "Autosave from /wiki",
+    "offline_wiki_background_prefetch": "Background prefetch",
+    "offline_wiki_daily_cap": "Daily prefetch cap",
+    "offline_wiki_prefetch_min_interval_sec": "Prefetch min interval (s)",
+    "offline_wiki_feed_enabled": "Feed context to AI",
+    "offline_wiki_feed_char_limit": "Feed char limit",
     "automessage_quiet_hours": "Automessage quiet hours",
     "mail_notify_enabled": "Mail alerts",
     "mail_notify_reminders_enabled": "Mail reminders",
@@ -1892,12 +2090,23 @@ CONFIG_KEY_FRIENDLY_NAMES: Dict[str, str] = {
     "resend_telemetry_enabled": "Ack telemetry",
     # Radio panel helper
     "radio_settings_info": "Radio settings",
+    # Context feeds & web
+    "web_ephemeral_feed_enabled": "Web context feed",
+    "web_ephemeral_feed_max_results": "Web feed max results",
+    "web_fact_scrape_enabled": "Top-page facts scrape",
+    "web_fact_scrape_timeout": "Facts scrape timeout",
+    "feed_auto_tune_enabled": "Auto-tune feed budgets",
+    "feed_queue_high": "Feed queue high mark",
+    "feed_min_budget": "Feed min char budget",
+    "offline_wiki_multi_language": "Offline wiki per-language",
 }
 
 CONFIG_KEY_EXPLAINERS: Dict[str, str] = {
     "debug": "Enable verbose troubleshooting logs. Turns off noise filtering so raw protobuf chatter is visible.",
     "clean_logs": "Filters noisy protobuf messages and adds emoji markers for easier scanning in the activity stream.",
     "language_selection": "Sets the default language for canned replies, menus, and status messages.",
+    "auto_language_detect_enabled": "When enabled, the system auto-sets a user's language after a few clear interactions.",
+    "auto_language_min_votes": "Number of messages in a detected language required before auto-setting the user preference.",
     "local_location_string": "Optional text describing this node's location that appears in certain status replies.",
     "ai_node_name": "Callsign the AI uses when introducing itself in conversations.",
     "start_on_boot": "If enabled, Mesh-Master starts automatically whenever the host computer boots.",
@@ -1939,6 +2148,18 @@ CONFIG_KEY_EXPLAINERS: Dict[str, str] = {
     "meshtastic_knowledge_file": "Local knowledge base JSON used for /meshinfo and related lookups.",
     "meshtastic_kb_max_context_chars": "Maximum number of characters to pull from the knowledge base for a reply.",
     "meshtastic_kb_cache_ttl": "How long knowledge base lookups stay cached before refreshing.",
+    "offline_wiki_enabled": "If enabled, Mesh Master serves and manages a local offline wiki store.",
+    "offline_wiki_dir": "Directory where offline wiki JSON files are stored.",
+    "offline_wiki_index": "Path to the index.json describing available offline wiki entries.",
+    "offline_wiki_summary_chars": "Maximum characters kept for article summaries.",
+    "offline_wiki_context_chars": "Maximum characters of article content cached for context.",
+    "offline_wiki_max_articles": "Upper bound for locally stored articles; pruning removes oldest first.",
+    "offline_wiki_autosave_from_wiki": "Queue a background download of Wikipedia when users run /wiki and it misses offline.",
+    "offline_wiki_background_prefetch": "Allow background prefetch from conversation triggers (future expansion).",
+    "offline_wiki_daily_cap": "Limit number of background downloads per day to conserve bandwidth.",
+    "offline_wiki_prefetch_min_interval_sec": "Minimum seconds between background downloads.",
+    "offline_wiki_feed_enabled": "Silently inject relevant offline wiki snippets into AI context (no user alert).",
+    "offline_wiki_feed_char_limit": "Character budget for injected snippets each turn.",
     "automessage_quiet_hours": "Toggle automated quiet hours for reminder delivery and set the overnight window.",
     "mail_notify_enabled": "Master switch for mesh mail alerts. When disabled, no inbox notifications are sent.",
     "mail_notify_reminders_enabled": "Controls whether Mesh Master schedules follow-up reminders for unread mail after the initial alert.",
@@ -1962,6 +2183,15 @@ CONFIG_KEY_EXPLAINERS: Dict[str, str] = {
     "resend_telemetry_enabled": "Record anonymous, in-memory ACK telemetry for quality tracking.",
     # Radio panel helper
     "radio_settings_info": "This category points to the live Radio Settings panel above for managing hop limit and channels.",
+    # Context feeds & web
+    "web_ephemeral_feed_enabled": "Inject a tiny DDG feed (names/dates/numbers) into AI context silently.",
+    "web_ephemeral_feed_max_results": "How many DDG results to summarize for the ephemeral feed.",
+    "web_fact_scrape_enabled": "After DDG, fetch the top result page and distill 1-page facts (names/dates/numbers).",
+    "web_fact_scrape_timeout": "HTTP timeout in seconds for the 1-page fact scrape.",
+    "feed_auto_tune_enabled": "Reduce context budgets when the response queue is busy to protect radio capacity.",
+    "feed_queue_high": "Queue length considered 'high' for auto-tuning feed budgets.",
+    "feed_min_budget": "Minimum characters kept for feeds after auto-tuning.",
+    "offline_wiki_multi_language": "Store and look up offline wikis under language subfolders (applies to future saves).",
 }
 
 
@@ -2508,6 +2738,10 @@ SAVE_WIZARD_TIMEOUT = 5 * 60
 VIBE_MENU_TIMEOUT = 3 * 60
 BIBLE_NAV_LOCK = threading.Lock()
 
+AUTO_RESUME_DELAY_SECONDS = 120
+AUTO_RESUME_LOCK = threading.Lock()
+AUTO_RESUME_TIMERS: Dict[str, threading.Timer] = {}
+
 ANTISPAM_LOCK = threading.Lock()
 ANTISPAM_STATE: Dict[str, Dict[str, Any]] = {}
 ANTISPAM_WINDOW_SECONDS = 120  # 2 minutes
@@ -2600,10 +2834,364 @@ try:
     OFFLINE_WIKI_CONTEXT_LIMIT = max(2000, int(config.get("offline_wiki_context_chars", 40000)))
 except (TypeError, ValueError):
     OFFLINE_WIKI_CONTEXT_LIMIT = 40000
+OFFLINE_WIKI_MAX_ARTICLES = int(config.get("offline_wiki_max_articles", 500) or 500)
+OFFLINE_WIKI_AUTOSAVE_FROM_WIKI = bool(config.get("offline_wiki_autosave_from_wiki", True))
+OFFLINE_WIKI_BACKGROUND_PREFETCH = bool(config.get("offline_wiki_background_prefetch", False))
+try:
+    OFFLINE_WIKI_PREFETCH_MIN_INTERVAL_SEC = max(3, int(config.get("offline_wiki_prefetch_min_interval_sec", 15)))
+except (TypeError, ValueError):
+    OFFLINE_WIKI_PREFETCH_MIN_INTERVAL_SEC = 15
+try:
+    OFFLINE_WIKI_DAILY_CAP = max(0, int(config.get("offline_wiki_daily_cap", 50)))
+except (TypeError, ValueError):
+    OFFLINE_WIKI_DAILY_CAP = 50
+OFFLINE_WIKI_FEED_ENABLED = bool(config.get("offline_wiki_feed_enabled", True))
+try:
+    OFFLINE_WIKI_FEED_CHAR_LIMIT = max(400, int(config.get("offline_wiki_feed_char_limit", 1200)))
+except (TypeError, ValueError):
+    OFFLINE_WIKI_FEED_CHAR_LIMIT = 1200
+FEED_AUTO_TUNE_ENABLED = bool(config.get("feed_auto_tune_enabled", True))
+try:
+    FEED_QUEUE_HIGH = max(2, int(config.get("feed_queue_high", 10)))
+except (TypeError, ValueError):
+    FEED_QUEUE_HIGH = 10
+try:
+    FEED_MIN_BUDGET = max(200, int(config.get("feed_min_budget", 400)))
+except (TypeError, ValueError):
+    FEED_MIN_BUDGET = 400
+
+# Multi-language offline wiki (optional)
+OFFLINE_WIKI_MULTI_LANGUAGE = bool(config.get("offline_wiki_multi_language", False))
+OFFLINE_WIKI_STORES: Dict[str, OfflineWikiStore] = {}
+
+def _wiki_lang_code(language_hint: Optional[str]) -> str:
+    if not language_hint:
+        return 'en'
+    l = str(language_hint).strip().lower()
+    # Supported top languages (ISO codes)
+    for code in ('en','zh','hi','es','fr','ar','bn','pt','ru','ur'):
+        if l == code or l.startswith(code + '-'):
+            return code
+    # common fallbacks
+    if l.startswith('es'): return 'es'
+    if l.startswith('en'): return 'en'
+    return 'en'
+
+def _get_wiki_store_for_lang(language_hint: Optional[str]) -> Optional[OfflineWikiStore]:
+    if not OFFLINE_WIKI_ENABLED:
+        return None
+    if not OFFLINE_WIKI_MULTI_LANGUAGE:
+        return OFFLINE_WIKI_STORE
+    lang = _wiki_lang_code(language_hint)
+    key = f"wiki:{lang}"
+    store = OFFLINE_WIKI_STORES.get(key)
+    if store is not None:
+        return store
+    # Create per-language store under subdir
+    base_dir = OFFLINE_WIKI_DIR / lang
+    index_file = base_dir / "index.json"
+    try:
+        base_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        store = OfflineWikiStore(index_file, base_dir=base_dir)
+        OFFLINE_WIKI_STORES[key] = store
+        if not store.is_ready():
+            err = store.error_message() or f"Offline wiki index has no entries ({index_file})."
+            clean_log(err, "⚠️", show_always=False)
+        return store
+    except Exception as exc:
+        clean_log(f"Failed to init wiki store for {lang}: {exc}", "⚠️", show_always=False)
+        return OFFLINE_WIKI_STORE
 OFFLINE_WIKI_STORE = OfflineWikiStore(OFFLINE_WIKI_INDEX, base_dir=OFFLINE_WIKI_DIR) if OFFLINE_WIKI_ENABLED else None
 if OFFLINE_WIKI_STORE and not OFFLINE_WIKI_STORE.is_ready():
     err = OFFLINE_WIKI_STORE.error_message() or f"Offline wiki index has no entries ({OFFLINE_WIKI_INDEX})."
     clean_log(err, "⚠️", show_always=True, rate_limit=False)
+
+# ---------------------------------
+# Offline Crawl Storage
+# ---------------------------------
+OFFLINE_CRAWL_ENABLED = bool(config.get("offline_crawl_enabled", True))
+_offline_crawl_dir = config.get("offline_crawl_dir", "data/offline_crawl")
+OFFLINE_CRAWL_DIR = Path(_offline_crawl_dir) if _offline_crawl_dir else Path("data/offline_crawl")
+try:
+    OFFLINE_CRAWL_SUMMARY_LIMIT = max(120, int(config.get("offline_crawl_summary_chars", 320)))
+except (TypeError, ValueError):
+    OFFLINE_CRAWL_SUMMARY_LIMIT = 320
+try:
+    OFFLINE_CRAWL_CONTEXT_LIMIT = max(2000, int(config.get("offline_crawl_context_chars", 30000)))
+except (TypeError, ValueError):
+    OFFLINE_CRAWL_CONTEXT_LIMIT = 30000
+OFFLINE_CRAWL_MAX_ENTRIES = int(config.get("offline_crawl_max_entries", 400) or 400)
+OFFLINE_CRAWL_MULTI_LANGUAGE = bool(config.get("offline_crawl_multi_language", True))
+OFFLINE_CRAWL_STORES: Dict[str, OfflineCrawlStore] = {}
+
+
+def _get_crawl_store_for_lang(language_hint: Optional[str]) -> Optional[OfflineCrawlStore]:
+    if not OFFLINE_CRAWL_ENABLED:
+        return None
+    if not OFFLINE_CRAWL_MULTI_LANGUAGE:
+        return OFFLINE_CRAWL_STORE
+    lang = _wiki_lang_code(language_hint)
+    key = f"crawl:{lang}"
+    store = OFFLINE_CRAWL_STORES.get(key)
+    if store is not None:
+        return store
+    base_dir = OFFLINE_CRAWL_DIR / lang
+    index_file = base_dir / "index.json"
+    try:
+        base_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        store = OfflineCrawlStore(index_file, base_dir=base_dir)
+        OFFLINE_CRAWL_STORES[key] = store
+        if not store.is_ready():
+            err = store.error_message()
+            if err:
+                clean_log(err, "⚠️", show_always=False)
+        return store
+    except Exception as exc:
+        clean_log(f"Failed to init crawl store for {lang}: {exc}", "⚠️", show_always=False)
+        return OFFLINE_CRAWL_STORE
+
+
+OFFLINE_CRAWL_STORE = (
+    OfflineCrawlStore(OFFLINE_CRAWL_DIR / "index.json", base_dir=OFFLINE_CRAWL_DIR)
+    if OFFLINE_CRAWL_ENABLED and not OFFLINE_CRAWL_MULTI_LANGUAGE
+    else None
+)
+if OFFLINE_CRAWL_STORE and not OFFLINE_CRAWL_STORE.is_ready():
+    err = OFFLINE_CRAWL_STORE.error_message() or f"Offline crawl index has no entries ({OFFLINE_CRAWL_DIR})."
+    clean_log(err, "⚠️", show_always=False, rate_limit=False)
+
+# ---------------------------------
+# Offline DDG storage
+# ---------------------------------
+OFFLINE_DDG_ENABLED = bool(config.get("offline_ddg_enabled", True))
+_offline_ddg_dir = config.get("offline_ddg_dir", "data/offline_ddg")
+OFFLINE_DDG_DIR = Path(_offline_ddg_dir) if _offline_ddg_dir else Path("data/offline_ddg")
+try:
+    OFFLINE_DDG_SUMMARY_LIMIT = max(120, int(config.get("offline_ddg_summary_chars", 240)))
+except (TypeError, ValueError):
+    OFFLINE_DDG_SUMMARY_LIMIT = 240
+try:
+    OFFLINE_DDG_MAX_ENTRIES = int(config.get("offline_ddg_max_entries", 600) or 600)
+except (TypeError, ValueError):
+    OFFLINE_DDG_MAX_ENTRIES = 600
+OFFLINE_DDG_MULTI_LANGUAGE = bool(config.get("offline_ddg_multi_language", True))
+OFFLINE_DDG_STORES: Dict[str, OfflineDDGStore] = {}
+
+
+def _get_ddg_store_for_lang(language_hint: Optional[str]) -> Optional[OfflineDDGStore]:
+    if not OFFLINE_DDG_ENABLED:
+        return None
+    if not OFFLINE_DDG_MULTI_LANGUAGE:
+        return OFFLINE_DDG_STORE
+    lang = _wiki_lang_code(language_hint)
+    key = f"ddg:{lang}"
+    store = OFFLINE_DDG_STORES.get(key)
+    if store is not None:
+        return store
+    base_dir = OFFLINE_DDG_DIR / lang
+    index_file = base_dir / "index.json"
+    try:
+        base_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        store = OfflineDDGStore(index_file, base_dir=base_dir)
+        OFFLINE_DDG_STORES[key] = store
+        return store
+    except Exception as exc:
+        clean_log(f"Failed to init DDG store for {lang}: {exc}", "⚠️", show_always=False)
+        return OFFLINE_DDG_STORE
+
+
+OFFLINE_DDG_STORE = (
+    OfflineDDGStore(OFFLINE_DDG_DIR / "index.json", base_dir=OFFLINE_DDG_DIR)
+    if OFFLINE_DDG_ENABLED and not OFFLINE_DDG_MULTI_LANGUAGE
+    else None
+)
+if OFFLINE_DDG_STORE and not OFFLINE_DDG_STORE.is_ready():
+    err = OFFLINE_DDG_STORE.error_message() or f"Offline DDG index has no entries ({OFFLINE_DDG_DIR})."
+    clean_log(err, "⚠️", show_always=False, rate_limit=False)
+
+# ---------------------------------
+# User-authored reports/logs
+# ---------------------------------
+REPORTS_ENABLED = bool(config.get("reports_enabled", True))
+LOGS_ENABLED = bool(config.get("logs_enabled", True))
+_reports_dir = config.get("reports_dir", "data/reports")
+_logs_dir = config.get("logs_dir", "data/logs")
+REPORTS_DIR = Path(_reports_dir) if _reports_dir else Path("data/reports")
+LOGS_DIR = Path(_logs_dir) if _logs_dir else Path("data/logs")
+try:
+    REPORTS_MAX_ENTRIES = int(config.get("reports_max_entries", 500) or 500)
+except (TypeError, ValueError):
+    REPORTS_MAX_ENTRIES = 500
+try:
+    LOGS_MAX_ENTRIES = int(config.get("logs_max_entries", 500) or 500)
+except (TypeError, ValueError):
+    LOGS_MAX_ENTRIES = 500
+
+REPORTS_STORE = UserEntryStore(REPORTS_DIR / "index.json", base_dir=REPORTS_DIR) if REPORTS_ENABLED else None
+LOGS_STORE = UserEntryStore(LOGS_DIR / "index.json", base_dir=LOGS_DIR) if LOGS_ENABLED else None
+
+# ---------------------------------
+# Offline Wiki Background Prefetch
+# ---------------------------------
+OFFLINE_WIKI_DL_LOCK = threading.Lock()
+OFFLINE_WIKI_DL_PENDING: Set[str] = set()
+OFFLINE_WIKI_DL_QUEUE: "queue.Queue[Tuple[str, Optional[str]]]" = queue.Queue()
+OFFLINE_WIKI_DL_DATE = datetime.utcnow().date()
+OFFLINE_WIKI_DL_COUNT_TODAY = 0
+
+def _reset_offline_wiki_daily_counter_if_needed() -> None:
+    global OFFLINE_WIKI_DL_DATE, OFFLINE_WIKI_DL_COUNT_TODAY
+    today = datetime.utcnow().date()
+    if today != OFFLINE_WIKI_DL_DATE:
+        OFFLINE_WIKI_DL_DATE = today
+        OFFLINE_WIKI_DL_COUNT_TODAY = 0
+
+def _enqueue_offline_wiki_download(topic: str, lang: Optional[str] = None) -> None:
+    if not topic or not OFFLINE_WIKI_ENABLED or OFFLINE_WIKI_STORE is None:
+        return
+    normalized = (topic or "").strip()
+    if not normalized:
+        return
+    lang_key = _wiki_lang_code(lang) if lang else _wiki_lang_code(None)
+    composite = f"{lang_key}:{normalized.lower()}"
+    _reset_offline_wiki_daily_counter_if_needed()
+    with OFFLINE_WIKI_DL_LOCK:
+        if composite in OFFLINE_WIKI_DL_PENDING or composite in OFFLINE_WIKI_DL_TOPICS_TODAY:
+            return
+        OFFLINE_WIKI_DL_PENDING.add(composite)
+        OFFLINE_WIKI_DL_TOPICS_TODAY.add(composite)
+        try:
+            OFFLINE_WIKI_DL_QUEUE.put_nowait((normalized, lang_key))
+            clean_log(f"Enqueued prefetch [{lang_key}] {normalized}", "📥", show_always=False, rate_limit=False)
+        except Exception:
+            OFFLINE_WIKI_DL_PENDING.discard(composite)
+            OFFLINE_WIKI_DL_TOPICS_TODAY.discard(composite)
+
+def _offline_wiki_download_worker():
+    while True:
+        try:
+            item = OFFLINE_WIKI_DL_QUEUE.get()
+            if not item:
+                time.sleep(1)
+                continue
+            topic, lang_key = item
+            with OFFLINE_WIKI_DL_LOCK:
+                # throttle and cap
+                _reset_offline_wiki_daily_counter_if_needed()
+                if OFFLINE_WIKI_DAILY_CAP and OFFLINE_WIKI_DL_COUNT_TODAY >= OFFLINE_WIKI_DAILY_CAP:
+                    # put back later to retry another day
+                    time.sleep(5)
+                    OFFLINE_WIKI_DL_PENDING.discard(f"{lang_key}:{topic.lower()}")
+                    continue
+            # Prune before adding new if needed
+            try:
+                store = _get_wiki_store_for_lang(lang_key) or OFFLINE_WIKI_STORE
+                if OFFLINE_WIKI_MAX_ARTICLES and store is not None:
+                    entries = store.list_entries()
+                    if len(entries) >= OFFLINE_WIKI_MAX_ARTICLES:
+                        store.prune_by_max(max(0, OFFLINE_WIKI_MAX_ARTICLES - 1))
+            except Exception:
+                pass
+            # Fetch
+            article = None
+            saved_successfully = False
+            try:
+                clean_log(f"Prefetch fetching [{lang_key}] {topic}", "📡", show_always=False, rate_limit=False)
+                article = _fetch_wikipedia_article(topic, max_chars=WIKI_MAX_CHARS, lang=lang_key)
+            except RuntimeError as exc:
+                if str(exc) != "offline":
+                    clean_log(f"Prefetch wiki failed for '{topic}': {exc}", "⚠️")
+            except Exception as exc:
+                clean_log(f"Prefetch wiki error for '{topic}': {exc}", "⚠️")
+            if article:
+                try:
+                    target_store = _get_wiki_store_for_lang(lang_key) or OFFLINE_WIKI_STORE
+                    if target_store is None:
+                        raise RuntimeError("offline wiki store unavailable")
+                    target_store.store_article(
+                        title=article.get("title") or topic,
+                        content=article.get("content") or article.get("extract") or "",
+                        summary=article.get("summary"),
+                        source=article.get("url") or article.get("source"),
+                        aliases=[topic],
+                        summary_limit=OFFLINE_WIKI_SUMMARY_LIMIT,
+                        context_limit=OFFLINE_WIKI_CONTEXT_LIMIT,
+                        overwrite=True,
+                    )
+                    with OFFLINE_WIKI_DL_LOCK:
+                        OFFLINE_WIKI_DL_COUNT_TODAY += 1
+                    title = article.get('title') or topic
+                    clean_log(f"Saved offline wiki: {title}", "📥")
+                    try:
+                        STATS.record_wiki_saved(title)
+                    except Exception:
+                        pass
+                    saved_successfully = True
+                except Exception as exc:
+                    clean_log(f"Could not save offline wiki '{topic}': {exc}", "⚠️")
+            # spacing between jobs
+            time.sleep(max(1, OFFLINE_WIKI_PREFETCH_MIN_INTERVAL_SEC))
+        except Exception:
+            time.sleep(5)
+        finally:
+            with OFFLINE_WIKI_DL_LOCK:
+                OFFLINE_WIKI_DL_PENDING.discard(f"{lang_key}:{(topic or '').lower()}")
+                if not (locals().get('saved_successfully') or False):
+                    OFFLINE_WIKI_DL_TOPICS_TODAY.discard(f"{lang_key}:{(topic or '').lower()}")
+
+# Ephemeral web feed (DDG) controls
+WEB_EPHEMERAL_FEED_ENABLED = bool(config.get("web_ephemeral_feed_enabled", True))
+try:
+    WEB_EPHEMERAL_FEED_MAX_RESULTS = max(1, int(config.get("web_ephemeral_feed_max_results", 2)))
+except (TypeError, ValueError):
+    WEB_EPHEMERAL_FEED_MAX_RESULTS = 2
+WEB_FACT_SCRAPE_ENABLED = bool(config.get("web_fact_scrape_enabled", False))
+try:
+    WEB_FACT_SCRAPE_TIMEOUT = max(3, int(config.get("web_fact_scrape_timeout", 8)))
+except (TypeError, ValueError):
+    WEB_FACT_SCRAPE_TIMEOUT = 8
+
+def _fetch_one_page_facts(url: str, *, max_len: int = 240) -> str:
+    headers = {
+        "User-Agent": WEB_SEARCH_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=WEB_FACT_SCRAPE_TIMEOUT, allow_redirects=True)
+        resp.raise_for_status()
+        text = resp.text
+    except requests.exceptions.RequestException:
+        return ""
+    except Exception:
+        return ""
+    # Prefer meta description / og:description when present
+    meta_desc = ''
+    try:
+        m1 = re.search(r'<meta\s+name=["\']description["\']\s+content=["\'](.*?)["\']', text, re.IGNORECASE)
+        m2 = re.search(r'<meta\s+property=["\']og:description["\']\s+content=["\'](.*?)["\']', text, re.IGNORECASE)
+        if m1 and m1.group(1):
+            meta_desc = _strip_html_tags(m1.group(1))
+        elif m2 and m2.group(1):
+            meta_desc = _strip_html_tags(m2.group(1))
+    except Exception:
+        meta_desc = ''
+    body = _strip_html_tags(text)
+    # Take first ~3 sentences as material, then distill
+    base_text = meta_desc if meta_desc else body
+    sentences = re.split(r"(?<=[.!?])\s+", base_text)
+    sample = " ".join(sentences[:3])
+    facts = _extract_key_facts(sample, max_len=max_len)
+    return facts
 
 
 def _channel_display_name(ch_idx: Optional[int]) -> str:
@@ -2666,6 +3254,10 @@ def _stop_bible_autoscroll(sender_key: Optional[str]) -> bool:
         if state:
             stop_event = state.get('stop_event')
             if stop_event and not stop_event.is_set():
+                try:
+                    setattr(stop_event, 'suppress_notice', True)
+                except Exception:
+                    pass
                 stop_event.set()
             BIBLE_AUTOSCROLL_STATE.pop(sender_key, None)
             stopped = True
@@ -2673,6 +3265,10 @@ def _stop_bible_autoscroll(sender_key: Optional[str]) -> bool:
         if pending:
             stop_event = pending.get('stop_event')
             if stop_event and not stop_event.is_set():
+                try:
+                    setattr(stop_event, 'suppress_notice', True)
+                except Exception:
+                    pass
                 stop_event.set()
             stopped = True
     return stopped
@@ -2781,13 +3377,14 @@ def _run_bible_autoscroll(sender_key: str, sender_node: str, interface_ref, nav_
         total_sent += 1
         if stop_event and stop_event.wait(BIBLE_AUTOSCROLL_INTERVAL):
             break
+    suppress_notice = bool(stop_event and getattr(stop_event, 'suppress_notice', False))
     finished = not (stop_event and stop_event.is_set())
     if finished:
         try:
             send_direct_chunks(interface_ref, translate(lang, 'bible_autoscroll_finished', "📖 Auto-scroll paused after the set of verses. Reply 22 to continue."), sender_node, chunk_delay=None)
         except Exception:
             pass
-    else:
+    elif not suppress_notice:
         try:
             send_direct_chunks(interface_ref, translate(lang, 'bible_autoscroll_stop', "⏹️ Auto-scroll paused. Reply 22 later to resume."), sender_node, chunk_delay=None)
         except Exception:
@@ -2836,6 +3433,10 @@ CONTEXT_SESSION_LOCK = threading.Lock()
 CONTEXT_SESSIONS: Dict[str, Dict[str, Any]] = {}
 PENDING_RECALL_SELECTIONS: Dict[str, Dict[str, Any]] = {}
 PENDING_DELETE_SELECTIONS: Dict[str, Dict[str, Any]] = {}
+PENDING_FIND_SELECTIONS: Dict[str, Dict[str, Any]] = {}
+FIND_RESULT_LIMIT = 3
+FIND_SELECTION_TIMEOUT = 600  # seconds
+PENDING_NOTE_INPUTS: Dict[str, Dict[str, Any]] = {}
 
 
 WEATHER_LOCATION_NAME = str(config.get("weather_location_name", "El Paso, TX"))
@@ -2968,6 +3569,676 @@ def _store_web_context(sender_key: Optional[str], formatted: str, *, context: Op
             dq = deque(maxlen=WEB_SEARCH_CONTEXT_MAX)
             WEB_SEARCH_CONTEXT[sender_key] = dq
         dq.append(payload)
+
+
+def _clip_text(payload: str, limit: int) -> str:
+    text = (payload or "").strip()
+    limit = max(1, int(limit))
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _persist_offline_crawl(
+    start_url: str,
+    formatted: str,
+    context_block: str,
+    pages: List[Dict[str, object]],
+    contacts: List[Dict[str, object]],
+    contact_page: Optional[Dict[str, object]],
+    *,
+    language_hint: Optional[str],
+    author_label: Optional[str] = None,
+) -> None:
+    if not OFFLINE_CRAWL_ENABLED:
+        return
+    store = _get_crawl_store_for_lang(language_hint) or OFFLINE_CRAWL_STORE
+    if store is None:
+        return
+    try:
+        parsed = urllib.parse.urlparse(start_url)
+        host = parsed.netloc or (parsed.path or start_url)
+        display_host = host or start_url
+        timestamp = datetime.now(tz=timezone.utc)
+        display_stamp = timestamp.strftime("%Y-%m-%d %H:%MZ")
+        title = f"{display_host} crawl ({display_stamp})"
+        summary = _clip_text(formatted.replace("\n", " "), OFFLINE_CRAWL_SUMMARY_LIMIT)
+        context = _clip_text(context_block, OFFLINE_CRAWL_CONTEXT_LIMIT)
+        alias_candidates = {
+            display_host,
+            start_url,
+            parsed.scheme + "://" + display_host if parsed.scheme else "",
+        }
+        alias_candidates.add(display_host.replace('.', ' '))
+        result = store.store_crawl(
+            title=title,
+            summary=summary,
+            context=context,
+            source=start_url,
+            fetched_at=timestamp,
+            pages=pages,
+            contacts=contacts,
+            contact_page=contact_page,
+            aliases=[alias for alias in alias_candidates if alias],
+            language=_wiki_lang_code(language_hint),
+        )
+        store.prune_by_max(OFFLINE_CRAWL_MAX_ENTRIES)
+        slug = result.get("slug") if isinstance(result, dict) else None
+        label = slug or title
+        author_suffix = f" by {author_label}" if author_label else ""
+        clean_log(f"Saved offline crawl{author_suffix}: {label}", "📥", show_always=False)
+    except Exception as exc:
+        clean_log(f"Failed to persist offline crawl for {start_url}: {exc}", "⚠️", show_always=False)
+
+
+def _persist_offline_ddg(
+    query: str,
+    results: List[Dict[str, str]],
+    *,
+    language_hint: Optional[str],
+    author_label: Optional[str] = None,
+) -> None:
+    if not OFFLINE_DDG_ENABLED:
+        return
+    store = _get_ddg_store_for_lang(language_hint) or OFFLINE_DDG_STORE
+    if store is None:
+        return
+    try:
+        summary = ''
+        if results:
+            first = results[0]
+            summary = (first.get('snippet') or first.get('title') or '').strip()
+        context = _context_from_results(query, results)
+        store.store_search(
+            query=query,
+            summary=_clip_text(summary, OFFLINE_DDG_SUMMARY_LIMIT),
+            context=context,
+            results=results,
+            source=results[0].get('url') if results else None,
+            fetched_at=datetime.now(tz=timezone.utc),
+            aliases=[query],
+            language=_wiki_lang_code(language_hint),
+        )
+        try:
+            store.prune_by_max(OFFLINE_DDG_MAX_ENTRIES)
+        except Exception:
+            pass
+        author_suffix = f" by {author_label}" if author_label else ""
+        clean_log(f"Saved offline search{author_suffix}: {query}", "📥", show_always=False)
+    except Exception as exc:
+        clean_log(f"Failed to persist offline search for '{query}': {exc}", "⚠️", show_always=False)
+
+def _inject_ephemeral_offline_context(prompt_text: str, sender_key: Optional[str], *, language: Optional[str] = None, budget: Optional[int] = None) -> Optional[str]:
+    """Return a transient offline-library context snippet without persisting it.
+
+    This is intentionally not stored in WEB_SEARCH_CONTEXT so it disappears
+    automatically after this turn. Keeps user-facing logs silent.
+    """
+    if not OFFLINE_WIKI_FEED_ENABLED:
+        return None
+    if not OFFLINE_WIKI_ENABLED or OFFLINE_WIKI_STORE is None or not OFFLINE_WIKI_STORE.is_ready():
+        return None
+    try:
+        text = (prompt_text or "").strip().lower()
+        if not text:
+            return None
+        # Simple token-based matching against titles; prefer 1–2 closest
+        tokens = [t for t in re.split(r"[^a-z0-9]+", text) if len(t) >= 4]
+        if not tokens:
+            return None
+        store = _get_wiki_store_for_lang(language) or OFFLINE_WIKI_STORE
+        if store is None or not store.is_ready():
+            return None
+        entries = store.list_entries()
+        if not entries:
+            return None
+        # Score by overlaps in title+summary words (lightweight, index-only)
+        scored = []
+        for e in entries:
+            title = str(e.get("title") or "").lower()
+            summary = str(e.get("summary") or "").lower()
+            title_tokens = set([t for t in re.split(r"[^a-z0-9]+", title) if len(t) >= 3])
+            summary_tokens = set([t for t in re.split(r"[^a-z0-9]+", summary) if len(t) >= 5])
+            base_tokens = title_tokens.union(summary_tokens)
+            if not base_tokens:
+                continue
+            # Boost for numeric overlaps (years/dates)
+            numeric_tokens = {t for t in re.findall(r"\b\d{3,4}\b", summary)}
+            query_numbers = set(re.findall(r"\b\d{3,4}\b", text))
+            numeric_overlap = len(numeric_tokens.intersection(query_numbers))
+            overlap = sum(1 for t in tokens if t in base_tokens)
+            try:
+                import difflib as _df
+                ratio_title = _df.SequenceMatcher(None, " ".join(tokens)[:80], title[:120]).ratio()
+                ratio_summary = _df.SequenceMatcher(None, " ".join(tokens)[:80], summary[:200]).ratio() if summary else 0.0
+            except Exception:
+                ratio_title = ratio_summary = 0.0
+            best_ratio = max(ratio_title, ratio_summary)
+            if overlap <= 0 and numeric_overlap <= 0 and best_ratio < 0.6:
+                continue
+            score = (overlap * 2.0) + (numeric_overlap * 1.5) + best_ratio
+            scored.append((score, e))
+        if not scored:
+            return None
+        scored.sort(key=lambda x: x[0], reverse=True)
+        picks = [e for _, e in scored[:2]]
+        if not picks:
+            return None
+        # Load articles and clip to first ~3 paragraphs combined within char budget
+        parts: List[str] = []
+        used = 0
+        for e in picks:
+            title = str(e.get("title") or "Untitled")
+            art, _ = store.lookup(title, summary_limit=OFFLINE_WIKI_SUMMARY_LIMIT, context_limit=OFFLINE_WIKI_CONTEXT_LIMIT)
+            if not art or not art.content:
+                continue
+            # First 3 paragraphs
+            paras = [p.strip() for p in art.content.split("\n\n") if p.strip()]
+            snippet = " ".join(paras[:3]) if paras else (art.summary or art.content.split("\n", 1)[0])
+            if not snippet:
+                continue
+            limit = OFFLINE_WIKI_FEED_CHAR_LIMIT if budget is None else max(200, int(budget))
+            remain = max(0, limit - used)
+            if remain <= 0:
+                break
+            clip = snippet if len(snippet) <= remain else (snippet[: remain - 1].rstrip() + "…")
+            parts.append(f"- {title}: {clip}")
+            used += len(clip)
+        if not parts:
+            return None
+        return "Offline library context:\n" + "\n".join(parts)
+    except Exception:
+        return None
+
+def _extract_key_facts(text: str, max_len: int = 280) -> str:
+    if not text:
+        return ""
+    # Emphasize numbers, dates, and capitalized tokens; keep it short
+    numbers = re.findall(r"\b(?:\d{4}|\d+(?:\.\d+)?(?:%|[KkMmBb]|\b))\b", text)
+    capitals = re.findall(r"\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,}){0,3})\b", text)
+    parts: List[str] = []
+    if numbers:
+        parts.append("nums: " + ", ".join(numbers[:6]))
+    if capitals:
+        uniq_caps = []
+        seen = set()
+        for c in capitals:
+            k = c.strip()
+            if k not in seen:
+                uniq_caps.append(k)
+                seen.add(k)
+            if len(uniq_caps) >= 6:
+                break
+        if uniq_caps:
+            parts.append("names: " + ", ".join(uniq_caps))
+    summary = "; ".join(parts)
+    if not summary:
+        summary = " ".join(text.split())
+    if len(summary) > max_len:
+        summary = summary[: max_len - 1].rstrip() + "…"
+    return summary
+
+def _inject_ephemeral_web_context(prompt_text: str, *, budget: Optional[int] = None, include_fact_scrape: bool = True) -> Optional[str]:
+    if not WEB_EPHEMERAL_FEED_ENABLED:
+        return None
+    query = (prompt_text or "").strip()
+    if not query:
+        return None
+    # Simple heuristic: only when prompt looks like a lookup
+    ql = query.lower()
+    if not any(x in ql for x in ("what is", "who is", "when was", "where is", "tell me about", "wiki", "wikipedia")):
+        # fallback: if it contains a probable name + year
+        if not re.search(r"\b\d{4}\b", ql):
+            return None
+    try:
+        results = _web_search_duckduckgo(query, max_results=WEB_EPHEMERAL_FEED_MAX_RESULTS)
+        if not results:
+            return None
+        lines = ["Web context:"]
+        used = 0
+        total_budget = max(300, OFFLINE_WIKI_FEED_CHAR_LIMIT // 2) if budget is None else max(200, int(budget))
+        for item in results[:WEB_EPHEMERAL_FEED_MAX_RESULTS]:
+            title = item.get("title") or ""
+            snippet = item.get("snippet") or ""
+            facts = _extract_key_facts(snippet, max_len=200)
+            s = f"- {title}: {facts}"
+            if used + len(s) > total_budget:
+                break
+            lines.append(s)
+            used += len(s)
+        # Optional: fetch 1st result page and extract compact facts
+        if include_fact_scrape and WEB_FACT_SCRAPE_ENABLED and results:
+            page_budget = max(120, total_budget - used)
+            if page_budget >= 120:
+                try:
+                    url = results[0].get('url')
+                    if url:
+                        page_facts = _fetch_one_page_facts(url, max_len=min(260, page_budget))
+                        if page_facts:
+                            lines.append(f"- Top page facts: {page_facts}")
+                except Exception:
+                    pass
+        return "\n".join(lines) if len(lines) > 1 else None
+    except Exception:
+        return None
+
+def _maybe_queue_topic_prefetch(text: str) -> None:
+    """Best-effort: infer a likely topic and queue offline wiki download.
+
+    Heuristics: catch a wide range of "tell me about" style phrases and
+    capitalized proper nouns, then enqueue background downloads for anything
+    that looks topic-worthy. The downloader overwrites existing files to keep
+    them refreshed.
+    """
+    if not OFFLINE_WIKI_BACKGROUND_PREFETCH:
+        return
+    t = (text or "").strip()
+    if not t or t.startswith('/'):
+        return
+    if len(t) < 6:
+        return
+    lower = t.lower()
+    topic_candidates: Set[str] = set()
+
+    phrase_patterns = [
+        r"\b(?:what is|who is|when was|where is|when did|where did|who were|what were)\b\s+(.+)",
+        r"\b(?:tell me about|tell me more about|learn more about|teach me about|what happened in|what happened at|what can you tell me about|information about|info about|info on|details on|history of)\b\s+(.+)",
+    ]
+
+    for pattern in phrase_patterns:
+        for match in re.finditer(pattern, lower):
+            start = match.start(1)
+            end = start + len(match.group(1))
+            raw = t[start:end]
+            topic_candidates.add(raw)
+
+    # Proper nouns (two to four capitalized words)
+    for proper in re.findall(r"\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,}){1,3})\b", t):
+        topic_candidates.add(proper)
+
+    # Also handle quoted phrases like "Battle of Hastings"
+    for quoted in re.findall(r'"([A-Z][A-Za-z0-9\s]{3,})"', t):
+        topic_candidates.add(quoted)
+
+    cleaned_topics: Set[str] = set()
+    for raw in topic_candidates:
+        topic = raw.strip().strip('"').strip("'.,:;()[]{}!?")
+        if not topic or len(topic) < 3:
+            continue
+        words = topic.split()
+        if len(words) == 1 and len(topic) < 10:
+            continue
+        if topic.lower() in OFFLINE_WIKI_PREFETCH_STOPWORDS:
+            continue
+        cleaned_topics.add(topic)
+
+    for topic in sorted(cleaned_topics):
+        clean_log(f"Prefetch heuristic matched '{topic}'", "🔍", show_always=False, rate_limit=False)
+        _enqueue_offline_wiki_download(topic)
+
+
+def _search_offline_wiki_entries(store: OfflineWikiStore, query: str, limit: int = 6) -> List[Dict[str, object]]:
+    try:
+        entries = store.list_entries()
+    except Exception:
+        return []
+    query_lower = (query or "").lower()
+    if not query_lower:
+        return []
+    tokens = [tok for tok in re.split(r"[^a-z0-9]+", query_lower) if tok]
+    results: List[Tuple[float, Dict[str, object]]] = []
+    for entry in entries:
+        haystack_parts = [
+            str(entry.get('title') or '').lower(),
+            str(entry.get('summary') or '').lower(),
+            str(entry.get('path') or '').lower(),
+        ]
+        haystack = " ".join(haystack_parts)
+        if not haystack:
+            continue
+        score = 0.0
+        if query_lower in haystack:
+            score += 5.0
+        for token in tokens:
+            if token and token in haystack:
+                score += 1.0
+        if not score:
+            continue
+        results.append((score, entry))
+    results.sort(key=lambda item: item[0], reverse=True)
+    return [entry for _, entry in results[:limit]]
+
+
+def _parse_iso8601(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.endswith('Z'):
+            text = text[:-1] + '+00:00'
+        return datetime.fromisoformat(text)
+    except Exception:
+        return None
+
+
+def _display_timestamp(value: Optional[str]) -> str:
+    dt = _parse_iso8601(value)
+    if not dt:
+        return str(value or "unknown time")
+    try:
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%MZ")
+    except Exception:
+        return dt.isoformat()
+
+
+def _store_user_note(
+    entry_type: str,
+    title: str,
+    content: str,
+    sender_id: Any,
+    sender_key: str,
+    language: Optional[str],
+) -> Tuple[bool, str]:
+    store = REPORTS_STORE if entry_type == 'report' else LOGS_STORE
+    max_entries = REPORTS_MAX_ENTRIES if entry_type == 'report' else LOGS_MAX_ENTRIES
+    if not store:
+        label = 'reports' if entry_type == 'report' else 'logs'
+        return False, f"⚠️ Offline {label} storage is disabled on this node."
+    try:
+        author = get_node_shortname(sender_id)
+    except Exception:
+        author = str(sender_id)
+    record = store.store_entry(
+        title=title,
+        content=content,
+        author=author,
+        author_id=sender_key,
+        language=language,
+    )
+    try:
+        store.prune_by_max(max_entries)
+    except Exception:
+        pass
+    created_iso = record.get('created_at') if isinstance(record, dict) else None
+    created_display = _display_timestamp(created_iso)
+    icon = "📝" if entry_type == 'report' else "🗒️"
+    clean_log(f"Saved {entry_type} by {author}: {title}", "📥", show_always=False)
+    preview = content.strip()
+    if len(preview) > 400:
+        preview = preview[:397].rstrip() + "…"
+    message = f"{icon} Saved '{title}' on {created_display} by {author}. Use /find {title} to view it later."
+    if preview:
+        message = f"{message}\n\n{preview}"
+    return True, message
+
+
+def _search_offline_sources(query: str, lang: str, limit: int = FIND_RESULT_LIMIT) -> List[Dict[str, Any]]:
+    query = (query or "").strip()
+    if not query:
+        return []
+
+    base_lang = _wiki_lang_code(lang)
+    comparison_langs: List[str] = [base_lang]
+    if base_lang != 'en':
+        comparison_langs.append('en')
+    comparison_langs = list(dict.fromkeys(comparison_langs))
+
+    query_lower = query.lower()
+    tokens = [tok for tok in re.split(r"[^a-z0-9]+", query_lower) if tok]
+    numeric_tokens = set(re.findall(r"\b\d{3,4}\b", query_lower))
+    now_utc = datetime.now(tz=timezone.utc)
+
+    candidates: List[Dict[str, Any]] = []
+
+    def _collect_entries(entry_type: str, lang_code: str, items: List[Dict[str, Any]]) -> None:
+        if not items:
+            return
+        # Clamp to reasonable sample to avoid excessive scoring cost
+        for entry in items[:400]:
+            if isinstance(entry, dict):
+                candidates.append({
+                    'type': entry_type,
+                    'lang': lang_code,
+                    'entry': entry,
+                })
+
+    if OFFLINE_WIKI_ENABLED:
+        if OFFLINE_WIKI_MULTI_LANGUAGE:
+            seen: Set[str] = set()
+            for target_lang in comparison_langs:
+                if target_lang in seen:
+                    continue
+                store = _get_wiki_store_for_lang(target_lang)
+                seen.add(target_lang)
+                if store and store.is_ready():
+                    try:
+                        entries = store.list_entries()
+                    except Exception:
+                        entries = []
+                    _collect_entries('wiki', target_lang, entries)
+        else:
+            store = OFFLINE_WIKI_STORE
+            if store and store.is_ready():
+                try:
+                    entries = store.list_entries()
+                except Exception:
+                    entries = []
+                _collect_entries('wiki', _wiki_lang_code(None), entries)
+
+    if OFFLINE_CRAWL_ENABLED:
+        if OFFLINE_CRAWL_MULTI_LANGUAGE:
+            seen_crawl: Set[str] = set()
+            for target_lang in comparison_langs:
+                if target_lang in seen_crawl:
+                    continue
+                store = _get_crawl_store_for_lang(target_lang)
+                seen_crawl.add(target_lang)
+                if store and store.is_ready():
+                    try:
+                        entries = store.list_entries()
+                    except Exception:
+                        entries = []
+                    _collect_entries('crawl', target_lang, entries)
+        else:
+            store = OFFLINE_CRAWL_STORE
+            if store and store.is_ready():
+                try:
+                    entries = store.list_entries()
+                except Exception:
+                    entries = []
+                _collect_entries('crawl', _wiki_lang_code(None), entries)
+
+    if OFFLINE_DDG_ENABLED:
+        if OFFLINE_DDG_MULTI_LANGUAGE:
+            seen_ddg: Set[str] = set()
+            for target_lang in comparison_langs:
+                if target_lang in seen_ddg:
+                    continue
+                store = _get_ddg_store_for_lang(target_lang)
+                seen_ddg.add(target_lang)
+                if store and store.is_ready():
+                    try:
+                        entries = store.list_entries()
+                    except Exception:
+                        entries = []
+                    _collect_entries('ddg', target_lang, entries)
+        else:
+            store = OFFLINE_DDG_STORE
+            if store and store.is_ready():
+                try:
+                    entries = store.list_entries()
+                except Exception:
+                    entries = []
+                _collect_entries('ddg', _wiki_lang_code(None), entries)
+
+    if REPORTS_ENABLED and REPORTS_STORE:
+        try:
+            entries = REPORTS_STORE.list_entries()
+        except Exception:
+            entries = []
+        _collect_entries('report', 'user', entries)
+
+    if LOGS_ENABLED and LOGS_STORE:
+        try:
+            entries = LOGS_STORE.list_entries()
+        except Exception:
+            entries = []
+        _collect_entries('log', 'user', entries)
+
+    if not candidates:
+        return []
+
+    scored: List[Dict[str, Any]] = []
+    group_counts: Dict[str, int] = {}
+    for candidate in candidates:
+        entry = candidate.get('entry') or {}
+        if not isinstance(entry, dict):
+            continue
+        title = str(entry.get('title') or '').strip()
+        summary = str(entry.get('summary') or '').strip()
+        aliases = list(entry.get('aliases') or [])
+        if candidate['type'] == 'ddg' and entry.get('query'):
+            aliases.append(entry.get('query'))
+        alias_text = " ".join(str(alias) for alias in aliases if alias)
+        source = str(entry.get('source') or '').strip()
+        path = str(entry.get('path') or '').strip()
+        title_lower = title.lower()
+        summary_lower = summary.lower()
+        alias_lower = alias_text.lower()
+        source_lower = source.lower()
+        path_lower = path.lower()
+        host_lower = ''
+        if candidate['type'] == 'crawl' and source:
+            try:
+                host_lower = urllib.parse.urlparse(source).netloc.lower()
+            except Exception:
+                host_lower = ''
+        elif candidate['type'] == 'ddg' and source:
+            try:
+                host_lower = urllib.parse.urlparse(source).netloc.lower()
+            except Exception:
+                host_lower = ''
+        haystack = " ".join(part for part in [title_lower, summary_lower, alias_lower, source_lower, path_lower, host_lower] if part)
+        if not haystack:
+            continue
+
+        score = 0.0
+        if query_lower in title_lower:
+            score += 8.0
+        if query_lower in summary_lower:
+            score += 3.5
+        if alias_lower and query_lower in alias_lower:
+            score += 2.5
+        if source_lower and query_lower in source_lower:
+            score += 2.0
+        if path_lower and query_lower in path_lower:
+            score += 1.5
+        if host_lower and query_lower in host_lower:
+            score += 1.5
+
+        for token in tokens:
+            if token in title_lower:
+                score += 3.2
+            elif token in summary_lower:
+                score += 1.6
+            elif token in alias_lower:
+                score += 1.3
+            elif token in host_lower:
+                score += 1.2
+            elif token in source_lower or token in path_lower:
+                score += 0.9
+
+        for token in numeric_tokens:
+            if token in summary_lower or token in title_lower or token in alias_lower:
+                score += 1.4
+
+        try:
+            ratio = difflib.SequenceMatcher(None, query_lower[:120], title_lower[:120]).ratio()
+        except Exception:
+            ratio = 0.0
+        score += ratio * 3.0
+
+        timestamp = 0.0
+        reference_dt = None
+        fetched_at = entry.get('fetched_at')
+        if fetched_at:
+            reference_dt = _parse_iso8601(fetched_at)
+        if reference_dt is None:
+            reference_dt = _parse_iso8601(entry.get('mtime_iso'))
+        age_days: Optional[float]
+        if reference_dt is not None:
+            timestamp = reference_dt.timestamp()
+            delta = (now_utc - reference_dt).total_seconds() / 86400.0
+            age_days = max(0.0, delta)
+        else:
+            raw_age = entry.get('age_days')
+            age_days = float(raw_age) if isinstance(raw_age, (int, float)) else None
+        if age_days is not None:
+            score += max(0.0, 2.0 - (age_days * 0.08))
+
+        if candidate['type'] == 'wiki':
+            score += 1.0
+        elif candidate['type'] == 'crawl':
+            score += 1.3
+        elif candidate['type'] == 'ddg':
+            score += 0.9
+        else:  # report/log
+            score += 1.6  # boost authored entries slightly
+
+        if candidate['lang'] != base_lang:
+            score *= 0.92
+
+        if score <= 0.5:
+            continue
+
+        group_key = None
+        if candidate['type'] in {'report', 'log'}:
+            if entry.get('group'):
+                group_key = entry.get('group')
+            else:
+                lowered_title = unidecode(title or '').lower()
+                group_key = re.sub(r"[^a-z0-9]+", "-", lowered_title).strip('-') or 'entry'
+            count = group_counts.get(group_key, 0)
+            if count >= 3:
+                continue
+            group_counts[group_key] = count + 1
+
+        scored.append(
+            {
+                'type': candidate['type'],
+                'title': title or (path or 'Untitled'),
+                'summary': summary,
+                'lang': candidate['lang'],
+                'key': entry.get('key') or title or path,
+                'source': source,
+                'path': path,
+                'aliases': aliases,
+                'score': score,
+                'timestamp': timestamp,
+                'age_days': age_days,
+                'fetched_at': fetched_at,
+                'author': entry.get('author'),
+                'author_id': entry.get('author_id'),
+                'created_at': entry.get('created_at'),
+                'group': entry.get('group') or group_key,
+                'query': entry.get('query'),
+                'results': entry.get('results'),
+            }
+        )
+
+    if not scored:
+        return []
+
+    scored.sort(
+        key=lambda item: (
+            -item.get('score', 0.0),
+            -item.get('timestamp', 0.0),
+            item.get('title', '').lower(),
+        )
+    )
+    return scored[: max(1, int(limit))]
 
 
 def _get_web_context(sender_key: Optional[str]) -> List[str]:
@@ -3524,7 +4795,7 @@ except (TypeError, ValueError):
     WIKI_SUMMARY_CHAR_LIMIT = 400
 
 
-def _fetch_wikipedia_article(topic: str, max_chars: int = WIKI_MAX_CHARS) -> Dict[str, str]:
+def _fetch_wikipedia_article(topic: str, max_chars: int = WIKI_MAX_CHARS, *, lang: str = 'en') -> Dict[str, str]:
     headers = {
         "User-Agent": WEB_SEARCH_USER_AGENT,
         "Accept": "application/json",
@@ -3544,8 +4815,9 @@ def _fetch_wikipedia_article(topic: str, max_chars: int = WIKI_MAX_CHARS) -> Dic
         "titles": topic,
     }
     try:
+        host = f"https://{lang}.wikipedia.org" if lang and lang != 'en' else "https://en.wikipedia.org"
         response = requests.get(
-            "https://en.wikipedia.org/w/api.php",
+            f"{host}/w/api.php",
             params=params,
             headers=headers,
             timeout=max(WEB_SEARCH_TIMEOUT, 15),
@@ -3570,7 +4842,7 @@ def _fetch_wikipedia_article(topic: str, max_chars: int = WIKI_MAX_CHARS) -> Dic
         summary_resp = None
         try:
             summary_resp = requests.get(
-                f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title.replace(' ', '_'))}",
+                f"{host}/api/rest_v1/page/summary/{urllib.parse.quote(title.replace(' ', '_'))}",
                 headers=headers,
                 timeout=max(WEB_SEARCH_TIMEOUT, 15),
             )
@@ -3594,7 +4866,7 @@ def _fetch_wikipedia_article(topic: str, max_chars: int = WIKI_MAX_CHARS) -> Dic
 
     canonical_url = page.get("fullurl") or page.get("canonicalurl")
     if not canonical_url:
-        canonical_url = f"https://en.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
+        canonical_url = f"{host}/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
 
     return {
         "title": title,
@@ -5710,6 +6982,9 @@ COMMAND_ALIASES: Dict[str, Dict[str, Any]] = {
     "/buscar": {"canonical": "/web", "languages": ["es"]},
     "/recherche": {"canonical": "/web", "languages": ["fr"]},
     "/suche": {"canonical": "/web", "languages": ["de"]},
+    "/database": {"canonical": "/find", "languages": ["en"]},
+    "/find": {"canonical": "/find", "languages": ["en"]},
+    "find": {"canonical": "/find", "languages": ["en"]},
     "/recal": {"canonical": "/recall", "languages": ["en"]},
     "/remember": {"canonical": "/recall", "languages": ["en"]},
     "/store": {"canonical": "/save", "languages": ["en"]},
@@ -5720,6 +6995,10 @@ COMMAND_ALIASES: Dict[str, Dict[str, Any]] = {
     "/elp": {"canonical": "/elpaso", "languages": ["en"]},
     "/elpasofact": {"canonical": "/elpaso", "languages": ["en"]},
     "/elpasofacts": {"canonical": "/elpaso", "languages": ["en"]},
+    "/report": {"canonical": "/report", "languages": ["en"]},
+    "/log": {"canonical": "/log", "languages": ["en"]},
+    "report": {"canonical": "/report", "languages": ["en"]},
+    "log": {"canonical": "/log", "languages": ["en"]},
     "/setmotd": {"canonical": "/changemotd", "languages": ["en"]},
     "/motdset": {"canonical": "/changemotd", "languages": ["en"]},
     "/setprompt": {"canonical": "/changeprompt", "languages": ["en"]},
@@ -5926,6 +7205,7 @@ COMMAND_SUMMARIES: Dict[str, str] = {
     "/weather": "Fetches the latest weather forecast for your configured location.",
     "/web": "Performs a live web search when the network allows it.",
     "/wiki": "Queries Wikipedia for a summary via the AI.",
+    "/find": "Search offline wiki, crawls, DDG, reports, and logs: /find <query>.",
     "/drudge": "Returns current Drudge Report headlines.",
     "/elpaso": "Posts a short historical or local fact about El Paso.",
     "/games": "Lists available interactive games.",
@@ -6030,6 +7310,9 @@ BUILTIN_COMMANDS = {
     "/elpaso",
     "/blond",
     "/yomomma",
+    "/find",
+    "/report",
+    "/log",
     "/changemotd",
     "/changeprompt",
     "/showprompt",
@@ -6062,6 +7345,12 @@ LANGUAGE_FALLBACK = _normalize_language_code(LANGUAGE_SELECTION_CONFIG)
 
 USER_LANGUAGE_LOCK = threading.Lock()
 USER_LANGUAGE_PREFS: Dict[str, str] = {}
+LANGUAGE_AUTODETECT_VOTES: Dict[str, Dict[str, int]] = {}
+AUTO_LANGUAGE_DETECT_ENABLED = bool(config.get("auto_language_detect_enabled", True))
+try:
+    AUTO_LANGUAGE_MIN_VOTES = max(1, int(config.get("auto_language_min_votes", 2)))
+except (TypeError, ValueError):
+    AUTO_LANGUAGE_MIN_VOTES = 2
 
 
 def _load_user_language_map() -> Dict[str, str]:
@@ -6119,6 +7408,109 @@ def _clear_user_language(sender_key: Optional[str]) -> None:
             snapshot = dict(USER_LANGUAGE_PREFS)
     if snapshot is not None:
         _save_user_language_map(snapshot)
+
+
+def _cancel_auto_resume(sender_key: Optional[str]) -> None:
+    if not sender_key:
+        return
+    with AUTO_RESUME_LOCK:
+        timer = AUTO_RESUME_TIMERS.pop(sender_key, None)
+    if timer:
+        try:
+            timer.cancel()
+        except Exception:
+            pass
+
+
+def _schedule_auto_resume(sender_key: Optional[str], sender_node: Any, language: Optional[str]) -> None:
+    if not sender_key or AUTO_RESUME_DELAY_SECONDS <= 0:
+        return
+    with AUTO_RESUME_LOCK:
+        existing = AUTO_RESUME_TIMERS.pop(sender_key, None)
+    if existing:
+        try:
+            existing.cancel()
+        except Exception:
+            pass
+
+    def _auto_resume_action() -> None:
+        try:
+            _set_user_muted(sender_key, False)
+            if interface and not _is_user_blocked(sender_key):
+                notice = translate(language or LANGUAGE_FALLBACK, 'auto_resume_notice', "▶️ Auto-resumed after a short pause. I'll reply again.")
+                try:
+                    send_direct_chunks(interface, notice, sender_node)
+                except Exception:
+                    pass
+            clean_log(f"Auto-resumed responses for {sender_key}", "▶️", show_always=False, rate_limit=False)
+        finally:
+            with AUTO_RESUME_LOCK:
+                AUTO_RESUME_TIMERS.pop(sender_key, None)
+
+    timer = threading.Timer(AUTO_RESUME_DELAY_SECONDS, _auto_resume_action)
+    timer.daemon = True
+    with AUTO_RESUME_LOCK:
+        AUTO_RESUME_TIMERS[sender_key] = timer
+    timer.start()
+
+
+_LATIN_STOPWORDS = {
+    'es': {
+        'el','la','de','que','y','en','es','los','las','un','una','del','al','como','pero','sus','ya','o','este','esta','hay','también','sí','porque'
+    },
+    'fr': {
+        'le','la','les','de','des','et','est','que','pour','dans','une','un','au','aux','du','sur','avec','par','ce','cet','cette','ou'
+    },
+    'pt': {
+        'de','da','do','que','e','em','não','é','um','uma','os','as','para','como','mais','também','se','por','com'
+    },
+}
+
+def _autodetect_language_from_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+    # Script-based detection first
+    if re.search(r"[\u4E00-\u9FFF]", text):
+        return 'zh'
+    if re.search(r"[\u0400-\u04FF]", text):
+        return 'ru'
+    if re.search(r"[\u0600-\u06FF]", text):
+        return 'ar'
+    if re.search(r"[\u0900-\u097F]", text):
+        return 'hi'
+    if re.search(r"[\u0980-\u09FF]", text):
+        return 'bn'
+    # Latin languages: stopword score
+    tokens = [t for t in re.findall(r"[a-záéíóúüñçãõâêô]+", text.lower()) if len(t) >= 2]
+    if not tokens:
+        return None
+    scores: Dict[str, int] = {}
+    for lang, words in _LATIN_STOPWORDS.items():
+        scores[lang] = sum(1 for t in tokens if t in words)
+    best = max(scores.items(), key=lambda kv: kv[1])
+    if best[1] >= 3:
+        return best[0]
+    return None
+
+def _maybe_autoset_user_language(sender_key: Optional[str], text: str) -> None:
+    if not AUTO_LANGUAGE_DETECT_ENABLED or not sender_key:
+        return
+    current = _get_user_language(sender_key)
+    if current:
+        return
+    guess = _autodetect_language_from_text(text)
+    if not guess or guess == LANGUAGE_FALLBACK:
+        return
+    # Tally votes
+    bucket = LANGUAGE_AUTODETECT_VOTES.setdefault(sender_key, {})
+    bucket[guess] = bucket.get(guess, 0) + 1
+    if bucket[guess] >= AUTO_LANGUAGE_MIN_VOTES:
+        changed = _set_user_language(sender_key, guess)
+        if changed:
+            try:
+                clean_log(f"Auto-set user language to {guess} for {sender_key}", "🈺")
+            except Exception:
+                pass
 
 
 def _resolve_user_language(language_hint: Optional[str], sender_key: Optional[str]) -> str:
@@ -6352,7 +7744,7 @@ COMMAND_CATEGORY_DEFINITIONS: "OrderedDict[str, Dict[str, Any]]" = OrderedDict([
         {
             "label": "Information & Reference",
             "commands": [
-                "/bible", "/biblehelp", "/weather", "/web", "/wiki", "/drudge",
+                "/bible", "/biblehelp", "/weather", "/web", "/wiki", "/find", "/drudge",
                 "/motd", "/meshinfo", "/meshtastic", "/elpaso",
             ],
         },
@@ -6672,6 +8064,7 @@ LANGUAGE_RESPONSES = {
         "yomomma_missing": "😅 La biblioteca de chistes de tu mamá está vacía por ahora.",
         "invalid_choice": "Opción inválida. Inténtalo de nuevo.",
         "missing_destination": "Ese camino aún no está listo.",
+        "auto_resume_notice": "▶️ Reanudado automáticamente tras una breve pausa. Volveré a responder.",
     },
 }
 
@@ -7506,10 +8899,7 @@ def process_responses_worker():
                 _process_bible_autoscroll_request(sender_key, sender_node, interface_ref)
 
                 if truncation_notice and interface_ref:
-                    try:
-                        send_direct_chunks(interface_ref, CONTEXT_TRUNCATION_NOTICE, sender_node)
-                    except Exception as notice_exc:
-                        clean_log(f"Context notice failed: {notice_exc}", "⚠️", show_always=False)
+                    pass  # Trim notices disabled
                 
                 try:
                     globals()['last_ai_response_time'] = _now()
@@ -9079,7 +10469,7 @@ def send_broadcast_chunks(interface, text, channelIndex, chunk_delay: Optional[f
         if success and i < len(chunks) - 1:  # Don't delay after last chunk
             time.sleep(delay)
     if sent_any:
-        clean_log(f"Broadcast to {_channel_display_name(channelIndex)}", "📡")
+        clean_log("Chat message sent 💬", emoji="")
     # Return basic info for potential resend scheduling
     return {"chunks": chunks, "sent": sent_any}
 
@@ -9188,7 +10578,7 @@ def send_direct_chunks(interface, text, destinationId, chunk_delay: Optional[flo
         if success and idx < len(chunks) - 1:
             time.sleep(delay)
     if sent_any:
-        clean_log(f"Sent to {dest_display}", "📤")
+        clean_log("DM message sent 💌", emoji="")
     # For callers interested in granular ACK feedback
     return {"chunks": chunks, "acks": ack_results, "sent": sent_any}
 
@@ -9588,7 +10978,184 @@ def _process_wipe_confirmation(sender_id: Any, message: str, is_direct: bool, ch
         aggregated = "\n".join(line for line in lines if line)
         return PendingReply(aggregated, "/wipe confirm")
 
-    return PendingReply("Unknown wipe action. Try /wipe again.", "/wipe confirm")
+        return PendingReply("Unknown wipe action. Try /wipe again.", "/wipe confirm")
+
+
+def _activate_find_result(
+    sender_id: Any,
+    sender_key: str,
+    result: Dict[str, Any],
+    selection_index: int,
+) -> PendingReply:
+    entry_type = (result.get('type') or 'wiki').lower()
+    lang_code = result.get('lang') or _wiki_lang_code(None)
+    title = str(result.get('title') or 'Untitled')
+    lookup_key = result.get('key') or title
+    summary_seed = str(result.get('summary') or '').strip()
+    context_text = ""
+    final_summary = summary_seed
+    source_label = result.get('source') or ''
+    try:
+        user_label = get_node_shortname(sender_id)
+    except Exception:
+        user_label = str(sender_id)
+
+    try:
+        if entry_type == 'wiki':
+            store = _get_wiki_store_for_lang(lang_code) if OFFLINE_WIKI_MULTI_LANGUAGE else OFFLINE_WIKI_STORE
+            if not store:
+                return PendingReply("⚠️ Offline wiki store unavailable right now.", "/find select")
+            article, suggestions = store.lookup(
+                lookup_key,
+                summary_limit=OFFLINE_WIKI_SUMMARY_LIMIT,
+                context_limit=OFFLINE_WIKI_CONTEXT_LIMIT,
+            )
+            if not article:
+                hint = f" Did you mean {suggestions[0]}?" if suggestions else ""
+                return PendingReply(f"⚠️ I couldn't load that article.{hint}", "/find select")
+            final_summary = article.summary or final_summary
+            context_parts = [f"Offline Wiki Entry: {article.title}"]
+            if final_summary:
+                context_parts.append(f"Summary:\n{final_summary}")
+            if article.content:
+                context_parts.append(article.content)
+            if article.source:
+                source_label = article.source
+                context_parts.append(f"Source: {article.source}")
+            context_text = "\n\n".join(part for part in context_parts if part)
+        elif entry_type == 'crawl':
+            store = _get_crawl_store_for_lang(lang_code) or OFFLINE_CRAWL_STORE
+            if not store:
+                return PendingReply("⚠️ Offline crawl library unavailable right now.", "/find select")
+            record, suggestions = store.lookup(lookup_key)
+            if not record:
+                hint = f" Did you mean {suggestions[0]}?" if suggestions else ""
+                return PendingReply(f"⚠️ I couldn't load that crawl.{hint}", "/find select")
+            final_summary = record.summary or final_summary
+            context_parts = [f"Offline Crawl: {record.title}"]
+            if record.source:
+                source_label = record.source
+                context_parts.append(f"Start URL: {record.source}")
+            if record.fetched_at:
+                context_parts.append(f"Captured: {record.fetched_at}")
+            if final_summary:
+                context_parts.append(f"Summary:\n{final_summary}")
+            if record.context:
+                context_parts.append(record.context)
+            if isinstance(record.contact_page, dict):
+                contact_url = record.contact_page.get('url')
+                if contact_url:
+                    context_parts.append(f"Primary contact page: {contact_url}")
+            context_text = "\n\n".join(part for part in context_parts if part)
+        elif entry_type == 'ddg':
+            store = _get_ddg_store_for_lang(lang_code) or OFFLINE_DDG_STORE
+            if not store:
+                return PendingReply("⚠️ Offline search library unavailable right now.", "/find select")
+            record, suggestions = store.lookup(lookup_key)
+            if not record:
+                hint = f" Did you mean {suggestions[0]}?" if suggestions else ""
+                return PendingReply(f"⚠️ I couldn't load that search.{hint}", "/find select")
+            final_summary = record.summary or final_summary
+            context_text = record.context or ""
+            if not context_text and record.results:
+                lines = [f"Source: {record.query}"]
+                for idx, item in enumerate(record.results, 1):
+                    title_r = item.get('title') or 'Untitled'
+                    url_r = item.get('url') or ''
+                    snippet_r = (item.get('snippet') or '').strip()
+                    lines.append(f"[{idx}] {title_r}")
+                    if url_r:
+                        lines.append(f"URL: {url_r}")
+                    if snippet_r:
+                        lines.append(snippet_r)
+                context_text = "\n".join(lines)
+            if record.source:
+                source_label = record.source
+        elif entry_type in {'report', 'log'}:
+            store = REPORTS_STORE if entry_type == 'report' else LOGS_STORE
+            if not store:
+                return PendingReply("⚠️ That library is disabled right now.", "/find select")
+            record = store.lookup(lookup_key)
+            if not record:
+                return PendingReply("⚠️ I couldn't load that entry. Try again or recreate it.", "/find select")
+            created_display = _display_timestamp(record.created_at)
+            author_display = record.author or "Unknown"
+            icon = "📝" if entry_type == 'report' else "🗒️"
+            lines = [
+                f"{icon} {title}",
+                f"Created {created_display} by {author_display}",
+                "",
+                record.content,
+            ]
+            return PendingReply("\n".join(lines), "/find select")
+        else:
+            return PendingReply("⚠️ Unknown entry type. Try again.", "/find select")
+    except Exception as exc:
+        clean_log(f"Failed to load offline entry '{title}': {exc}", "⚠️", show_always=False)
+        return PendingReply("⚠️ I couldn't open that file. Try another number or rerun /find.", "/find select")
+
+    if not context_text:
+        return PendingReply("⚠️ That entry had no content to load.", "/find select")
+
+    prompt_addendum = (
+        f"You are answering questions using the offline {entry_type} entry titled '{title}'. "
+        "If the user asks about unrelated topics, ask them to open another file or provide more details."
+    )
+    session_payload = {
+        'type': 'offline_database',
+        'title': title,
+        'summary': final_summary,
+        'context': context_text,
+        'use_history': True,
+        'prompt_addendum': prompt_addendum,
+        'language': lang_code,
+    }
+    _set_context_session(sender_key, session_payload)
+    clean_log(f"Offline knowledge context '{title}' ({entry_type}) opened for {user_label}", "📚", show_always=False)
+
+    lines = [
+        f"Context window {selection_index} opened for \"{title}\".",
+        "Ask a question for more information.",
+        "Type reset or /reset to exit file.",
+        "🤯 Brainfart engaged—I'll stay on this file until you reset.",
+    ]
+    if source_label:
+        lines.insert(1, f"Source: {source_label}")
+    return PendingReply("\n".join(lines), "/find select")
+
+
+def _handle_pending_find_selection(
+    sender_id: Any,
+    sender_key: str,
+    text: str,
+) -> Optional[PendingReply]:
+    state = PENDING_FIND_SELECTIONS.get(sender_key)
+    if not state:
+        return None
+    created = float(state.get('created', 0))
+    if (_now() - created) > FIND_SELECTION_TIMEOUT:
+        PENDING_FIND_SELECTIONS.pop(sender_key, None)
+        return PendingReply("⏱️ That search expired. Run `/find <query>` again.", "/find select")
+
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return PendingReply("Reply with the number from the list, or X to cancel.", "/find select")
+    lowered = cleaned.lower()
+    if lowered in {'x', 'cancel', 'n', 'no', 'exit'}:
+        PENDING_FIND_SELECTIONS.pop(sender_key, None)
+        return PendingReply("Okay, no file loaded.", "/find select")
+    try:
+        index = int(cleaned)
+    except ValueError:
+        return PendingReply("Please reply with a number from the list, or X to cancel.", "/find select")
+
+    results = state.get('results') or []
+    if index < 1 or index > len(results):
+        return PendingReply("That number isn't on the list. Try again or reply X to cancel.", "/find select")
+
+    result = results[index - 1]
+    PENDING_FIND_SELECTIONS.pop(sender_key, None)
+    return _activate_find_result(sender_id, sender_key, result, index)
 
 def build_ollama_history(sender_id=None, is_direct=False, channel_idx=None, thread_root_ts=None, max_chars=OLLAMA_CONTEXT_CHARS) -> Tuple[str, bool]:
   """Build a short conversation history string for Ollama based on recent messages.
@@ -9698,7 +11265,7 @@ def send_to_ollama(
     if not is_ai_enabled():
         ai_log("Blocked: AI responses disabled", "ollama")
         return AI_DISABLED_MESSAGE
-    ai_log("Processing message...", "ollama")
+    start_time = time.perf_counter()
     try:
         STATS.record_ai_request()
     except Exception:
@@ -9897,7 +11464,8 @@ def send_to_ollama(
         full_text = "".join(total_parts)
         if not full_text:
             full_text = _format_ai_error("Ollama", "no content returned")
-        ai_log(f"Response ready (len={len(full_text)})", "ollama")
+        elapsed = max(0.01, time.perf_counter() - start_time)
+        ai_log(f"Sent in {elapsed:.1f}s", "ollama")
         return StreamingResult(full_text[:MAX_RESPONSE_LENGTH], sent_chunks=streamed_chunks, truncated=truncated)
 
     try:
@@ -9931,8 +11499,6 @@ def send_to_ollama(
             dprint(f"Ollama raw => {jr}")
             # Extract clean response for logging
             resp = jr.get("response")
-            if resp:
-                ai_log(f"Response ready (len={len(resp)})", "ollama")
             # Ollama may return different fields depending on version; prefer 'response' then 'choices'
             if not resp and isinstance(jr.get("choices"), list) and jr.get("choices"):
                 # choices may contain dicts with 'text' or 'content'
@@ -9940,6 +11506,8 @@ def send_to_ollama(
                 resp = first.get('text') or first.get('content') or resp
             if not resp:
                 resp = _format_ai_error("Ollama", "no content returned")
+            elapsed = max(0.01, time.perf_counter() - start_time)
+            ai_log(f"Sent in {elapsed:.1f}s", "ollama")
             return (resp or "")[:MAX_RESPONSE_LENGTH]
         else:
             status = getattr(r, 'status_code', 'no response')
@@ -10019,6 +11587,8 @@ def get_ai_response(prompt, sender_id=None, is_direct=False, channel_idx=None, t
     print(f"⚠️ Unknown AI provider '{provider}', defaulting to Ollama.")
 
   _log_high_cost(sender_id, "ollama", prompt[:80])
+  # Automatic offline/web context injection disabled; rely on explicit context windows instead.
+
   response = send_to_ollama(
       prompt,
       sender_id=sender_id,
@@ -10582,7 +12152,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     built_in = [
       "/about", "/menu", "/mail", "/checkmail", "/emailhelp", "/wipe",
       "/test",
-      "/motd", "/meshinfo", "/bible", "/biblehelp", "/web", "/drudge", "/chucknorris", "/elpaso", "/blond", "/yomomma",
+      "/motd", "/meshinfo", "/bible", "/biblehelp", "/web", "/wiki", "/find", "/report", "/log", "/drudge", "/chucknorris", "/elpaso", "/blond", "/yomomma",
       "/games", "/blackjack", "/yahtzee", "/hangman", "/wordle", "/wordladder", "/adventure", "/rps", "/coinflip", "/cipher", "/quizbattle", "/morse",
       "/vibe", "/chathistory", "/changemotd", "/changeprompt", "/showprompt", "/printprompt", "/reset"
     ]
@@ -10607,6 +12177,12 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
   elif cmd == "/web":
     remainder = full_text[len(cmd):].strip()
     sender_key = _safe_sender_key(sender_id)
+    author_label = None
+    if sender_id is not None:
+      try:
+        author_label = get_node_shortname(sender_id)
+      except Exception:
+        author_label = str(sender_id)
 
     def _web_help_message() -> str:
       lines = [
@@ -10650,6 +12226,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
       formatted = _format_web_results(query, results)
       context_block = _context_from_results(query, results)
       _record_web_context(formatted, context_block)
+      _persist_offline_ddg(query, results, language_hint=lang, author_label=author_label)
       try:
         clean_log(f"Web search '{query}' → {len(results)} result(s)", "🌐", show_always=False)
       except Exception:
@@ -10684,6 +12261,16 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
       formatted = _format_crawl_results(start_url, pages, contacts, contact_page)
       context_block = _context_from_crawl(start_url, pages, contacts, contact_page)
       _record_web_context(formatted, context_block)
+      _persist_offline_crawl(
+          start_url,
+          formatted,
+          context_block,
+          pages,
+          contacts,
+          contact_page,
+          language_hint=lang,
+          author_label=author_label,
+      )
       try:
         clean_log(f"Web crawl '{start_url}' → {len(pages)} page(s)", "🕸️", show_always=False)
       except Exception:
@@ -10722,11 +12309,88 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     formatted = _format_web_results(query, results)
     context_block = _context_from_results(query, results)
     _record_web_context(formatted, context_block)
+    _persist_offline_ddg(query, results, language_hint=lang, author_label=author_label)
     try:
       clean_log(f"Web search '{query}' → {len(results)} result(s)", "🌐", show_always=False)
     except Exception:
       pass
-    return _cmd_reply(cmd, formatted)
+      return _cmd_reply(cmd, formatted)
+
+  elif cmd == "/find":
+    if not is_direct:
+      return _cmd_reply(cmd, translate(lang, 'dm_only', "❌ This command can only be used in a direct message."))
+    sender_key = _safe_sender_key(sender_id)
+    if not sender_key:
+      return _cmd_reply(cmd, "⚠️ I couldn't identify your DM session. Try again in a moment.")
+    query = full_text[len(cmd):].strip()
+    if not query:
+      return _cmd_reply(cmd, "Use this by typing: /find <keywords>")
+    results = _search_offline_sources(query, lang, limit=FIND_RESULT_LIMIT)
+    if not results:
+      return _cmd_reply(cmd, f"I couldn't find offline results matching '{query}'.")
+    type_badge = {
+      'wiki': 'Wiki',
+      'crawl': 'Web Crawl',
+      'ddg': 'Search',
+      'report': 'Report',
+      'log': 'Log',
+    }
+    lines = ["📂 Offline knowledge matches:"]
+    for idx, item in enumerate(results, 1):
+      entry_type = (item.get('type') or 'wiki').lower()
+      badge = type_badge.get(entry_type, entry_type.title())
+      title = item.get('title') or 'Untitled'
+      lines.append(f"{idx}. [{badge}] {title}")
+      if entry_type in {'report', 'log'}:
+        created = _display_timestamp(item.get('created_at'))
+        author = item.get('author') or 'Unknown'
+        lines.append(f"   {created} • {author}")
+      else:
+        summary = str(item.get('summary') or '').replace('\n', ' ').strip()
+        source = item.get('source') or ''
+        host = ''
+        if source:
+          try:
+            host = urllib.parse.urlparse(source).netloc or source
+          except Exception:
+            host = source
+        snippet_seed = summary or source or item.get('path') or ''
+        snippet = _clip_text(snippet_seed.replace('\n', ' ').strip(), 140)
+        if snippet:
+          if host and host not in snippet:
+            snippet = f"{snippet} ({host})"
+          lines.append(f"   {snippet}")
+    lines.append("Reply with the number to open it, or X to cancel.")
+    PENDING_FIND_SELECTIONS.pop(sender_key, None)
+    PENDING_FIND_SELECTIONS[sender_key] = {
+      'created': _now(),
+      'results': [dict(item) for item in results],
+      'query': query,
+      'language': lang,
+    }
+    return PendingReply("\n".join(lines), "/find search")
+
+  elif cmd in {"/report", "/log"}:
+    if not is_direct:
+      return _cmd_reply(cmd, translate(lang, 'dm_only', "❌ This command can only be used in a direct message."))
+    sender_key = _safe_sender_key(sender_id)
+    if not sender_key:
+      return _cmd_reply(cmd, "⚠️ I couldn't identify your DM session. Try again in a moment.")
+    raw_title = full_text[len(cmd):].strip().strip('"').strip("'")
+    if not raw_title:
+      usage = "/report <title>" if cmd == "/report" else "/log <title>"
+      return _cmd_reply(cmd, f"Use this by typing: {usage}")
+    note_type = 'report' if cmd == "/report" else 'log'
+    icon = "📝" if note_type == 'report' else "🗒️"
+    prompt = f"{icon} What do you want to {'report' if note_type == 'report' else 'log'} for '{raw_title}'?"
+    PENDING_NOTE_INPUTS[sender_key] = {
+      'type': note_type,
+      'title': raw_title,
+      'created': _now(),
+      'language': lang,
+    }
+    clean_log(f"Awaiting {note_type} body: {raw_title}", "🕘", show_always=False)
+    return PendingReply(prompt, f"/{note_type} capture")
 
   elif cmd == "/drudge":
     # Fetch current Drudge Report headlines. Not DM-only.
@@ -10770,10 +12434,67 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     query = full_text[len(cmd):].strip()
     if not query:
       return _cmd_reply(cmd, "Use this by typing: /wiki <topic>")
-
-    if OFFLINE_WIKI_ENABLED and OFFLINE_WIKI_STORE is not None and OFFLINE_WIKI_STORE.is_ready():
+    wiki_author_label = None
+    if sender_id is not None:
       try:
-        article, suggestions = OFFLINE_WIKI_STORE.lookup(
+        wiki_author_label = get_node_shortname(sender_id)
+      except Exception:
+        wiki_author_label = str(sender_id)
+
+    # 1) Try live Wikipedia API for freshest content
+    try:
+      wiki_lang = _wiki_lang_code(lang)
+      live = _fetch_wikipedia_article(query, max_chars=WIKI_MAX_CHARS, lang=wiki_lang)
+      if live:
+        title = live.get("title") or query
+        extract = live.get("extract") or live.get("content") or ""
+        # Reply minimally: summary + first 2 more paragraphs
+        paras = [p.strip() for p in (extract or "").split("\n\n") if p.strip()]
+        lines = [f"📚 {title}"]
+        if live.get("summary"):
+          lines.append(live.get("summary"))
+        extra_paras = paras[1:3] if paras else []
+        if extra_paras:
+          joined = "\n".join(extra_paras)
+          if len(joined) > 800:
+            joined = joined[:797].rstrip() + "…"
+          lines.append(joined)
+        if live.get("url"):
+          lines.append(f"Source: {live.get('url')}")
+        formatted = "\n".join(lines)
+        sender_key = _safe_sender_key(sender_id)
+        if sender_key and extract:
+          _store_web_context(sender_key, formatted, context=_format_wiki_context(live))
+        # Save/refresh offline copy for next time
+        target_store = _get_wiki_store_for_lang(lang)
+        if OFFLINE_WIKI_ENABLED and target_store is not None and OFFLINE_WIKI_AUTOSAVE_FROM_WIKI:
+          try:
+            target_store.store_article(
+              title=live.get("title") or query,
+              content=extract,
+              summary=live.get("summary"),
+              source=live.get("url"),
+              aliases=[query],
+              overwrite=True,
+              summary_limit=OFFLINE_WIKI_SUMMARY_LIMIT,
+              context_limit=OFFLINE_WIKI_CONTEXT_LIMIT,
+            )
+          except Exception:
+            pass
+        return _cmd_reply(cmd, formatted)
+    except RuntimeError as exc:
+      if str(exc) != "offline":
+        # Non-offline error; fall through to other strategies
+        pass
+      else:
+        # Hard offline → try local store
+        pass
+
+    # 2) Fallback to offline store when available
+    store_for_lang = _get_wiki_store_for_lang(lang)
+    if OFFLINE_WIKI_ENABLED and store_for_lang is not None and store_for_lang.is_ready():
+      try:
+        article, suggestions = store_for_lang.lookup(
           query,
           summary_limit=OFFLINE_WIKI_SUMMARY_LIMIT,
           context_limit=OFFLINE_WIKI_CONTEXT_LIMIT,
@@ -10782,25 +12503,39 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
         article, suggestions = None, []
       if article:
         lines = [f"📚 {article.title}"]
-        if article.summary:
+        # First three paragraphs from cached content
+        paras = [p.strip() for p in (article.content or "").split("\n\n") if p.strip()]
+        if paras:
+          joined = "\n".join(paras[:3])
+          if len(joined) > 800:
+            joined = joined[:797].rstrip() + "…"
+          lines.append(joined)
+        elif article.summary:
           lines.append(article.summary)
-        context_len = min(len(article.content), OFFLINE_WIKI_CONTEXT_LIMIT)
-        lines.append(f"Loaded about {context_len} chars of context. Ask follow-up questions or send /reset to clear.")
         if article.source:
           lines.append(f"Source: {article.source}")
         formatted = "\n".join(lines)
         sender_key = _safe_sender_key(sender_id)
         if sender_key and article.content:
           _store_web_context(sender_key, formatted, context=article.content)
+        try:
+          STATS.record_wiki_served(article.title)
+          clean_log(f"Served offline wiki: {article.title}", "📤")
+        except Exception:
+          pass
         return _cmd_reply(cmd, formatted)
       else:
         if suggestions:
           hint = ", ".join(suggestions)
           return _cmd_reply(cmd, f"📚 Not found. Try: {hint}")
 
-    # Fallback to web search constrained to Wikipedia
+    # 3) Last resort: DDG top results (lightweight)
     try:
-      results = _web_search_duckduckgo(f"site:wikipedia.org {query}")
+      domain_like = bool(re.search(r"[a-z0-9]+\.[a-z]{2,}", query.lower()))
+      ddg_query = query if domain_like else f"site:wikipedia.org {query}"
+      results = _web_search_duckduckgo(ddg_query)
+      if not results and not domain_like:
+        results = _web_search_duckduckgo(query)
     except RuntimeError as exc:
       message = str(exc)
       if message == "offline":
@@ -10812,6 +12547,13 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
     sender_key = _safe_sender_key(sender_id)
     if sender_key:
       _store_web_context(sender_key, formatted, context=context_block)
+    _persist_offline_ddg(query, results, language_hint=lang, author_label=wiki_author_label)
+    # Opportunistically queue an offline download so next time is instant
+    if OFFLINE_WIKI_AUTOSAVE_FROM_WIKI:
+      try:
+        _enqueue_offline_wiki_download(query, lang)
+      except Exception:
+        pass
     return _cmd_reply(cmd, formatted)
 
   elif cmd == "/offline":
@@ -10823,6 +12565,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
       helper_lines = [
         "Offline toolkit:",
         "• wiki <topic> — load encyclopedia context without the internet.",
+        "• search <query> — find matching offline topics.",
       ]
       return _cmd_reply(cmd, "\n".join(helper_lines))
 
@@ -10834,6 +12577,9 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
       "wiki": "wiki",
       "wikipedia": "wiki",
       "wifi": "wiki",
+      "search": "search",
+      "find": "search",
+      "lookup": "search",
     }
     subcmd = offline_aliases.get(subcmd_raw)
     if not subcmd:
@@ -10844,16 +12590,17 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
         return _cmd_reply(cmd, f"Offline toolkit commands:\n• wiki <topic> (you wrote '{subcmd_raw}')")
 
     if subcmd == "wiki":
-      if not OFFLINE_WIKI_ENABLED or OFFLINE_WIKI_STORE is None:
+      store_for_lang = _get_wiki_store_for_lang(lang)
+      if not OFFLINE_WIKI_ENABLED or store_for_lang is None:
         return _cmd_reply(cmd, "📚 Offline wiki support is disabled on this node.")
-      if not OFFLINE_WIKI_STORE.is_ready():
-        error = OFFLINE_WIKI_STORE.error_message() or f"Install offline data at {OFFLINE_WIKI_INDEX}."
+      if not store_for_lang.is_ready():
+        error = store_for_lang.error_message() or f"Install offline data at {OFFLINE_WIKI_DIR}."
         return _cmd_reply(cmd, f"📚 Offline wiki not ready: {error}")
       if not argument:
         return _cmd_reply(cmd, "Use this by typing: /offline wiki <topic>")
 
       try:
-        article, suggestions = OFFLINE_WIKI_STORE.lookup(
+        article, suggestions = store_for_lang.lookup(
           argument,
           summary_limit=OFFLINE_WIKI_SUMMARY_LIMIT,
           context_limit=OFFLINE_WIKI_CONTEXT_LIMIT,
@@ -10866,7 +12613,7 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
         if suggestions:
           suggestion_line = ", ".join(suggestions)
           return _cmd_reply(cmd, f"📚 I couldn't find '{argument}'. Try: {suggestion_line}")
-        available = list(itertools.islice(OFFLINE_WIKI_STORE.available_topics(), 5))
+        available = list(itertools.islice(store_for_lang.available_topics(), 5))
         if available:
           catalog = ", ".join(available)
           helper = (
@@ -10895,7 +12642,34 @@ def handle_command(cmd, full_text, sender_id, is_direct=False, channel_idx=None,
 
       origin = article.matched_alias if article.matched_alias else argument
       clean_log(f"Offline wiki request '{origin}' → {article.title}", "📦", show_always=False)
+      try:
+        STATS.record_wiki_served(article.title)
+        clean_log(f"Served offline wiki: {article.title}", "📤")
+      except Exception:
+        pass
       return _cmd_reply(cmd, formatted)
+
+    if subcmd == "search":
+      store_for_lang = _get_wiki_store_for_lang(lang)
+      if not OFFLINE_WIKI_ENABLED or store_for_lang is None:
+        return _cmd_reply(cmd, "📚 Offline wiki support is disabled on this node.")
+      if not store_for_lang.is_ready():
+        error = store_for_lang.error_message() or f"Install offline data at {OFFLINE_WIKI_DIR}."
+        return _cmd_reply(cmd, f"📚 Offline wiki not ready: {error}")
+      if not argument:
+        return _cmd_reply(cmd, "Use this by typing: /offline search <keywords>")
+      matches = _search_offline_wiki_entries(store_for_lang, argument, limit=6)
+      if not matches:
+        return _cmd_reply(cmd, f"📚 No offline matches for '{argument}'. Try /wiki {argument} to fetch it online.")
+      lines = ["📚 Offline wiki matches:"]
+      for entry in matches:
+        summary = entry.get('summary') or ''
+        if summary and len(summary) > 140:
+          summary = summary[:137].rstrip() + "…"
+        detail = f" — {summary}" if summary else ""
+        lines.append(f"• {entry.get('title')} ({entry.get('path')}){detail}")
+      lines.append("Use /offline wiki <title> to load a result.")
+      return _cmd_reply(cmd, "\n".join(lines))
 
     return _cmd_reply(cmd, "Offline toolkit commands:\n• wiki <topic>")
 
@@ -11684,14 +13458,16 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
       else:
         return PendingReply("Please reply Y or N to confirm the block.", "blacklist confirm")
 
-    if lower in {"/stop", "stop"}:
+    if lower == "/stop":
       if check_only:
         return True
+      bible_stopped = False
       try:
-        _stop_bible_autoscroll(sender_key)
+        bible_stopped = _stop_bible_autoscroll(sender_key)
       except Exception:
-        pass
+        bible_stopped = False
       _set_user_muted(sender_key, True)
+      _cancel_auto_resume(sender_key)
       RESEND_MANAGER.cancel_for_sender(sender_key)
       removed = cancel_pending_responses_for_sender(sender_key)
       try:
@@ -11703,11 +13479,23 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
           ALARM_TIMER_MANAGER.pause_for_user(sender_key)
       except Exception:
         pass
-      note = f"✅ Paused. Use /start or /resume to continue. (cleared {removed} queued replies)"
+      if bible_stopped:
+        extra_note = " Reply 22 to resume Bible auto-scroll."
+      else:
+        if AUTO_RESUME_DELAY_SECONDS % 60 == 0:
+          minutes = AUTO_RESUME_DELAY_SECONDS // 60
+          unit = "minute" if minutes == 1 else "minutes"
+          extra_note = f" I'll auto-resume in {minutes} {unit}."
+        else:
+          extra_note = f" I'll auto-resume in {AUTO_RESUME_DELAY_SECONDS} seconds."
+        if sender_id is not None:
+          _schedule_auto_resume(sender_key, sender_id, lang)
+      note = f"✅ Paused. Use /start or /resume to continue. (cleared {removed} queued replies){extra_note}"
       return PendingReply(note, "stop command")
-    if lower in {"/start", "start", "/resume", "resume", "/continue", "continue", "/unmute", "unmute"}:
+    if lower in {"/start", "/resume", "/continue", "/unmute"}:
       if check_only:
         return True
+      _cancel_auto_resume(sender_key)
       _set_user_muted(sender_key, False)
       if _is_user_blocked(sender_key):
         # If blocked, inform to use unblock
@@ -11882,6 +13670,31 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
       if not check_only:
         _clear_bible_nav(sender_key)
 
+  if is_direct and sender_key and sender_key in PENDING_NOTE_INPUTS and not text.startswith("/"):
+    if check_only:
+      return True
+    state = PENDING_NOTE_INPUTS.get(sender_key)
+    if state:
+      if (_now() - state.get('created', 0)) > 600:
+        note_type = state.get('type') or 'report'
+        title = state.get('title') or 'Untitled'
+        icon = "📝" if note_type == 'report' else "🗒️"
+        PENDING_NOTE_INPUTS.pop(sender_key, None)
+        return PendingReply(f"⏱️ That {note_type} prompt for '{title}' expired. Run /{note_type} again to restart.", f"/{note_type} expired")
+      state = PENDING_NOTE_INPUTS.pop(sender_key, None)
+      note_type = state.get('type') or 'report'
+      title = state.get('title') or 'Untitled'
+      lang_state = state.get('language') or lang
+      success, message = _store_user_note(note_type, title, text, sender_id, sender_key, lang_state)
+      return PendingReply(message, f"/{note_type} saved")
+
+  if is_direct and sender_key and sender_key in PENDING_FIND_SELECTIONS and not text.startswith("/"):
+    if check_only:
+      return True
+    db_reply = _handle_pending_find_selection(sender_id, sender_key, text)
+    if db_reply:
+      return db_reply
+
   if sender_key and sender_key in PENDING_RECALL_SELECTIONS and not text.startswith("/"):
     if check_only:
       return True
@@ -11897,6 +13710,11 @@ def parse_incoming_text(text, sender_id, is_direct, channel_idx, thread_root_ts=
 
   sanitized = text.replace('\u0007', '').strip()
   normalized = sanitized.lower()
+  try:
+    if sender_key and sanitized:
+      _maybe_autoset_user_language(sender_key, sanitized)
+  except Exception:
+    pass
 
   if is_direct and sanitized and not sanitized.startswith('/'):
     promoted = promote_bare_command(sanitized, _known_commands(), resolve_command_token)
@@ -12157,19 +13975,18 @@ def on_receive(packet=None, interface=None, **kwargs):
       return
     sender_display = _node_display_label(sender_node)
     normalized_text = (text or "").strip()
+    try:
+      _maybe_queue_topic_prefetch(normalized_text)
+    except Exception:
+      pass
     msg_length = len(normalized_text)
     if sender_key and _is_heartbeat_text(normalized_text):
         NODE_HEARTBEAT_LAST[sender_key] = _now()
-    sender_token = f"[NODE:{sender_display}]"
-    if to_node_int == BROADCAST_ADDR:
-      dest_display = _channel_display_name(ch_idx)
-      dest_token = f"[DEST:channel:{ch_idx}]"
-      dest_label = f"[Channel #{ch_idx}]"
-    else:
-      dest_display = _node_display_label(raw_to or to_node_int)
-      dest_token = f"[DEST:node:{dest_display}]"
-      dest_label = "[DM]"
-    info_print(f"📨 {sender_token} {sender_display} → {dest_token} {dest_display} {dest_label} (len={msg_length})")
+    is_direct_message = to_node_int != BROADCAST_ADDR
+    summary_label = "DM message" if is_direct_message else "Chat message"
+    trailing_emoji = "💌" if is_direct_message else "💬"
+    summary_text = summary_label
+    clean_log(f"{summary_text} {trailing_emoji}", emoji="", show_always=False)
 
     entry = log_message(
         sender_node,
@@ -12526,6 +14343,354 @@ def logs_stream():
     mimetype="text/event-stream"
   )
 
+# -----------------------------
+# Offline Wiki Dashboard APIs
+# -----------------------------
+@app.route("/dashboard/wiki/list", methods=["GET"])
+def dashboard_wiki_list():
+  if not OFFLINE_WIKI_ENABLED or (OFFLINE_WIKI_STORE is None and not OFFLINE_WIKI_MULTI_LANGUAGE):
+    return jsonify({"ok": False, "error": "offline wiki disabled"}), 400
+  try:
+    lang = request.args.get('lang')
+    store = _get_wiki_store_for_lang(lang) if OFFLINE_WIKI_MULTI_LANGUAGE else OFFLINE_WIKI_STORE
+    if store is None:
+      return jsonify({"ok": False, "error": "offline wiki store unavailable"}), 400
+    entries = store.list_entries()
+    total = len(entries)
+    total_bytes = sum(int(e.get('size_bytes') or 0) for e in entries)
+    mtimes = [e.get('mtime_iso') for e in entries if e.get('mtime_iso')]
+    oldest = min(mtimes) if mtimes else None
+    newest = max(mtimes) if mtimes else None
+    stats = {
+      'count': total,
+      'bytes': total_bytes,
+      'oldest': oldest,
+      'newest': newest,
+      'downloads_today': OFFLINE_WIKI_DL_COUNT_TODAY,
+      'daily_cap': OFFLINE_WIKI_DAILY_CAP,
+      'feed_enabled': OFFLINE_WIKI_FEED_ENABLED,
+    }
+    base_dir = store.base_dir.as_posix() if hasattr(store, 'base_dir') else OFFLINE_WIKI_DIR.as_posix()
+    return jsonify({"ok": True, "entries": entries, "dir": base_dir, "stats": stats, "lang": lang or _wiki_lang_code(None)}), 200
+  except Exception as exc:
+    return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/dashboard/wiki/delete", methods=["POST"])
+def dashboard_wiki_delete():
+  if not OFFLINE_WIKI_ENABLED or (OFFLINE_WIKI_STORE is None and not OFFLINE_WIKI_MULTI_LANGUAGE):
+    return jsonify({"ok": False, "error": "offline wiki disabled"}), 400
+  try:
+    payload = request.get_json(force=True, silent=True) or {}
+  except Exception:
+    payload = {}
+  title = str(payload.get("title") or payload.get("key") or "").strip()
+  lang = str(payload.get('lang') or '').strip() or None
+  if not title:
+    return jsonify({"ok": False, "error": "missing title/key"}), 400
+  try:
+    store = _get_wiki_store_for_lang(lang) if OFFLINE_WIKI_MULTI_LANGUAGE else OFFLINE_WIKI_STORE
+    if store is None:
+      return jsonify({"ok": False, "error": "offline wiki store unavailable"}), 400
+    removed = store.delete(title)
+    if removed:
+      clean_log(f"Deleted offline wiki: {title}", "🗑️")
+      try:
+        STATS.record_wiki_deleted(title)
+      except Exception:
+        pass
+    return jsonify({"ok": bool(removed)}), 200
+  except Exception as exc:
+    return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/dashboard/wiki/prune", methods=["POST"])
+def dashboard_wiki_prune():
+  if not OFFLINE_WIKI_ENABLED or (OFFLINE_WIKI_STORE is None and not OFFLINE_WIKI_MULTI_LANGUAGE):
+    return jsonify({"ok": False, "error": "offline wiki disabled"}), 400
+  try:
+    payload = request.get_json(force=True, silent=True) or {}
+  except Exception:
+    payload = {}
+  try:
+    max_articles = payload.get("max")
+    if max_articles is None:
+      max_articles = OFFLINE_WIKI_MAX_ARTICLES
+    max_articles = int(max_articles)
+  except Exception:
+    max_articles = OFFLINE_WIKI_MAX_ARTICLES
+  try:
+    lang = str(payload.get('lang') or '').strip() or None
+    store = _get_wiki_store_for_lang(lang) if OFFLINE_WIKI_MULTI_LANGUAGE else OFFLINE_WIKI_STORE
+    if store is None:
+      return jsonify({"ok": False, "error": "offline wiki store unavailable"}), 400
+    result = store.prune_by_max(max_articles)
+    if result.get("removed", 0) > 0:
+      clean_log(f"Pruned offline wiki to {result.get('after', 0)} entries", "🧹")
+    return jsonify({"ok": True, "result": result}), 200
+  except Exception as exc:
+    return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/dashboard/wiki/get", methods=["GET"])
+def dashboard_wiki_get():
+  if not OFFLINE_WIKI_ENABLED or (OFFLINE_WIKI_STORE is None and not OFFLINE_WIKI_MULTI_LANGUAGE):
+    return jsonify({"ok": False, "error": "offline wiki disabled"}), 400
+  title = request.args.get('title') or ''
+  lang = request.args.get('lang') or None
+  if not title.strip():
+    return jsonify({"ok": False, "error": "missing title"}), 400
+  try:
+    store = _get_wiki_store_for_lang(lang) if OFFLINE_WIKI_MULTI_LANGUAGE else OFFLINE_WIKI_STORE
+    if store is None:
+      return jsonify({"ok": False, "error": "offline wiki store unavailable"}), 400
+    article, suggestions = store.lookup(title, summary_limit=OFFLINE_WIKI_SUMMARY_LIMIT, context_limit=OFFLINE_WIKI_CONTEXT_LIMIT)
+    if not article:
+      return jsonify({"ok": False, "error": "not found", "suggestions": suggestions}), 404
+    payload = {
+      'title': article.title,
+      'summary': article.summary,
+      'content': article.content,
+      'source': article.source,
+    }
+    return jsonify({"ok": True, "article": payload}), 200
+  except Exception as exc:
+    return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+def _normalize_offline_type(value: Optional[str]) -> str:
+  if not value:
+    return 'wiki'
+  lowered = str(value).strip().lower()
+  if lowered in {'crawl', 'crawls', 'web', 'webcrawl', 'web_crawl', 'offline_crawl'}:
+    return 'crawl'
+  if lowered in {'ddg', 'search', 'searches', 'duckduckgo'}:
+    return 'ddg'
+  if lowered in {'report', 'reports'}:
+    return 'report'
+  if lowered in {'log', 'logs'}:
+    return 'log'
+  return 'wiki'
+
+
+def _resolve_offline_store(entry_type: str, lang: Optional[str]):
+  if entry_type == 'crawl':
+    if not OFFLINE_CRAWL_ENABLED:
+      return None
+    return _get_crawl_store_for_lang(lang) if OFFLINE_CRAWL_MULTI_LANGUAGE else OFFLINE_CRAWL_STORE
+  if entry_type == 'ddg':
+    if not OFFLINE_DDG_ENABLED:
+      return None
+    return _get_ddg_store_for_lang(lang) if OFFLINE_DDG_MULTI_LANGUAGE else OFFLINE_DDG_STORE
+  if entry_type == 'report':
+    return REPORTS_STORE if REPORTS_ENABLED else None
+  if entry_type == 'log':
+    return LOGS_STORE if LOGS_ENABLED else None
+  if not OFFLINE_WIKI_ENABLED:
+    return None
+  return _get_wiki_store_for_lang(lang) if OFFLINE_WIKI_MULTI_LANGUAGE else OFFLINE_WIKI_STORE
+
+
+def _offline_base_dir(store, entry_type: str):
+  if store is not None and hasattr(store, 'base_dir'):
+    base = store.base_dir
+  else:
+    if entry_type == 'crawl':
+      base = OFFLINE_CRAWL_DIR
+    elif entry_type == 'ddg':
+      base = OFFLINE_DDG_DIR
+    elif entry_type == 'report':
+      base = REPORTS_DIR
+    elif entry_type == 'log':
+      base = LOGS_DIR
+    else:
+      base = OFFLINE_WIKI_DIR
+  try:
+    return base.as_posix()
+  except Exception:
+    return str(base)
+
+
+def _build_offline_stats(entry_type: str, entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+  total = len(entries)
+  total_bytes = sum(int(entry.get('size_bytes') or 0) for entry in entries)
+  mtimes = [entry.get('mtime_iso') for entry in entries if entry.get('mtime_iso')]
+  newest = max(mtimes) if mtimes else None
+  oldest = min(mtimes) if mtimes else None
+  stats: Dict[str, Any] = {
+    'count': total,
+    'bytes': total_bytes,
+    'newest': newest,
+    'oldest': oldest,
+  }
+  if entry_type == 'wiki':
+    stats.update({
+      'downloads_today': OFFLINE_WIKI_DL_COUNT_TODAY,
+      'daily_cap': OFFLINE_WIKI_DAILY_CAP,
+      'feed_enabled': OFFLINE_WIKI_FEED_ENABLED,
+    })
+  elif entry_type in {'crawl', 'ddg'}:
+    recent = 0
+    now_utc = datetime.now(tz=timezone.utc)
+    for entry in entries:
+      fetched_at = entry.get('fetched_at')
+      dt = _parse_iso8601(fetched_at)
+      if dt and (now_utc - dt).total_seconds() <= 86400:
+        recent += 1
+    stats['recent_captures'] = recent
+  else:
+    recent = 0
+    now_utc = datetime.now(tz=timezone.utc)
+    for entry in entries:
+      created_at = entry.get('created_at')
+      dt = _parse_iso8601(created_at)
+      if dt and (now_utc - dt).total_seconds() <= 86400:
+        recent += 1
+    stats['recent_entries'] = recent
+  return stats
+
+
+@app.route("/dashboard/offline/list", methods=["GET"])
+def dashboard_offline_list():
+  entry_type = _normalize_offline_type(request.args.get('type'))
+  lang = request.args.get('lang') or None
+  store = _resolve_offline_store(entry_type, lang)
+  if store is None:
+    return jsonify({"ok": False, "error": f"offline {entry_type} store unavailable"}), 400
+  try:
+    entries = store.list_entries()
+  except Exception as exc:
+    return jsonify({"ok": False, "error": str(exc)}), 500
+  stats = _build_offline_stats(entry_type, entries)
+  resolved_lang = lang or _wiki_lang_code(None)
+  payload = {
+    "ok": True,
+    "entries": entries,
+    "dir": _offline_base_dir(store, entry_type),
+    "stats": stats,
+    "lang": resolved_lang,
+    "type": entry_type,
+  }
+  return jsonify(payload), 200
+
+
+@app.route("/dashboard/offline/delete", methods=["POST"])
+def dashboard_offline_delete():
+  try:
+    payload = request.get_json(force=True, silent=True) or {}
+  except Exception:
+    payload = {}
+  entry_type = _normalize_offline_type(payload.get('type'))
+  lang = payload.get('lang') or None
+  key = str(payload.get('key') or payload.get('title') or '').strip()
+  if not key:
+    return jsonify({"ok": False, "error": "missing key"}), 400
+  store = _resolve_offline_store(entry_type, lang)
+  if store is None:
+    return jsonify({"ok": False, "error": f"offline {entry_type} store unavailable"}), 400
+  try:
+    removed = bool(store.delete(key))
+  except Exception as exc:
+    return jsonify({"ok": False, "error": str(exc)}), 500
+  if removed:
+    emoji = "🗑️"
+    clean_log(f"Deleted offline {entry_type}: {key}", emoji, show_always=False)
+  return jsonify({"ok": removed}), 200
+
+
+@app.route("/dashboard/offline/prune", methods=["POST"])
+def dashboard_offline_prune():
+  try:
+    payload = request.get_json(force=True, silent=True) or {}
+  except Exception:
+    payload = {}
+  entry_type = _normalize_offline_type(payload.get('type'))
+  lang = payload.get('lang') or None
+  max_entries = payload.get('max')
+  if max_entries is None:
+    max_entries = OFFLINE_WIKI_MAX_ARTICLES if entry_type == 'wiki' else OFFLINE_CRAWL_MAX_ENTRIES
+  try:
+    max_entries = int(max_entries)
+  except Exception:
+    max_entries = OFFLINE_WIKI_MAX_ARTICLES if entry_type == 'wiki' else OFFLINE_CRAWL_MAX_ENTRIES
+  store = _resolve_offline_store(entry_type, lang)
+  if store is None:
+    return jsonify({"ok": False, "error": f"offline {entry_type} store unavailable"}), 400
+  try:
+    result = store.prune_by_max(max_entries)
+  except Exception as exc:
+    return jsonify({"ok": False, "error": str(exc)}), 500
+  if result.get('removed', 0) > 0:
+    clean_log(f"Pruned offline {entry_type} to {result.get('after', 0)} entries", "🧹", show_always=False)
+  return jsonify({"ok": True, "result": result}), 200
+
+
+@app.route("/dashboard/offline/get", methods=["GET"])
+def dashboard_offline_get():
+  entry_type = _normalize_offline_type(request.args.get('type'))
+  lang = request.args.get('lang') or None
+  key = request.args.get('key') or request.args.get('title') or ''
+  if not key.strip():
+    return jsonify({"ok": False, "error": "missing key"}), 400
+  store = _resolve_offline_store(entry_type, lang)
+  if store is None:
+    return jsonify({"ok": False, "error": f"offline {entry_type} store unavailable"}), 400
+  try:
+    if entry_type == 'wiki':
+      article, suggestions = store.lookup(key, summary_limit=OFFLINE_WIKI_SUMMARY_LIMIT, context_limit=OFFLINE_WIKI_CONTEXT_LIMIT)
+      if not article:
+        return jsonify({"ok": False, "error": "not found", "suggestions": suggestions}), 404
+      payload = {
+        'title': article.title,
+        'summary': article.summary,
+        'content': article.content,
+        'source': article.source,
+        'type': 'wiki',
+      }
+    elif entry_type == 'crawl':
+      record, suggestions = store.lookup(key)
+      if not record:
+        return jsonify({"ok": False, "error": "not found", "suggestions": suggestions}), 404
+      payload = {
+        'title': record.title,
+        'summary': record.summary,
+        'context': record.context,
+        'source': record.source,
+        'fetched_at': record.fetched_at,
+        'pages': record.pages,
+        'contacts': record.contacts,
+        'contact_page': record.contact_page,
+        'type': 'crawl',
+      }
+    elif entry_type == 'ddg':
+      record, suggestions = store.lookup(key)
+      if not record:
+        return jsonify({"ok": False, "error": "not found", "suggestions": suggestions}), 404
+      payload = {
+        'title': record.title,
+        'summary': record.summary,
+        'context': record.context,
+        'source': record.source,
+        'fetched_at': record.fetched_at,
+        'results': record.results,
+        'type': 'ddg',
+      }
+    else:  # report/log
+      record = store.lookup(key)
+      if not record:
+        return jsonify({"ok": False, "error": "not found"}), 404
+      payload = {
+        'title': record.title,
+        'summary': record.summary,
+        'content': record.content,
+        'author': record.author,
+        'created_at': record.created_at,
+        'type': entry_type,
+      }
+    return jsonify({"ok": True, "entry": payload, "type": entry_type}), 200
+  except Exception as exc:
+    return jsonify({"ok": False, "error": str(exc)}), 500
+
 
 _LOG_URL_PATTERN = re.compile(r"(https?://\S+)")
 
@@ -12585,10 +14750,11 @@ def _inject_emoji_html(escaped_text: str) -> str:
 
 def _render_log_line_html(line: str) -> str:
   normalized = _normalize_log_timestamp(line)
-  if len(normalized) > LOG_VIEWER_CHAR_LIMIT:
-    normalized = _truncate_for_log(normalized, LOG_VIEWER_CHAR_LIMIT)
-  css_class = _classify_log_line(normalized)
-  safe = html.escape(normalized, quote=False)
+  display = _summarize_log_line(normalized)
+  if len(display) > LOG_VIEWER_CHAR_LIMIT:
+    display = _truncate_for_log(display, LOG_VIEWER_CHAR_LIMIT)
+  css_class = _classify_log_line(display)
+  safe = html.escape(display, quote=False)
   safe = _LOG_URL_PATTERN.sub(lambda m: f'<a href="{m.group(1)}" target="_blank" rel="noopener">{m.group(1)}</a>', safe)
   safe = _inject_emoji_html(safe)
   classes = "log-line"
@@ -12607,531 +14773,6 @@ def mesh_locations_kml():
   return Response(kml, headers=headers)
 
 
-@app.route("/logs", methods=["GET"])
-def logs():
-    try:
-        uptime = datetime.now(timezone.utc) - server_start_time
-        uptime_str = _humanize_uptime(uptime)
-        now_local_dt = datetime.now().astimezone()
-        rounded_now = (now_local_dt + timedelta(seconds=30)).replace(second=0, microsecond=0)
-        now_local = rounded_now.strftime("%b %d %H:%M %Z")
-
-        visible = [
-            line for line in script_logs
-            if (_viewer_should_show(line) if _viewer_filter_enabled else True)
-        ]
-        log_text = "".join(_render_log_line_html(line) for line in visible)
-
-        lang_for_proverbs = LANGUAGE_FALLBACK
-        proverb_lang_key = _proverb_language_key(lang_for_proverbs)
-        initial_proverb = _next_proverb(lang_for_proverbs)
-        proverb_index_js = PROVERB_INDEX_TRACKER.get(proverb_lang_key, 0)
-        proverb_list = _load_proverbs(lang_for_proverbs)
-        proverbs_json = json.dumps(proverb_list, ensure_ascii=False)
-        initial_proverb_html = _inject_emoji_html(html.escape(initial_proverb, quote=False))
-        proverb_interval_ms = 60000
-        fade_duration_ms = 1200
-        emoji_html_map_json = json.dumps({emoji: _twemoji_img(emoji) for emoji in LOG_EMOJI_SVG}, ensure_ascii=False)
-        emoji_keys_json = json.dumps(_LOG_EMOJI_KEYS, ensure_ascii=False)
-
-        html_page = f"""<html>
-  <head>
-    <title>MESH-MASTER Logs - Smooth Stream</title>
-    <style>
-      body {{
-        background:#000;
-        color:#dfe5f1;
-        font-family: 'Segoe UI', 'Noto Sans', 'Liberation Sans', 'Helvetica Neue', Arial, 'Twemoji Mozilla', 'Noto Color Emoji', 'Segoe UI Emoji', 'Apple Color Emoji', sans-serif;
-        padding:20px;
-        margin:0;
-        overflow-x:hidden;
-      }}
-      body::before {{
-        content:'';
-        position:fixed;
-        top:0; left:0; right:0; bottom:0;
-        background: radial-gradient(circle at 20% 20%, rgba(255,255,255,0.15) 0%, rgba(255,255,255,0) 60%),
-                    radial-gradient(circle at 80% 30%, rgba(120,200,255,0.125) 0%, rgba(0,0,0,0) 55%),
-                    radial-gradient(circle at 50% 80%, rgba(255,180,255,0.1) 0%, rgba(0,0,0,0) 60%),
-                    #000;
-        background-size:400px 400px, 600px 600px, 500px 500px;
-        animation: starfield 240s linear infinite;
-        z-index:-2;
-      }}
-      @keyframes starfield {{
-        from {{ background-position: 0px 0px, 0px 0px, 0px 0px; }}
-        to {{ background-position: -800px -200px, 600px -400px, -400px 600px; }}
-      }}
-      pre {{
-        white-space: pre-wrap;
-        word-break: break-word;
-        margin:0;
-        padding-bottom:100px;
-      }}
-      .header {{
-        position:fixed;
-        top:0;
-        left:0;
-        right:0;
-        background:rgba(0,0,0,0.9);
-        padding:14px 20px 12px;
-        border-bottom:1px solid #333;
-        z-index:1000;
-        text-align:center;
-      }}
-      .content {{
-        margin-top:150px;
-        text-align:center;
-      }}
-      .logbox {{
-        position:relative;
-        height: calc(100vh - 220px);
-        overflow-y: auto;
-        white-space: pre-wrap;
-        word-break: break-word;
-        margin:0;
-        padding:20px 12px 140px;
-        display:flex;
-        flex-direction:column;
-        justify-content:flex-end;
-        gap:6px;
-      }}
-      .logbox::before {{
-        content:"";
-        position:sticky;
-        top:0;
-        left:0;
-        right:0;
-        height:50px;
-        pointer-events:none;
-        background:linear-gradient(to bottom, rgba(0,0,0,0.9) 0%, rgba(0,0,0,0) 80%);
-        z-index:1;
-      }}
-      .scroll-indicator {{
-        display:flex;
-        align-items:center;
-        gap:6px;
-        background:#333;
-        padding:4px 12px;
-        border-radius:6px;
-        min-width:150px;
-        justify-content:center;
-      }}
-      .scroll-indicator .arrow {{
-        font-size:14px;
-        opacity:0;
-        display:inline-flex;
-        align-items:center;
-      }}
-      .scroll-indicator.on .arrow {{
-        opacity:0.6;
-        animation:drift 2.4s ease-in-out infinite;
-      }}
-      .scroll-indicator .label {{
-        text-transform:uppercase;
-        letter-spacing:0.08em;
-        font-size:0.72rem;
-        color:#cfd9e6;
-      }}
-      .heartbeat-indicator {{
-        font-size:0.72rem;
-        color:#f06292;
-        display:inline-flex;
-        align-items:center;
-        margin-right:4px;
-        opacity:0.7;
-        transition:transform 0.3s ease, opacity 0.3s ease;
-      }}
-      .heartbeat-indicator.inactive {{
-        opacity:0.3;
-      }}
-      .heartbeat-indicator.pulse {{
-        animation: viewer-heartbeat 1s ease-in-out;
-      }}
-      .status-bar {{
-        display:flex;
-        justify-content:center;
-        align-items:center;
-        gap:16px;
-        flex-wrap:wrap;
-        margin-bottom:10px;
-      }}
-      .status-meta {{
-        display:flex;
-        gap:12px;
-        background:rgba(0,0,0,0.45);
-        padding:4px 12px;
-        border-radius:8px;
-      }}
-      .status-meta span {{
-        color:#9eb6d4;
-        font-size:0.85rem;
-      }}
-      @keyframes rise-scale {{
-        0% {{ transform: translateY(22px) scale(0.68); opacity:0; }}
-        35% {{ transform: translateY(14px) scale(0.8); opacity:0.55; }}
-        65% {{ transform: translateY(6px) scale(0.92); opacity:0.85; }}
-        100% {{ transform: translateY(0) scale(1); opacity:1; }}
-      }}
-      @keyframes drift {{
-        0% {{ transform:translateY(-2px); opacity:0.2; }}
-        35% {{ transform:translateY(1px); opacity:0.7; }}
-        65% {{ transform:translateY(-1px); opacity:0.6; }}
-        100% {{ transform:translateY(-2px); opacity:0.2; }}
-      }}
-      .proverb-box {{
-        display:inline-block;
-        max-width:80%;
-        padding:6px 14px;
-        margin-top:18px;
-        background:rgba(0,0,0,0.55);
-        border-radius:8px;
-        text-align:center;
-        margin-left:auto;
-        margin-right:auto;
-      }}
-      .headline-text {{
-        display:block;
-        font-family: 'Playfair Display', 'Georgia', 'Cambria', 'Times New Roman', serif, 'Twemoji Mozilla', 'Noto Color Emoji', 'Segoe UI Emoji', 'Apple Color Emoji';
-        font-size:0.88rem;
-        line-height:1.3;
-        letter-spacing:0.15px;
-        color:#c0b9ac;
-        opacity:1;
-        transition: opacity 1.2s ease-in-out;
-      }}
-      .headline-text.fade-out {{
-        opacity:0;
-      }}
-      .headline-text.highlight {{
-        color:#cca961;
-      }}
-      .log-line {{
-        display:flex;
-        align-items:flex-start;
-        gap:8px;
-        margin:0;
-        transform-origin: bottom center;
-        white-space:pre-wrap;
-        line-height:1.5;
-      }}
-      .log-line.animate-up {{ animation: rise-scale 0.85s ease-out; position:relative; z-index:0; }}
-      .log-line .emoji {{
-        width:1em;
-        height:1em;
-        flex-shrink:0;
-        margin:0;
-        vertical-align:middle;
-      }}
-      .log-line.incoming {{ color:#D7BA7D; }}
-      .log-line.outgoing {{ color:#6A9955; }}
-      .log-line.clock {{ color:#2472C8; }}
-      .log-line.error {{ color:#F14C4C; font-weight:700; }}
-      .log-line.incoming .message {{ color:#D7BA7D; }}
-      .log-line.outgoing .message {{ color:#6A9955; }}
-      .log-line.clock .message {{ color:#2472C8; }}
-      .log-line.error .message {{ color:#F14C4C; font-weight:700; }}
-      .header .clock {{ color:#2472C8; font-weight:bold; }}
-      .log-line a {{ color:#90caf9; }}
-      @keyframes viewer-heartbeat {{
-        0% {{ transform: scale(1); opacity:0.7; }}
-        25% {{ transform: scale(1.4); opacity:1; }}
-        55% {{ transform: scale(1.1); opacity:0.85; }}
-        100% {{ transform: scale(1); opacity:0.7; }}
-      }}
-    </style>
-  </head>
-  <body>
-    <div class="header">
-      <div class="status-bar">
-        <div class="scroll-indicator on" id="scrollStatus">
-          <span class="heartbeat-indicator" id="heartbeatIndicator">💓</span>
-          <span class="label" id="scrollLabel">Scrolling</span>
-          <span class="arrow">↓</span>
-        </div>
-        <div class="status-meta">
-          <span id="statusTime">{now_local}</span>
-          <span id="statusUptime">{uptime_str}</span>
-          <span id="statusRestarts">Restarts: {restart_count}</span>
-        </div>
-      </div>
-      <div class="proverb-box">
-        <span class="headline-text" id="headlineText">{initial_proverb_html}</span>
-      </div>
-    </div>
-    <div class="content">
-      <div id="logbox" class="logbox">{log_text}</div>
-    </div>
-    <script>
-      const EMOJI_HTML_MAP = {emoji_html_map_json};
-      const EMOJI_KEYS = Object.keys(EMOJI_HTML_MAP).sort((a, b) => b.length - a.length);
-
-      const PROVERBS = {proverbs_json};
-      let proverbIndex = {proverb_index_js};
-      const PROVERB_INTERVAL = {proverb_interval_ms};
-      const FADE_DURATION = {fade_duration_ms};
-      const headlineText = document.getElementById('headlineText');
-      let highlightTimer = null;
-      let highlightActive = false;
-      let proverbRotationTimer = null;
-      let fadeTimeout = null;
-
-      function escapeForHTML(text) {{
-        if (!text) return '';
-        return text
-          .replace(/&/g, '&amp;')
-          .replace(/</g, '&lt;')
-          .replace(/>/g, '&gt;')
-          .replace(/"/g, '&quot;')
-          .replace(/'/g, '&#39;');
-      }}
-
-      function renderWithEmoji(text) {{
-        let escaped = escapeForHTML(text || '');
-        if (!EMOJI_KEYS.length) return escaped;
-        for (const emoji of EMOJI_KEYS) {{
-          const html = EMOJI_HTML_MAP[emoji];
-          if (!html) continue;
-          escaped = escaped.split(emoji).join(html);
-        }}
-        return escaped;
-      }}
-
-      function nextProverb() {{
-        if (!PROVERBS.length) {{
-          return 'Proverbs unavailable.';
-        }}
-        const text = PROVERBS[proverbIndex % PROVERBS.length];
-        proverbIndex = (proverbIndex + 1) % PROVERBS.length;
-        return text;
-      }}
-
-      function swapHeadline(text, {{ highlight = false, immediate = false }} = {{}}) {{
-        if (fadeTimeout) {{
-          clearTimeout(fadeTimeout);
-          fadeTimeout = null;
-        }}
-
-        const html = renderWithEmoji(text || '');
-        if (immediate) {{
-          headlineText.innerHTML = html;
-          headlineText.classList.remove('fade-out', 'highlight');
-          if (highlight) {{
-            headlineText.classList.add('highlight');
-          }}
-          return;
-        }}
-
-        headlineText.classList.remove('fade-out');
-        void headlineText.offsetWidth;
-        headlineText.classList.add('fade-out');
-
-        fadeTimeout = setTimeout(() => {{
-          headlineText.innerHTML = html;
-          headlineText.classList.remove('highlight');
-          if (highlight) {{
-            headlineText.classList.add('highlight');
-          }}
-          headlineText.classList.remove('fade-out');
-          fadeTimeout = null;
-        }}, FADE_DURATION);
-      }}
-
-      function setHeadlineToProverb(force=false) {{
-        if (highlightActive && !force) return;
-        const proverb = nextProverb();
-        highlightActive = false;
-        swapHeadline(proverb);
-      }}
-
-      function showMessageHeadline(text) {{
-        highlightActive = true;
-        swapHeadline(text, {{ highlight: true }});
-        if (highlightTimer) {{ clearTimeout(highlightTimer); }}
-        highlightTimer = setTimeout(() => {{
-          highlightActive = false;
-          setHeadlineToProverb(true);
-          highlightTimer = null;
-        }}, PROVERB_INTERVAL * 2);
-      }}
-
-      function startProverbRotation() {{
-        if (proverbRotationTimer) {{ clearInterval(proverbRotationTimer); }}
-        proverbRotationTimer = setInterval(() => {{
-          setHeadlineToProverb();
-        }}, PROVERB_INTERVAL);
-      }}
-
-      window.addEventListener('load', () => {{
-        swapHeadline(headlineText.textContent, {{ immediate: true }});
-        startProverbRotation();
-      }});
-
-      function appendLogLine(html) {{
-        const temp = document.createElement('div');
-        temp.innerHTML = html;
-        const span = temp.firstElementChild || temp;
-        const textContent = (span.textContent || '').trim();
-
-        if (textContent.includes('📨')) {{
-          showMessageHeadline(textContent);
-        }} else if (textContent.includes('📤') || textContent.includes('📡')) {{
-          showMessageHeadline(textContent);
-        }}
-
-        logbox.appendChild(span);
-        span.classList.add('animate-up');
-        setTimeout(() => span.classList.remove('animate-up'), 600);
-      }}
-
-
-      let autoScroll = true;
-      let isUserScrolling = false;
-      let scrollTimeout;
-      const logbox = document.getElementById('logbox');
-      const scrollStatus = document.getElementById('scrollStatus');
-      const scrollLabel = document.getElementById('scrollLabel');
-      const heartbeatIndicator = document.getElementById('heartbeatIndicator');
-      let heartbeatTimer = null;
-
-      function updateScrollLabel(text, arrowOn) {{
-        scrollLabel.textContent = text;
-        if (arrowOn) {{
-          scrollStatus.classList.add('on');
-        }} else {{
-          scrollStatus.classList.remove('on');
-        }}
-        if (heartbeatIndicator) {{
-          heartbeatIndicator.classList.toggle('inactive', !arrowOn);
-        }}
-      }}
-
-      updateScrollLabel('Scrolling', true);
-
-      function pulseHeartbeat() {{
-        if (!heartbeatIndicator) {{
-          return;
-        }}
-        if (heartbeatTimer) {{
-          clearTimeout(heartbeatTimer);
-        }}
-        heartbeatIndicator.classList.remove('pulse');
-        heartbeatIndicator.classList.remove('inactive');
-        void heartbeatIndicator.offsetWidth;
-        heartbeatIndicator.classList.add('pulse');
-        heartbeatTimer = setTimeout(() => heartbeatIndicator.classList.remove('pulse'), 700);
-      }}
-
-      function smoothScrollToBottom() {{
-        if (autoScroll && !isUserScrolling) {{
-          logbox.scrollTo({{
-            top: logbox.scrollHeight,
-            behavior: 'smooth'
-          }});
-        }}
-      }}
-
-      logbox.addEventListener('scroll', () => {{
-        isUserScrolling = true;
-        clearTimeout(scrollTimeout);
-                const nearBottom = logbox.scrollHeight - logbox.scrollTop <= logbox.clientHeight + 10;
-                if (nearBottom) {{
-          autoScroll = true;
-          updateScrollLabel('Scrolling', true);
-        }} else {{
-          autoScroll = false;
-          updateScrollLabel('Paused', false);
-        }}
-        scrollTimeout = setTimeout(() => {{
-          isUserScrolling = false;
-        }}, 1000);
-      }});
-
-      let eventSource;
-      let reconnectAttempts = 0;
-      let maxReconnectAttempts = 5;
-      let lastMessageTime = Date.now();
-
-      function createEventSource() {{
-        const url = `/logs_stream?v=${{Date.now()}}`;
-        eventSource = new EventSource(url);
-
-        eventSource.onmessage = function(event) {{
-          if (event.data.includes('heartbeat') || event.data.includes('keepalive')) {{
-            lastMessageTime = Date.now();
-            pulseHeartbeat();
-            updateScrollLabel('Streaming', true);
-            reconnectAttempts = 0;
-            return;
-          }}
-          if (event.data.includes('💓 HB')) {{
-            lastMessageTime = Date.now();
-            pulseHeartbeat();
-            updateScrollLabel('Streaming', true);
-            reconnectAttempts = 0;
-            return;
-          }}
-
-          appendLogLine(event.data);
-          smoothScrollToBottom();
-          lastMessageTime = Date.now();
-          reconnectAttempts = 0;
-        }};
-
-        eventSource.onopen = function(event) {{
-          reconnectAttempts = 0;
-          lastMessageTime = Date.now();
-          updateScrollLabel(autoScroll ? 'Scrolling' : 'Paused', autoScroll);
-        }};
-
-        eventSource.onerror = function(event) {{
-          eventSource.close();
-          if (reconnectAttempts < maxReconnectAttempts) {{
-            const delay = Math.min(5000, 1000 * Math.pow(2, reconnectAttempts));
-            reconnectAttempts += 1;
-            setTimeout(createEventSource, delay);
-          }} else {{
-            updateScrollLabel('Log stream offline', false);
-          }}
-        }};
-      }}
-
-      createEventSource();
-
-      function smoothScrollCheck() {{
-        if (autoScroll) {{
-          const now = Date.now();
-          const elapsed = now - lastMessageTime;
-          if (elapsed > 30000) {{
-            updateScrollLabel('Waiting…', false);
-          }} else {{
-            updateScrollLabel('Scrolling', true);
-          }}
-        }}
-        requestAnimationFrame(smoothScrollCheck);
-      }}
-      smoothScrollCheck();
-    </script>
-  </body>
-  <script>
-    const logbox = document.getElementById('logbox');
-    logbox.scrollTop = logbox.scrollHeight;
-  </script>
-</html>"""
-
-        return html_page
-    except Exception as exc:
-        err_message = f"⚠️ Logs page failed: {exc}"
-        try:
-            add_script_log(err_message)
-        except Exception:
-            pass
-        app.logger.exception("Logs endpoint error")
-        return (
-            "<h1>Log viewer error</h1><p>Please check mesh-master.log for details.</p>",
-            500,
-        )
-
 # -----------------------------
 # Web Routes
 # -----------------------------
@@ -13144,6 +14785,91 @@ def root():
 def health():
   # Simple health endpoint for status checks
   return jsonify({"ok": connection_status == "Connected", "status": connection_status})
+
+@app.route("/logs/verbose", methods=["GET"])
+def logs_verbose():
+  captured = script_logs[-400:]
+  rendered = "\n".join(captured) if captured else "No logs captured yet."
+  escaped = html.escape(rendered, quote=False)
+  now_local = datetime.now().astimezone().strftime("%b %d %Y · %H:%M:%S %Z")
+  html_page = f"""<!DOCTYPE html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\">
+  <title>Mesh Verbose Logs</title>
+  <style>
+    :root {{
+      --bg: #040608;
+      --bg-pane: #05090f;
+      --border: #0f1620;
+      --text: #d7deed;
+      --muted: #8792a7;
+      --accent: #3c92ff;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      padding: 28px 32px 36px;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      background: radial-gradient(circle at 15% 20%, rgba(60, 146, 255, 0.12), transparent 55%),
+                  radial-gradient(circle at 80% 10%, rgba(165, 105, 255, 0.1), transparent 60%),
+                  var(--bg);
+      color: var(--text);
+      font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+      font-size: 13px;
+      line-height: 1.6;
+    }}
+    header {{
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .tagline {{
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }}
+    pre {{
+      flex: 1;
+      margin: 0;
+      padding: 28px;
+      background: linear-gradient(180deg, rgba(8, 12, 18, 0.92), rgba(6, 10, 15, 0.92));
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+      overflow: auto;
+      word-break: break-word;
+      white-space: pre-wrap;
+    }}
+    a.link {{
+      color: var(--accent);
+      text-decoration: none;
+    }}
+    a.link:hover,
+    a.link:focus-visible {{
+      text-decoration: underline;
+      outline: none;
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <span>Mesh Verbose Logs</span>
+    <span>{now_local}</span>
+  </header>
+  <div class=\"tagline\">Unfiltered script output · copy + paste for debugging</div>
+  <pre>{escaped}</pre>
+</body>
+</html>"""
+  return html_page
 
 @app.route("/dashboard", methods=["GET"])
 def dashboard():
@@ -13169,7 +14895,7 @@ def dashboard():
 <head>
   <meta charset="utf-8">
   <title>MESH-MASTER Operations Console</title>
-  <style>
+  <style id="dashboardStyles">
     :root {
       --bg: #05070b;
       --bg-alt: #07090c;
@@ -13233,25 +14959,24 @@ def dashboard():
     }
     .header-actions {
       display: flex;
-      align-items: center;
-      gap: 16px;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 6px;
       color: var(--text-secondary);
       font-size: 13px;
     }
-    .header-actions .divider {
-      width: 1px;
-      height: 20px;
-      background: var(--border);
+    .header-meta-link {
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--text-faint);
+      text-decoration: none;
+      transition: color 0.2s ease;
     }
-    .header-link {
-      padding: 6px 12px;
-      border-radius: 4px;
-      border: 1px solid transparent;
-      transition: background 0.2s ease, border-color 0.2s ease;
-    }
-    .header-link:hover {
-      background: var(--accent-soft);
-      border-color: var(--accent);
+    .header-meta-link:hover,
+    .header-meta-link:focus-visible {
+      color: var(--text-secondary);
+      outline: none;
     }
     .connection-banner {
       padding: 10px 28px;
@@ -13282,36 +15007,91 @@ def dashboard():
       flex: 1;
       padding: 24px;
       display: grid;
-      grid-template-columns: minmax(320px, 2fr) minmax(420px, 3fr);
-      grid-template-areas: "primary activity";
+      grid-template-columns: minmax(160px, 220px) minmax(0, 1fr) minmax(320px, 34vw);
+      grid-template-areas: "menu panels activity";
       gap: 20px;
       align-items: start;
+      align-content: start;
     }
-    .primary {
-      grid-area: primary;
+    .panel-menu {
+      grid-area: menu;
       display: flex;
       flex-direction: column;
-      gap: 28px;
+      gap: 12px;
+      align-self: flex-start;
+      position: sticky;
+      top: 92px;
+      padding-right: 12px;
     }
-    .activity {
+    .panel-menu-header {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--text-secondary);
+    }
+    .panel-menu-list {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .panel-menu-btn {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 6px 10px;
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      color: var(--text-secondary);
+      font-size: 12.5px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: color 0.2s ease, border-color 0.2s ease, background 0.2s ease;
+    }
+    .panel-menu-btn:hover,
+    .panel-menu-btn:focus-visible {
+      color: var(--text-primary);
+      border-color: rgba(86, 156, 214, 0.4);
+      background: rgba(86, 156, 214, 0.12);
+      outline: none;
+    }
+    .panel-menu-btn[aria-pressed="true"] {
+      color: var(--text-primary);
+      border-color: rgba(86, 156, 214, 0.65);
+      background: rgba(86, 156, 214, 0.2);
+    }
+    .panel-menu-btn-label {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .panel-menu-badge {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-faint);
+    }
+    .panel-grid {
+      grid-area: panels;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 20px;
+      align-content: start;
+    }
+    .activity-column {
       grid-area: activity;
       display: flex;
       flex-direction: column;
-      gap: 28px;
-      position: relative;
-    }
-    .activity::before {
-      content: "";
-      position: absolute;
-      inset: 0;
-      border-radius: 14px;
-      background: rgba(7, 9, 12, 0.92);
-      box-shadow: 0 40px 60px rgba(0, 0, 0, 0.45);
-      z-index: 0;
-    }
-    .activity > * {
-      position: relative;
-      z-index: 1;
+      gap: 20px;
+      position: sticky;
+      top: 92px;
+      align-self: flex-start;
     }
     .panel {
       background: var(--bg-panel);
@@ -13322,6 +15102,10 @@ def dashboard():
       display: flex;
       flex-direction: column;
       gap: 12px;
+      transition: box-shadow 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
+    }
+    .panel.is-hidden {
+      display: none !important;
     }
     .panel[data-draggable="true"] .panel-header {
       cursor: grab;
@@ -13369,21 +15153,14 @@ def dashboard():
       flex-direction: column;
       gap: 12px;
     }
-    .panel.collapsed {
-      gap: 8px;
-    }
-    .panel.collapsed .panel-body {
-      display: none;
-    }
     .panel-collapse {
-      position: relative;
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      width: 32px;
-      height: 26px;
+      width: 28px;
+      height: 24px;
       padding: 0;
-      background: rgba(86, 156, 214, 0.15);
+      background: transparent;
       border: 1px solid rgba(86, 156, 214, 0.25);
       border-radius: 6px;
       color: var(--text-secondary);
@@ -13391,14 +15168,9 @@ def dashboard():
       transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
     }
     .panel-collapse::before {
-      content: '▾';
+      content: '×';
       font-size: 14px;
       line-height: 1;
-      transform: translateY(-1px);
-    }
-    .panel.collapsed .panel-collapse::before {
-      content: '▸';
-      transform: translateY(-1px);
     }
     .panel-collapse:hover,
     .panel-collapse:focus-visible {
@@ -13442,11 +15214,13 @@ def dashboard():
       flex: 1;
       background: rgba(17, 19, 25, 0.9);
       border: 1px solid rgba(86, 156, 214, 0.35);
-      border-radius: 8px;
+      border-radius: 6px;
       color: var(--text-primary);
       font-family: inherit;
-      font-size: 13px;
-      padding: 8px 10px;
+      font-size: 12px;
+      line-height: 1.3;
+      padding: 6px 8px;
+      min-height: 32px;
     }
     .config-row.config-row-stack {
       flex-direction: column;
@@ -14105,6 +15879,10 @@ def dashboard():
       padding: 22px 24px;
       box-shadow: 0 24px 48px rgba(0, 0, 0, 0.3);
       overflow: hidden;
+      resize: both;
+      min-height: 320px;
+      min-width: 280px;
+      max-width: 100%;
     }
     .log-panel .panel-header {
       border-bottom: 1px solid rgba(60, 65, 80, 0.45);
@@ -14305,19 +16083,27 @@ def dashboard():
     }
     .activity-header-meta {
       display: flex;
-      align-items: center;
-      gap: 12px;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 8px;
     }
-    .uptime-ticker {
-      font-size: 12px;
+    .queue-meta {
+      font-size: 11px;
       color: var(--text-secondary);
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 10px;
-      border-radius: 999px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
       background: rgba(86, 156, 214, 0.12);
       border: 1px solid rgba(86, 156, 214, 0.25);
+      padding: 4px 10px;
+      border-radius: 999px;
+    }
+    .queue-meta[data-tone="rise"] {
+      color: var(--warning);
+      border-color: rgba(215, 186, 125, 0.5);
+    }
+    .queue-meta[data-tone="fall"] {
+      color: var(--success);
+      border-color: rgba(106, 153, 85, 0.45);
     }
     .admin-popover[hidden] {
       display: none;
@@ -14388,6 +16174,42 @@ def dashboard():
       max-height: 260px;
       overflow-y: auto;
     }
+    /* Simple modal for wiki preview */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.55);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+    }
+    .modal-overlay.show { display: flex; }
+    .modal {
+      width: min(900px, 92vw);
+      max-height: 86vh;
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: 0 20px 60px var(--shadow);
+      display: flex;
+      flex-direction: column;
+    }
+    .modal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .modal-title { font-weight: 600; }
+    .modal-close {
+      background: transparent; border: 1px solid var(--border);
+      color: var(--text-secondary); border-radius: 8px; padding: 4px 8px;
+      cursor: pointer; font-weight: 600;
+    }
+    .modal-body { padding: 12px 16px; overflow: auto; }
+    .wiki-preview { white-space: pre-wrap; font-family: inherit; font-size: 12.5px; line-height: 1.55; }
     .admin-list {
       list-style: none;
       padding: 0;
@@ -14450,12 +16272,33 @@ def dashboard():
       opacity: 0.55;
       cursor: default;
     }
-    @media (max-width: 1200px) {
+    @media (max-width: 1320px) {
+      .content {
+        grid-template-columns: minmax(150px, 200px) minmax(0, 1fr) minmax(280px, 32vw);
+      }
+      .panel-grid {
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      }
+    }
+    @media (max-width: 960px) {
       .content {
         grid-template-columns: 1fr;
         grid-template-areas:
-          "primary"
-          "activity";
+          "activity"
+          "menu"
+          "panels";
+      }
+      .panel-menu {
+        position: relative;
+        top: auto;
+        padding-right: 0;
+      }
+      .activity-column {
+        position: relative;
+        top: auto;
+      }
+      .activity-header-meta {
+        align-items: flex-start;
       }
     }
     @media (max-width: 720px) {
@@ -14466,10 +16309,19 @@ def dashboard():
       }
       .header-actions {
         align-self: stretch;
+        flex-direction: row;
+        align-items: center;
         justify-content: space-between;
       }
       .content {
         padding: 20px;
+      }
+      .panel-menu-btn {
+        padding: 8px 12px;
+      }
+      .queue-meta {
+        width: 100%;
+        text-align: left;
       }
     }
   </style>
@@ -14483,195 +16335,259 @@ def dashboard():
       </div>
       <div class="header-actions">
         <span id="metricsTimestamp" class="panel-subtitle">Waiting for metrics…</span>
-        <span class="divider"></span>
-        <a class="header-link" href="/logs" target="_blank">Pop-out Stream</a>
+        <a class="header-meta-link" href="/logs/verbose" target="_blank" rel="noreferrer">verbose logs</a>
       </div>
     </header>
     <div id="connectionBanner" class="connection-banner is-unknown">Checking connection…</div>
     <main class="content">
-      <section class="primary" data-panel-zone="primary">
+      <nav class="panel-menu" id="panelMenu" aria-label="Dashboard sections"></nav>
+      <section class="panel-grid" data-panel-zone="dashboard">
         <article class="panel snapshot-panel" data-panel-id="snapshot" data-draggable="true" data-collapsible="true">
-          <div class="panel-header">
-            <div class="panel-title">
-              <h2>Activity Snapshot 📊</h2>
-              <span class="panel-subtitle">Mesh visibility</span>
-            </div>
-            <button type="button" class="panel-collapse" aria-expanded="true" aria-controls="snapshotBody" aria-label="Collapse panel"></button>
+        <div class="panel-header">
+          <div class="panel-title">
+            <h2>Activity Snapshot 📊</h2>
+            <span class="panel-subtitle">Mesh visibility</span>
           </div>
-          <div class="panel-body" id="snapshotBody">
-            <div class="snapshot-grid">
-              <section class="snapshot-section">
-                <h3>Messaging ✉️</h3>
-                <dl class="snapshot-list">
-                  <div><dt>Total</dt><dd id="stat-msg-total">—</dd></div>
-                  <div><dt>Direct</dt><dd id="stat-msg-direct">—</dd></div>
-                  <div><dt>AI Authored</dt><dd id="stat-msg-ai">—</dd></div>
-                </dl>
-              </section>
-              <section class="snapshot-section">
-                <h3>Network 🌐</h3>
-                <dl class="snapshot-list">
-                  <div><dt>Active nodes</dt><dd id="stat-nodes-current">—</dd></div>
-                  <div><dt>New nodes</dt><dd id="stat-nodes-new">—</dd></div>
-                  <div><dt>Active users</dt><dd id="stat-active-users">—</dd></div>
-                </dl>
-                <div class="games-breakdown" id="stat-games-breakdown"></div>
-              </section>
-              <section class="snapshot-section">
-                <h3>Ack Telemetry 📶</h3>
-                <dl class="snapshot-list">
-                  <div><dt>DM 1st try</dt><dd id="stat-ack-dm-first">—</dd></div>
-                  <div><dt>DM resend</dt><dd id="stat-ack-dm-resend">—</dd></div>
-                  <div><dt>DM events</dt><dd id="stat-ack-dm-events">—</dd></div>
-                </dl>
-              </section>
-              <section class="snapshot-section">
-                <h3>Onboarding 🧭</h3>
-                <dl class="snapshot-list">
-                  <div><dt>New 24h</dt><dd id="stat-new-onboards">—</dd></div>
-                  <div><dt>Games launched</dt><dd id="stat-games">—</dd></div>
-                </dl>
-                <div class="onboard-roster" id="onboardRoster"></div>
-              </section>
-            </div>
+          <button type="button" class="panel-collapse" aria-label="Hide panel"></button>
+        </div>
+        <div class="panel-body" id="snapshotBody">
+          <div class="snapshot-grid">
+            <section class="snapshot-section">
+              <h3>Messaging ✉️</h3>
+              <dl class="snapshot-list">
+                <div><dt>Total</dt><dd id="stat-msg-total">—</dd></div>
+                <div><dt>Direct</dt><dd id="stat-msg-direct">—</dd></div>
+                <div><dt>AI Authored</dt><dd id="stat-msg-ai">—</dd></div>
+              </dl>
+            </section>
+            <section class="snapshot-section">
+              <h3>Network 🌐</h3>
+              <dl class="snapshot-list">
+                <div><dt>Active nodes</dt><dd id="stat-nodes-current">—</dd></div>
+                <div><dt>New nodes</dt><dd id="stat-nodes-new">—</dd></div>
+                <div><dt>Active users</dt><dd id="stat-active-users">—</dd></div>
+              </dl>
+              <div class="games-breakdown" id="stat-games-breakdown"></div>
+            </section>
+            <section class="snapshot-section">
+              <h3>Ack Telemetry 📶</h3>
+              <dl class="snapshot-list">
+                <div><dt>DM 1st try</dt><dd id="stat-ack-dm-first">—</dd></div>
+                <div><dt>DM resend</dt><dd id="stat-ack-dm-resend">—</dd></div>
+                <div><dt>DM events</dt><dd id="stat-ack-dm-events">—</dd></div>
+              </dl>
+            </section>
+            <section class="snapshot-section">
+              <h3>Onboarding 🧭</h3>
+              <dl class="snapshot-list">
+                <div><dt>New 24h</dt><dd id="stat-new-onboards">—</dd></div>
+                <div><dt>Games launched</dt><dd id="stat-games">—</dd></div>
+              </dl>
+              <div class="onboard-roster" id="onboardRoster"></div>
+            </section>
+            <section class="snapshot-section">
+              <h3>Offline Knowledge 🧠</h3>
+              <dl class="snapshot-list">
+                <div><dt>Saved 24h</dt><dd id="stat-wiki-saved">—</dd></div>
+                <div><dt>Deleted 24h</dt><dd id="stat-wiki-deleted">—</dd></div>
+                <div><dt>Served 24h</dt><dd id="stat-wiki-served">—</dd></div>
+                <div><dt>Avg Freshness</dt><dd id="stat-wiki-age">—</dd></div>
+              </dl>
+            </section>
           </div>
+        </div>
         </article>
 
         <article class="panel ops-panel" data-panel-id="operations" data-draggable="true">
-          <div class="panel-header">
-            <h2>Operations Center 🛠️</h2>
-            <span id="featuresStatus" class="panel-subtitle">Manage AI and command access</span>
+        <div class="panel-header">
+          <h2>Operations Center 🛠️</h2>
+          <span id="featuresStatus" class="panel-subtitle">Manage AI and command access</span>
+        </div>
+        <div id="featureAlerts" class="feature-alerts" hidden></div>
+        <div class="toggle-row">
+          <label class="switch">
+            <input type="checkbox" id="aiToggle">
+            <span class="slider"></span>
+          </label>
+          <div class="toggle-copy">
+            <span class="toggle-title">AI Responses 🤖</span>
+            <span id="aiToggleStatus" class="toggle-status">Enabled</span>
           </div>
-          <div id="featureAlerts" class="feature-alerts" hidden></div>
-          <div class="toggle-row">
-            <label class="switch">
-              <input type="checkbox" id="aiToggle">
-              <span class="slider"></span>
-            </label>
-            <div class="toggle-copy">
-              <span class="toggle-title">AI Responses 🤖</span>
-              <span id="aiToggleStatus" class="toggle-status">Enabled</span>
+        </div>
+        <div class="toggle-row">
+          <label class="switch">
+            <input type="checkbox" id="autoPingToggle">
+            <span class="slider"></span>
+          </label>
+          <div class="toggle-copy">
+            <span class="toggle-title">Auto Ping Replies 🏓</span>
+            <span id="autoPingToggleStatus" class="toggle-status">Enabled</span>
+          </div>
+        </div>
+        <div class="mode-toggle">
+          <div class="mode-header">
+            <span class="mode-title">Inbound Messaging 📡</span>
+            <span class="mode-status" id="modeStatus">Channels + DMs</span>
+          </div>
+          <div class="mode-buttons" role="radiogroup" aria-label="Inbound messaging mode">
+            <button type="button" class="mode-btn" data-mode="both" aria-pressed="false">Channels + DMs</button>
+            <button type="button" class="mode-btn" data-mode="dm_only" aria-pressed="false">DM only</button>
+            <button type="button" class="mode-btn" data-mode="channel_only" aria-pressed="false">Channels only</button>
+          </div>
+        </div>
+        <div class="passphrase-card">
+          <label for="adminPassphrase">🔑 Admin Handoff Word</label>
+          <div class="passphrase-input">
+            <input type="text" id="adminPassphrase" name="adminPassphrase" placeholder="enter secret word" autocomplete="off" spellcheck="false">
+            <button type="button" id="adminPassphraseSet" class="passphrase-set">Set</button>
+          </div>
+          <p class="passphrase-warning" id="adminPassphraseWarning" hidden>Saving a new word keeps the current admin whitelist. Use the admin list to remove anyone who should no longer have access.</p>
+          <p class="passphrase-hint">Share this word privately; a DM containing only it grants admin powers instantly. <a href="#" id="adminListToggle" class="admin-list-link" role="button">admin list</a></p>
+          <div class="admin-popover" id="adminListPopover" role="dialog" aria-labelledby="adminListTitle" hidden>
+            <div class="admin-popover-header">
+              <h3 id="adminListTitle">Admin Access</h3>
+              <button type="button" class="admin-popover-close" id="adminListClose" aria-label="Close admin list">✕</button>
+            </div>
+            <div class="admin-popover-body">
+              <p class="admin-empty" id="adminListEmpty">No admins currently authorized.</p>
+              <ul class="admin-list" id="adminList"></ul>
             </div>
           </div>
-          <div class="toggle-row">
-            <label class="switch">
-              <input type="checkbox" id="autoPingToggle">
-              <span class="slider"></span>
-            </label>
-            <div class="toggle-copy">
-              <span class="toggle-title">Auto Ping Replies 🏓</span>
-              <span id="autoPingToggleStatus" class="toggle-status">Enabled</span>
-            </div>
-          </div>
-          <div class="mode-toggle">
-            <div class="mode-header">
-              <span class="mode-title">Inbound Messaging 📡</span>
-              <span class="mode-status" id="modeStatus">Channels + DMs</span>
-            </div>
-            <div class="mode-buttons" role="radiogroup" aria-label="Inbound messaging mode">
-              <button type="button" class="mode-btn" data-mode="both" aria-pressed="false">Channels + DMs</button>
-              <button type="button" class="mode-btn" data-mode="dm_only" aria-pressed="false">DM only</button>
-              <button type="button" class="mode-btn" data-mode="channel_only" aria-pressed="false">Channels only</button>
-            </div>
-          </div>
-          <div class="passphrase-card">
-            <label for="adminPassphrase">🔑 Admin Handoff Word</label>
-            <div class="passphrase-input">
-              <input type="text" id="adminPassphrase" name="adminPassphrase" placeholder="enter secret word" autocomplete="off" spellcheck="false">
-              <button type="button" id="adminPassphraseSet" class="passphrase-set">Set</button>
-            </div>
-            <p class="passphrase-warning" id="adminPassphraseWarning" hidden>Saving a new word keeps the current admin whitelist. Use the admin list to remove anyone who should no longer have access.</p>
-            <p class="passphrase-hint">Share this word privately; a DM containing only it grants admin powers instantly. <a href="#" id="adminListToggle" class="admin-list-link" role="button">admin list</a></p>
-            <div class="admin-popover" id="adminListPopover" role="dialog" aria-labelledby="adminListTitle" hidden>
-              <div class="admin-popover-header">
-                <h3 id="adminListTitle">Admin Access</h3>
-                <button type="button" class="admin-popover-close" id="adminListClose" aria-label="Close admin list">✕</button>
-              </div>
-              <div class="admin-popover-body">
-                <p class="admin-empty" id="adminListEmpty">No admins currently authorized.</p>
-                <ul class="admin-list" id="adminList"></ul>
-              </div>
-            </div>
-          </div>
-          <div class="command-groups" id="commandGroups"></div>
+        </div>
+        <div class="command-groups" id="commandGroups"></div>
         </article>
 
         <article class="panel radio-panel" data-panel-id="radio-settings" data-draggable="true" data-collapsible="true">
-          <div class="panel-header">
-            <div class="panel-title">
-              <h2>Radio Settings 📻</h2>
-              <span class="panel-subtitle">LoRa hop limit and channels</span>
-            </div>
-            <button type="button" class="panel-collapse" aria-expanded="true" aria-controls="radioPanelBody" aria-label="Collapse panel"></button>
+        <div class="panel-header">
+          <div class="panel-title">
+            <h2>Radio Settings 📻</h2>
+            <span class="panel-subtitle">LoRa hop limit and channels</span>
           </div>
-          <div class="panel-body" id="radioPanelBody">
-            <div class="config-section" aria-live="polite">
-              <div class="config-row">
-                <div class="config-key">
-                  <div class="config-key-heading">
-                    <strong>Hop Limit</strong>
-                  </div>
-                </div>
-                <div class="config-value">
-                  <div class="config-display-line">
-                    <input type="number" min="0" max="7" id="radioHopLimit" class="config-input" style="width: 100px; display: inline-block;" aria-label="Hop limit">
-                    <button type="button" id="radioHopSave" class="config-save-btn" style="margin-left: 8px;">Apply</button>
-                    <span class="config-status" id="radioHopStatus"></span>
-                  </div>
+          <button type="button" class="panel-collapse" aria-label="Hide panel"></button>
+        </div>
+        <div class="panel-body" id="radioPanelBody">
+          <div class="config-section" aria-live="polite">
+            <div class="config-row">
+              <div class="config-key">
+                <div class="config-key-heading">
+                  <strong>Hop Limit</strong>
                 </div>
               </div>
+              <div class="config-value">
+                <div class="config-display-line">
+                  <input type="number" min="0" max="7" id="radioHopLimit" class="config-input" style="width: 100px; display: inline-block;" aria-label="Hop limit">
+                  <button type="button" id="radioHopSave" class="config-save-btn" style="margin-left: 8px;">Apply</button>
+                  <span class="config-status" id="radioHopStatus"></span>
+                </div>
+              </div>
+            </div>
 
-              <div class="config-row config-row-stack" id="radioChannelsRow">
-                <div class="config-key-heading"><strong>Channels</strong></div>
-                <div class="config-value">
-                  <div id="radioChannelsList" class="config-table"></div>
-                  <div style="margin-top: 8px; display:flex; gap:8px; align-items:center; flex-wrap: wrap;">
-                    <button type="button" id="radioAddChannel" class="config-save-btn">Add Channel</button>
-                    <span class="config-status" id="radioChannelsStatus"></span>
-                  </div>
+            <div class="config-row config-row-stack" id="radioChannelsRow">
+              <div class="config-key-heading"><strong>Channels</strong></div>
+              <div class="config-value">
+                <div id="radioChannelsList" class="config-table"></div>
+                <div style="margin-top: 8px; display:flex; gap:8px; align-items:center; flex-wrap: wrap;">
+                  <button type="button" id="radioAddChannel" class="config-save-btn">Add Channel</button>
+                  <span class="config-status" id="radioChannelsStatus"></span>
                 </div>
               </div>
             </div>
           </div>
+        </div>
         </article>
 
         <article class="panel config-panel" data-panel-id="config-overview" data-draggable="true" data-collapsible="true">
-          <div class="panel-header">
-            <div class="panel-title">
-              <h2>Configuration Overview ⚙️</h2>
-              <span class="panel-subtitle">Inspect current config.json values</span>
-            </div>
-            <button type="button" class="panel-collapse" aria-expanded="true" aria-controls="configOverviewBody" aria-label="Collapse panel"></button>
+        <div class="panel-header">
+          <div class="panel-title">
+            <h2>Configuration Overview ⚙️</h2>
+            <span class="panel-subtitle">Inspect current config.json values</span>
           </div>
-          <div class="panel-body" id="configOverviewBody">
-            <div class="config-select-row">
-              <label for="configCategorySelect">Category</label>
-              <select id="configCategorySelect" class="config-select"></select>
-            </div>
-            <div class="config-table" id="configSettingsList">
-              <p class="config-empty">Config snapshot unavailable.</p>
-            </div>
+          <button type="button" class="panel-collapse" aria-label="Hide panel"></button>
+        </div>
+        <div class="panel-body" id="configOverviewBody">
+          <div class="config-select-row">
+            <label for="configCategorySelect">Category</label>
+            <select id="configCategorySelect" class="config-select"></select>
           </div>
+          <div class="config-table" id="configSettingsList">
+            <p class="config-empty">Config snapshot unavailable.</p>
+          </div>
+        </div>
         </article>
-      </section>
 
-      <section class="activity" data-panel-zone="activity">
-        <article class="panel log-panel" data-panel-id="log" data-draggable="true">
-          <div class="panel-header">
-            <h2>Mesh Activity Stream 📡</h2>
-            <div class="activity-header-meta">
-              <div class="scroll-status on" id="scrollStatus"><span class="heartbeat-indicator" id="heartbeatIndicator">💓</span><span id="scrollLabel">Streaming</span></div>
-              <span class="uptime-ticker" id="uptimeTicker">—</span>
-            </div>
+        <article class="panel wiki-panel" data-panel-id="offline-knowledge" data-draggable="true" data-collapsible="true">
+        <div class="panel-header">
+          <div class="panel-title">
+            <h2>Offline Knowledge 🧠</h2>
+            <span class="panel-subtitle">Wiki + web crawl cache</span>
           </div>
-          <div id="logbox" class="logbox">
+          <button type="button" class="panel-collapse" aria-label="Hide panel"></button>
+        </div>
+        <div class="panel-body" id="offlinePanelBody">
+          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px;">
+            <label for="offlineTypeSelect">Source</label>
+            <select id="offlineTypeSelect" class="config-select">
+              <option value="wiki">Wiki</option>
+              <option value="crawl">Web Crawl</option>
+              <option value="ddg">Search Results</option>
+              <option value="report">Reports</option>
+              <option value="log">Logs</option>
+            </select>
+            <label for="offlineLangSelect">Lang</label>
+            <select id="offlineLangSelect" class="config-select">
+              <option value="en">English (en)</option>
+              <option value="zh">Chinese (zh)</option>
+              <option value="hi">Hindi (hi)</option>
+              <option value="es">Spanish (es)</option>
+              <option value="fr">French (fr)</option>
+              <option value="ar">Arabic (ar)</option>
+              <option value="bn">Bengali (bn)</option>
+              <option value="pt">Portuguese (pt)</option>
+              <option value="ru">Russian (ru)</option>
+              <option value="ur">Urdu (ur)</option>
+            </select>
+            <button type="button" id="offlineRefresh" class="config-save-btn">Refresh</button>
+            <button type="button" id="offlinePrune" class="config-save-btn">Prune to Max</button>
+            <span id="offlineStatus" class="config-status"></span>
+          </div>
+          <div class="config-table" id="offlineList">
+            <p class="config-empty">No offline entries yet.</p>
+          </div>
+        </div>
+        </article>
+
+      </section>
+      <aside class="activity-column">
+        <article class="panel log-panel" data-panel-id="log">
+        <div class="panel-header">
+          <h2>Activity 📡</h2>
+          <div class="activity-header-meta">
+            <div class="scroll-status on" id="scrollStatus"><span class="heartbeat-indicator" id="heartbeatIndicator">💓</span><span id="scrollLabel">Streaming</span></div>
+            <div class="queue-meta" id="queueMeta">Queue —</div>
+          </div>
+        </div>
+        <div id="logbox" class="logbox">
 """
     page_html += initial_log_html
     page_html += r"""
-          </div>
+        </div>
         </article>
-      </section>
+      </aside>
     </main>
+  </div>
+
+  <!-- Modal for offline preview -->
+  <div class="modal-overlay" id="offlineModal" aria-hidden="true" role="dialog" aria-labelledby="offlineModalTitle">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title" id="offlineModalTitle">Preview</div>
+        <button type="button" class="modal-close" id="offlineModalClose" aria-label="Close">Close</button>
+      </div>
+      <div class="modal-body">
+        <div id="offlineModalMeta" class="config-explainer" style="margin-bottom:8px;"></div>
+        <pre id="offlineModalContent" class="wiki-preview"></pre>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -14688,6 +16604,10 @@ def dashboard():
     const RADIO_UPDATE_CHANNEL_URL = "/dashboard/radio/channel/update";
     const RADIO_REMOVE_CHANNEL_URL = "/dashboard/radio/channel/remove";
     const RADIO_STATE_POLL_MS = 15000;
+    const OFFLINE_LIST_URL = "/dashboard/offline/list";
+    const OFFLINE_DELETE_URL = "/dashboard/offline/delete";
+    const OFFLINE_PRUNE_URL = "/dashboard/offline/prune";
+    const OFFLINE_GET_URL = "/dashboard/offline/get";
     const appShellEl = document.getElementById('appShell');
     const heartbeatIndicator = document.getElementById('heartbeatIndicator');
     let initialMetrics = {};
@@ -14710,7 +16630,6 @@ def dashboard():
     let heartbeatTimer = null;
     let adminPopoverPreviousFocus = null;
     let adminPopoverOutsideHandler = null;
-    let collapsedPanelState = new Set();
     let configOverviewState = { sections: [], selectedId: null, pendingData: null, metadata: {} };
     const CONFIG_LOCKED_KEYS = new Set(['ai_provider']);
     const DEFAULT_LANGUAGE_OPTIONS = [
@@ -14720,6 +16639,7 @@ def dashboard():
     const DEFAULT_PERSONALITY_OPTIONS = [{ value: 'trail_scout', label: 'Trail Scout' }];
     let configSelectInitialized = false;
     let radioState = { connected: false, radio_id: null, hops: null, channels: [] };
+    let offlineModalOpen = false;
 
     function $(id) { return document.getElementById(id); }
 
@@ -14766,6 +16686,348 @@ def dashboard():
       }
       renderRadioChannels(state && Array.isArray(state.channels) ? state.channels : []);
     }
+
+    // --------------------
+    // Offline Knowledge (UI)
+    // --------------------
+    function formatBytes(n) {
+      const bytes = Number(n || 0);
+      if (bytes < 1024) return `${bytes} B`;
+      const kb = (bytes / 1024).toFixed(1);
+      return `${kb} KB`;
+    }
+
+    const OFFLINE_TYPE_LABELS = {
+      wiki: 'Offline Wiki',
+      crawl: 'Web Crawl',
+      ddg: 'Search Results',
+      report: 'Reports',
+      log: 'Logs',
+    };
+
+    let offlineState = { type: 'wiki', lang: 'en', dir: '', entries: [], stats: {} };
+
+    function currentOfflineType() {
+      const sel = $("offlineTypeSelect");
+      const value = sel ? (sel.value || 'wiki') : offlineState.type;
+      return value === 'crawl' ? 'crawl' : 'wiki';
+    }
+
+    function currentOfflineLang() {
+      const sel = $("offlineLangSelect");
+      return sel ? (sel.value || 'en') : offlineState.lang;
+    }
+
+    async function loadOfflineList() {
+      const status = $("offlineStatus");
+      const type = currentOfflineType();
+      const lang = currentOfflineLang();
+      offlineState.type = type;
+      offlineState.lang = lang;
+      const langSel = $("offlineLangSelect");
+      if (langSel) {
+        langSel.disabled = (type === 'report' || type === 'log');
+      }
+      if (status) {
+        status.textContent = 'Loading…';
+        status.removeAttribute('data-tone');
+      }
+      try {
+        const url = `${OFFLINE_LIST_URL}?type=${encodeURIComponent(type)}&lang=${encodeURIComponent(lang)}`;
+        const res = await fetch(url, { method: 'GET' });
+        const data = await res.json();
+        if (!res.ok || !data || data.ok === false) {
+          const msg = (data && data.error) ? data.error : `HTTP ${res.status}`;
+          throw new Error(msg);
+        }
+        offlineState.dir = data.dir || '';
+        offlineState.entries = Array.isArray(data.entries) ? data.entries : [];
+        offlineState.stats = data.stats || {};
+        renderOfflineList();
+      } catch (err) {
+        const list = $("offlineList");
+        if (list) list.innerHTML = '<p class="config-empty">Offline data unavailable.</p>';
+        if (status) {
+          status.textContent = err && err.message ? err.message : 'Load failed';
+          status.dataset.tone = 'error';
+        }
+      }
+    }
+
+    function renderOfflineList() {
+      const list = $("offlineList");
+      const status = $("offlineStatus");
+      if (!list) return;
+      const entries = Array.isArray(offlineState.entries) ? offlineState.entries : [];
+      if (!entries.length) {
+        list.innerHTML = '<p class="config-empty">No offline entries yet.</p>';
+        if (status) {
+          status.textContent = offlineState.dir ? `Dir: ${offlineState.dir}` : '';
+          status.removeAttribute('data-tone');
+        }
+        return;
+      }
+      const table = document.createElement('div');
+      table.className = 'config-table';
+      entries.forEach(item => {
+        if (!item || typeof item !== 'object') return;
+        const row = document.createElement('div');
+        row.className = 'config-row';
+
+        const keyCol = document.createElement('div');
+        keyCol.className = 'config-key';
+        const heading = document.createElement('div');
+        heading.className = 'config-key-heading';
+        const link = document.createElement('a');
+        link.href = '#';
+        link.className = 'offline-title';
+        const displayTitle = item.title || item.key || '(untitled)';
+        link.textContent = displayTitle;
+        link.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          openOfflinePreview(item);
+        });
+        heading.appendChild(link);
+        keyCol.appendChild(heading);
+
+        const meta = document.createElement('div');
+        meta.className = 'config-explainer';
+        const metaParts = [];
+        const type = offlineState.type;
+        if (type === 'wiki') {
+          metaParts.push(formatBytes(item.size_bytes));
+          if (item.path) metaParts.push(String(item.path));
+          if (item.age_days || item.age_days === 0) metaParts.push(`age ${item.age_days}d`);
+          if (item.mtime_iso) metaParts.push(String(item.mtime_iso));
+        } else if (type === 'crawl' || type === 'ddg') {
+          if (item.source) {
+            try {
+              const host = new URL(item.source).hostname;
+              if (host) metaParts.push(host);
+            } catch (err) {
+              metaParts.push(String(item.source));
+            }
+          }
+          if (item.fetched_at) metaParts.push(String(item.fetched_at));
+          metaParts.push(formatBytes(item.size_bytes));
+        } else {
+          if (item.created_at) metaParts.push(String(item.created_at));
+          if (item.author) metaParts.push(`by ${item.author}`);
+          metaParts.push(formatBytes(item.size_bytes));
+        }
+        meta.textContent = metaParts.filter(Boolean).join(' • ');
+        keyCol.appendChild(meta);
+
+        const valCol = document.createElement('div');
+        valCol.className = 'config-value';
+        const delBtn = document.createElement('button');
+        delBtn.type = 'button';
+        delBtn.className = 'config-cancel-btn';
+        delBtn.textContent = 'Delete';
+        delBtn.addEventListener('click', () => deleteOfflineItem(item));
+        valCol.appendChild(delBtn);
+
+        row.appendChild(keyCol);
+        row.appendChild(valCol);
+        table.appendChild(row);
+      });
+      list.innerHTML = '';
+      list.appendChild(table);
+
+      if (status) {
+        const stats = offlineState.stats || {};
+        const count = stats.count || entries.length;
+        const bytes = stats.bytes || entries.reduce((acc, it) => acc + Number(it.size_bytes || 0), 0);
+        let extra = '';
+        if (offlineState.type === 'wiki') {
+          if (stats.downloads_today !== undefined) {
+            extra += ` • DL today: ${stats.downloads_today}/${stats.daily_cap || '?'}`;
+          }
+          if (stats.feed_enabled === false) {
+            extra += ' • Feed: off';
+          }
+        } else if (stats.recent_captures !== undefined) {
+          extra += ` • Captured 24h: ${stats.recent_captures}`;
+        } else if (stats.recent_entries !== undefined) {
+          extra += ` • New 24h: ${stats.recent_entries}`;
+        }
+        status.textContent = `Dir: ${offlineState.dir} • ${count} item(s) • Size: ${formatBytes(bytes)}${extra}`;
+        status.removeAttribute('data-tone');
+      }
+    }
+
+    async function deleteOfflineItem(item) {
+      const status = $("offlineStatus");
+      const key = item && (item.key || item.title);
+      if (!key) return;
+      const label = OFFLINE_TYPE_LABELS[offlineState.type] || 'Offline entry';
+      if (!confirm(`Delete '${item.title || key}' from ${label}?`)) return;
+      try {
+        if (status) {
+          status.textContent = 'Deleting…';
+          status.removeAttribute('data-tone');
+        }
+        const body = {
+          type: offlineState.type,
+          lang: offlineState.lang,
+          key,
+        };
+        const res = await fetch(OFFLINE_DELETE_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json();
+        if (!res.ok || !data || data.ok === false) {
+          const msg = (data && data.error) ? data.error : `HTTP ${res.status}`;
+          throw new Error(msg);
+        }
+        if (status) status.textContent = 'Deleted';
+        await loadOfflineList();
+      } catch (err) {
+        if (status) {
+          status.textContent = err && err.message ? err.message : 'Delete failed';
+          status.dataset.tone = 'error';
+        }
+      }
+    }
+
+    async function pruneOfflineItems() {
+      const status = $("offlineStatus");
+      try {
+        if (status) {
+          status.textContent = 'Pruning…';
+          status.removeAttribute('data-tone');
+        }
+        const res = await fetch(OFFLINE_PRUNE_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type: offlineState.type, lang: offlineState.lang }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data || data.ok === false) {
+          const msg = (data && data.error) ? data.error : `HTTP ${res.status}`;
+          throw new Error(msg);
+        }
+        const removed = data.result && data.result.removed ? data.result.removed : 0;
+        if (status) status.textContent = `Pruned (${removed})`;
+        await loadOfflineList();
+      } catch (err) {
+        if (status) {
+          status.textContent = err && err.message ? err.message : 'Prune failed';
+          status.dataset.tone = 'error';
+        }
+      }
+    }
+
+    async function openOfflinePreview(item) {
+      const status = $("offlineStatus");
+      const key = item && (item.key || item.title);
+      if (!key) return;
+      try {
+        const type = offlineState.type;
+        const lang = offlineState.lang;
+        const res = await fetch(`${OFFLINE_GET_URL}?type=${encodeURIComponent(type)}&lang=${encodeURIComponent(lang)}&key=${encodeURIComponent(key)}`, { method: 'GET' });
+        const data = await res.json();
+        if (!res.ok || !data || data.ok === false) {
+          throw new Error((data && data.error) ? data.error : `HTTP ${res.status}`);
+        }
+        const entry = data.entry || {};
+        const modal = $("offlineModal");
+        const header = $("offlineModalTitle");
+        const meta = $("offlineModalMeta");
+        const content = $("offlineModalContent");
+        if (header) header.textContent = entry.title || item.title || key;
+        let metaText = '';
+        if (entry.type === 'report' || entry.type === 'log') {
+          if (entry.summary) metaText += entry.summary;
+          if (entry.created_at) metaText += metaText ? ` • ${entry.created_at}` : entry.created_at;
+          if (entry.author) metaText += metaText ? ` • by ${entry.author}` : `by ${entry.author}`;
+        } else {
+          if (entry.summary) metaText += entry.summary;
+          if (entry.source) metaText += metaText ? ` • ${entry.source}` : entry.source;
+          if (entry.fetched_at) metaText += metaText ? ` • ${entry.fetched_at}` : entry.fetched_at;
+        }
+        if (meta) meta.textContent = metaText;
+        let body = '';
+        if (entry.type === 'crawl') {
+          body = (entry.context || '').trim();
+          const lines = [];
+          if (Array.isArray(entry.pages) && entry.pages.length) {
+            lines.push('Pages:');
+            entry.pages.slice(0, 12).forEach(page => {
+              if (!page) return;
+              const pageTitle = page.title || page.url || '';
+              const pageUrl = page.url ? ` (${page.url})` : '';
+              lines.push(`- ${pageTitle}${pageUrl}`);
+            });
+          }
+          if (Array.isArray(entry.contacts) && entry.contacts.length) {
+            lines.push('', 'Contacts:');
+            entry.contacts.slice(0, 12).forEach(contact => {
+              if (!contact) return;
+              const label = contact.type || 'Contact';
+              const value = contact.value || '';
+              const origin = contact.source ? ` (${contact.source})` : '';
+              lines.push(`- ${label}: ${value}${origin}`);
+            });
+          }
+          if (lines.length) {
+            body = body ? `${body}\n\n${lines.join('\n')}` : lines.join('\n');
+          }
+        } else if (entry.type === 'ddg') {
+          body = entry.context || '(empty)';
+        } else {
+          body = entry.content || '(empty)';
+        }
+        if (content) content.textContent = body || '(empty)';
+        if (modal) {
+          modal.classList.add('show');
+          modal.setAttribute('aria-hidden', 'false');
+          offlineModalOpen = true;
+        }
+      } catch (err) {
+        if (status) {
+          status.textContent = err && err.message ? err.message : 'Preview failed';
+          status.dataset.tone = 'error';
+        }
+      }
+    }
+
+    function bindOfflineModal() {
+      const modal = $("offlineModal");
+      if (!modal) return;
+      const close = $("offlineModalClose");
+      if (close) close.addEventListener('click', closeOfflineModal);
+      modal.addEventListener('click', event => {
+        if (event.target === modal) closeOfflineModal();
+      });
+      document.addEventListener('keydown', event => {
+        if (event.key === 'Escape' && offlineModalOpen) {
+          closeOfflineModal();
+        }
+      });
+    }
+
+    function closeOfflineModal() {
+      const modal = $("offlineModal");
+      if (!modal) return;
+      modal.classList.remove('show');
+      modal.setAttribute('aria-hidden', 'true');
+      offlineModalOpen = false;
+    }
+
+    function setupOfflineControls() {
+      const typeSel = $("offlineTypeSelect");
+      const langSel = $("offlineLangSelect");
+      const refreshBtn = $("offlineRefresh");
+      const pruneBtn = $("offlinePrune");
+      if (typeSel) typeSel.addEventListener('change', () => { offlineState.type = currentOfflineType(); loadOfflineList(); });
+      if (langSel) langSel.addEventListener('change', () => { offlineState.lang = currentOfflineLang(); loadOfflineList(); });
+      if (refreshBtn) refreshBtn.addEventListener('click', loadOfflineList);
+      if (pruneBtn) pruneBtn.addEventListener('click', pruneOfflineItems);
+    }
+
 
     function channelRoleBadge(role) {
       switch (String(role || 'DISABLED')) {
@@ -15219,18 +17481,20 @@ def dashboard():
       el.innerHTML = `<span class="stat-value-number">${valueText}</span>${deltaHtml}`;
     }
 
-    const PANEL_LAYOUT_STORAGE_KEY = 'mesh-dashboard-layout-v1';
-    const COLLAPSE_STORAGE_KEY = 'mesh-dashboard-collapsed-v1';
+    const PANEL_LAYOUT_STORAGE_KEY = 'mesh-dashboard-layout-v2';
+    const PANEL_VISIBILITY_STORAGE_KEY = 'mesh-dashboard-hidden-v1';
     let dragPanelRef = null;
     const dragPlaceholder = document.createElement('div');
     dragPlaceholder.className = 'panel-placeholder';
+    let hiddenPanelState = new Set();
 
     function savePanelLayout() {
       const layout = {};
       document.querySelectorAll('[data-panel-zone]').forEach(zone => {
         const zoneId = zone.dataset.panelZone;
         if (!zoneId) return;
-        layout[zoneId] = Array.from(zone.querySelectorAll('.panel[data-panel-id]')).map(panel => panel.dataset.panelId);
+        layout[zoneId] = Array.from(zone.querySelectorAll('.panel[data-panel-id]:not(.is-hidden)'))
+          .map(panel => panel.dataset.panelId);
       });
       try {
         localStorage.setItem(PANEL_LAYOUT_STORAGE_KEY, JSON.stringify(layout));
@@ -15269,6 +17533,9 @@ def dashboard():
           return;
         }
         ids.forEach(id => {
+          if (id === 'log') {
+            return;
+          }
           const panel = document.querySelector(`.panel[data-panel-id="${id}"]`);
           if (panel) {
             zone.appendChild(panel);
@@ -15277,9 +17544,9 @@ def dashboard():
       });
     }
 
-    function loadCollapsedPanelState() {
+    function loadHiddenPanelState() {
       try {
-        const raw = localStorage.getItem(COLLAPSE_STORAGE_KEY);
+        const raw = localStorage.getItem(PANEL_VISIBILITY_STORAGE_KEY);
         if (!raw) {
           return new Set();
         }
@@ -15287,47 +17554,152 @@ def dashboard():
         if (!Array.isArray(parsed)) {
           return new Set();
         }
-        const filtered = parsed.filter(id => typeof id === 'string' && id);
-        return new Set(filtered);
+        return new Set(parsed.filter(id => typeof id === 'string' && id && id !== 'log'));
       } catch (err) {
-        console.warn('Could not read collapse state', err);
+        console.warn('Could not read hidden panel state', err);
         return new Set();
       }
     }
 
-    function persistCollapsedPanelState() {
+    function persistHiddenPanelState() {
       try {
-        localStorage.setItem(COLLAPSE_STORAGE_KEY, JSON.stringify(Array.from(collapsedPanelState)));
+        localStorage.setItem(PANEL_VISIBILITY_STORAGE_KEY, JSON.stringify(Array.from(hiddenPanelState)));
       } catch (err) {
-        console.warn('Could not persist collapse state', err);
+        console.warn('Could not persist hidden panel state', err);
       }
     }
 
-    function applyPanelCollapseState(panel, collapsed) {
+    function applyPanelHiddenState(panel, hidden, { persist = true } = {}) {
       if (!panel) {
         return;
       }
       const panelId = panel.dataset.panelId || '';
-      panel.classList.toggle('collapsed', collapsed);
-      const button = panel.querySelector('.panel-collapse');
-      if (button) {
-        button.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-        button.setAttribute('aria-label', collapsed ? 'Expand panel' : 'Collapse panel');
-        const targetId = button.getAttribute('aria-controls');
-        if (targetId) {
-          const body = document.getElementById(targetId);
-          if (body) {
-            body.hidden = collapsed;
+      if (!panelId) {
+        return;
+      }
+      if (panelId === 'log') {
+        hidden = false;
+      }
+      panel.classList.toggle('is-hidden', hidden);
+      panel.setAttribute('aria-hidden', hidden ? 'true' : 'false');
+      panel.setAttribute('draggable', hidden ? 'false' : 'true');
+      if (hidden) {
+        panel.setAttribute('tabindex', '-1');
+        hiddenPanelState.add(panelId);
+      } else {
+        panel.removeAttribute('tabindex');
+        hiddenPanelState.delete(panelId);
+      }
+      if (persist) {
+        persistHiddenPanelState();
+      }
+    }
+
+    function updateMenuButtonState(panelId) {
+      const menu = $("panelMenu");
+      if (!menu) return;
+      const button = menu.querySelector(`.panel-menu-btn[data-panel-id="${panelId}"]`);
+      if (!button) return;
+      const hidden = hiddenPanelState.has(panelId);
+      button.setAttribute('aria-pressed', hidden ? 'false' : 'true');
+      const badge = button.querySelector('.panel-menu-badge');
+      if (badge) {
+        badge.textContent = hidden ? 'show' : 'hide';
+      }
+    }
+
+    function setPanelVisibility(panelId, shouldShow) {
+      const panel = document.querySelector(`.panel[data-panel-id="${panelId}"]`);
+      if (!panel) {
+        return;
+      }
+      if (panelId === 'log') {
+        return;
+      }
+      const hidden = !shouldShow;
+      applyPanelHiddenState(panel, hidden);
+      updateMenuButtonState(panelId);
+      savePanelLayout();
+      if (!hidden) {
+        try {
+          panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        } catch (err) {}
+      }
+    }
+
+    function buildPanelMenu() {
+      const menu = $("panelMenu");
+      if (!menu) {
+        return;
+      }
+      menu.innerHTML = '';
+      const fragment = document.createDocumentFragment();
+      const heading = document.createElement('div');
+      heading.className = 'panel-menu-header';
+      heading.textContent = 'Sections';
+      fragment.appendChild(heading);
+      const list = document.createElement('ul');
+      list.className = 'panel-menu-list';
+      const panels = Array.from(document.querySelectorAll('.panel[data-panel-id]'));
+      panels.forEach(panel => {
+        const panelId = panel.dataset.panelId || '';
+        if (!panelId) {
+          return;
+        }
+        if (panelId === 'log') {
+          return;
+        }
+        const heading = panel.querySelector('h2');
+        const label = heading ? heading.textContent.trim() : panelId;
+        const item = document.createElement('li');
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'panel-menu-btn';
+        button.dataset.panelId = panelId;
+        button.setAttribute('aria-pressed', 'false');
+        button.title = label;
+        const span = document.createElement('span');
+        span.className = 'panel-menu-btn-label';
+        span.textContent = label;
+        button.appendChild(span);
+        const badge = document.createElement('span');
+        badge.className = 'panel-menu-badge';
+        badge.textContent = 'show';
+        button.appendChild(badge);
+        const shouldHide = hiddenPanelState.has(panelId);
+        applyPanelHiddenState(panel, shouldHide, { persist: false });
+        button.setAttribute('aria-pressed', shouldHide ? 'false' : 'true');
+        badge.textContent = shouldHide ? 'show' : 'hide';
+        button.addEventListener('click', () => {
+          const currentlyHidden = hiddenPanelState.has(panelId);
+          setPanelVisibility(panelId, currentlyHidden);
+        });
+        item.appendChild(button);
+        list.appendChild(item);
+      });
+      fragment.appendChild(list);
+      menu.appendChild(fragment);
+    }
+
+    function primeHiddenPanels() {
+      hiddenPanelState = loadHiddenPanelState();
+      if (hiddenPanelState.size === 0) {
+        document.querySelectorAll('.panel-grid .panel[data-panel-id]').forEach(panel => {
+          const panelId = panel.dataset.panelId || '';
+          if (panelId && panelId !== 'log') {
+            hiddenPanelState.add(panelId);
           }
-        }
+        });
+        persistHiddenPanelState();
       }
-      if (panelId) {
-        if (collapsed) {
-          collapsedPanelState.add(panelId);
-        } else {
-          collapsedPanelState.delete(panelId);
+      document.querySelectorAll('.panel[data-panel-id]').forEach(panel => {
+        const panelId = panel.dataset.panelId || '';
+        if (!panelId) {
+          return;
         }
-      }
+        const shouldHide = hiddenPanelState.has(panelId);
+        applyPanelHiddenState(panel, shouldHide, { persist: false });
+      });
     }
 
     function onPanelCollapseToggle(event) {
@@ -15337,24 +17709,23 @@ def dashboard():
       if (!panel) {
         return;
       }
-      const shouldCollapse = !panel.classList.contains('collapsed');
-      applyPanelCollapseState(panel, shouldCollapse);
-      persistCollapsedPanelState();
+      const panelId = panel.dataset.panelId || '';
+      if (!panelId || panelId === 'log') {
+        return;
+      }
+      setPanelVisibility(panelId, false);
     }
 
     function initPanelCollapse() {
-      collapsedPanelState = loadCollapsedPanelState();
       document.querySelectorAll('.panel[data-collapsible="true"]').forEach(panel => {
         const button = panel.querySelector('.panel-collapse');
         if (!button) {
           return;
         }
+        button.setAttribute('aria-label', 'Hide panel');
+        button.title = 'Hide panel';
         button.addEventListener('click', onPanelCollapseToggle);
-        const panelId = panel.dataset.panelId || '';
-        const collapsed = panelId ? collapsedPanelState.has(panelId) : false;
-        applyPanelCollapseState(panel, collapsed);
       });
-      persistCollapsedPanelState();
     }
 
     function panelAfterCursor(zone, y) {
@@ -15448,17 +17819,18 @@ def dashboard():
     }
 
     function initPanelDrag() {
-      document.querySelectorAll('.panel[data-panel-id]').forEach(panel => {
-        panel.setAttribute('draggable', 'true');
+      document.querySelectorAll('.panel-grid .panel[data-panel-id]').forEach(panel => {
+        const isHidden = panel.classList.contains('is-hidden');
+        panel.setAttribute('draggable', isHidden ? 'false' : 'true');
         panel.addEventListener('dragstart', onPanelDragStart);
         panel.addEventListener('dragend', onPanelDragEnd);
       });
-      document.querySelectorAll('[data-panel-zone]').forEach(zone => {
+      document.querySelectorAll('.panel-grid[data-panel-zone]').forEach(zone => {
         zone.addEventListener('dragover', onZoneDragOver);
         zone.addEventListener('drop', onZoneDrop);
         zone.addEventListener('dragleave', onZoneDragLeave);
       });
-      document.querySelectorAll('.panel[data-panel-id] .panel-header').forEach(header => {
+      document.querySelectorAll('.panel-grid .panel[data-panel-id] .panel-header').forEach(header => {
         header.classList.add('panel-drag-handle');
       });
       applySavedPanelLayout();
@@ -17003,29 +19375,28 @@ def dashboard():
       }
       updateConnectionBanner(metrics.connection_status);
 
-      const uptimeBadge = $("uptimeTicker");
-      if (uptimeBadge) {
-        const parts = [];
-        if (metrics.uptime_human) {
-          parts.push(metrics.uptime_human);
-        }
-        if (typeof metrics.restart_count === 'number') {
-          parts.push(`restarts ${formatNumber(metrics.restart_count)}`);
-        }
+      const queueBadge = $("queueMeta");
+      if (queueBadge) {
         const queueValue = metrics.queue && typeof metrics.queue.value === 'number'
           ? metrics.queue.value
           : (typeof metrics.queue_size === 'number' ? metrics.queue_size : null);
         if (queueValue !== null) {
-          let queueText = `queue ${formatNumber(queueValue)}`;
+          let queueText = `Queue ${formatNumber(queueValue)}`;
           const delta = metrics.queue && typeof metrics.queue.delta === 'number' ? metrics.queue.delta : 0;
           if (delta > 0) {
             queueText += ' ▲';
+            queueBadge.dataset.tone = 'rise';
           } else if (delta < 0) {
             queueText += ' ▼';
+            queueBadge.dataset.tone = 'fall';
+          } else {
+            queueBadge.dataset.tone = 'steady';
           }
-          parts.push(queueText);
+          queueBadge.textContent = queueText;
+        } else {
+          queueBadge.textContent = 'Queue —';
+          delete queueBadge.dataset.tone;
         }
-        uptimeBadge.textContent = parts.length ? parts.join(' · ') : '—';
       }
 
       const messageActivity = metrics.message_activity || {};
@@ -17039,6 +19410,22 @@ def dashboard():
       setValueWithDelta('stat-active-users', metrics.active_users || { value: 0, delta: 0 });
       setValueWithDelta('stat-new-onboards', metrics.new_onboards || { value: 0, delta: 0 });
       setValueWithDelta('stat-games', metrics.games || { value: 0, delta: 0 });
+      // Offline wiki daily stats
+      if (metrics.wiki) {
+        setValueWithDelta('stat-wiki-saved', metrics.wiki.saved || { value: 0, delta: 0 });
+        setValueWithDelta('stat-wiki-deleted', metrics.wiki.deleted || { value: 0, delta: 0 });
+        setValueWithDelta('stat-wiki-served', metrics.wiki.served || { value: 0, delta: 0 });
+        const ageEl = $("stat-wiki-age");
+        if (ageEl) {
+          const v = metrics.wiki.avg_age_days;
+          ageEl.textContent = (v === null || v === undefined) ? '—' : `${v} d`;
+        }
+      } else {
+        setValueWithDelta('stat-wiki-saved', { value: 0, delta: 0 });
+        setValueWithDelta('stat-wiki-deleted', { value: 0, delta: 0 });
+        setValueWithDelta('stat-wiki-served', { value: 0, delta: 0 });
+        const ageEl = $("stat-wiki-age"); if (ageEl) ageEl.textContent = '—';
+      }
 
       if (metrics.games && metrics.games.breakdown) {
         renderGamesBreakdown(metrics.games.breakdown);
@@ -17083,8 +19470,10 @@ def dashboard():
       decorateExistingLogLines();
       bindLogScroll();
       initLogStream();
+      primeHiddenPanels();
       initPanelDrag();
       initPanelCollapse();
+      buildPanelMenu();
       if (initialMetrics && Object.keys(initialMetrics).length) {
         updateMetrics(initialMetrics);
         const statusEl = $("metricsStatus");
@@ -17137,6 +19526,9 @@ def dashboard():
       loadRadioState();
       setInterval(loadRadioState, RADIO_STATE_POLL_MS);
       monitorLogStream();
+      bindOfflineModal();
+      setupOfflineControls();
+      loadOfflineList();
     });
   </script>
 </body>
@@ -17255,6 +19647,62 @@ def update_dashboard_config():
     if key == 'cooldown_enabled':
         try:
             globals()['COOLDOWN_ENABLED'] = bool(new_value)
+        except Exception:
+            pass
+    # Apply select offline wiki settings at runtime
+    if key == 'offline_wiki_feed_enabled':
+        try:
+            globals()['OFFLINE_WIKI_FEED_ENABLED'] = bool(new_value)
+        except Exception:
+            pass
+    if key == 'offline_wiki_feed_char_limit':
+        try:
+            globals()['OFFLINE_WIKI_FEED_CHAR_LIMIT'] = max(400, int(new_value))
+        except Exception:
+            pass
+    if key == 'offline_wiki_max_articles':
+        try:
+            globals()['OFFLINE_WIKI_MAX_ARTICLES'] = int(new_value)
+        except Exception:
+            pass
+    if key == 'offline_wiki_autosave_from_wiki':
+        try:
+            globals()['OFFLINE_WIKI_AUTOSAVE_FROM_WIKI'] = bool(new_value)
+        except Exception:
+            pass
+    if key == 'web_ephemeral_feed_enabled':
+        try:
+            globals()['WEB_EPHEMERAL_FEED_ENABLED'] = bool(new_value)
+        except Exception:
+            pass
+    if key == 'web_ephemeral_feed_max_results':
+        try:
+            globals()['WEB_EPHEMERAL_FEED_MAX_RESULTS'] = max(1, int(new_value))
+        except Exception:
+            pass
+    if key == 'web_fact_scrape_enabled':
+        try:
+            globals()['WEB_FACT_SCRAPE_ENABLED'] = bool(new_value)
+        except Exception:
+            pass
+    if key == 'web_fact_scrape_timeout':
+        try:
+            globals()['WEB_FACT_SCRAPE_TIMEOUT'] = max(3, int(new_value))
+        except Exception:
+            pass
+    if key == 'feed_auto_tune_enabled':
+        try:
+            globals()['FEED_AUTO_TUNE_ENABLED'] = bool(new_value)
+        except Exception:
+            pass
+    if key == 'feed_queue_high':
+        try:
+            globals()['FEED_QUEUE_HIGH'] = max(2, int(new_value))
+        except Exception:
+            pass
+    if key == 'feed_min_budget':
+        try:
+            globals()['FEED_MIN_BUDGET'] = max(100, int(new_value))
         except Exception:
             pass
     clean_log(f"Config '{key}' updated via dashboard", "🛠️", show_always=True, rate_limit=False)
@@ -17698,8 +20146,33 @@ def connect_interface():
         # 2️⃣  Local mesh interface ---------------------------------------
         if USE_MESH_INTERFACE and MESH_INTERFACE_AVAILABLE:
             print("MeshInterface() for direct‑radio mode")
-            connection_status, last_error_message = "Connected", ""
-            return MeshInterface()
+            mesh_candidate = None
+            try:
+                mesh_candidate = MeshInterface()
+                if mesh_candidate.isConnected.wait(timeout=5):
+                    connection_status, last_error_message = "Connected", ""
+                    return mesh_candidate
+                connection_status, last_error_message = (
+                    "Disconnected",
+                    "MeshInterface did not report ready; falling back to SerialInterface",
+                )
+                clean_log(
+                    last_error_message,
+                    "⚠️",
+                    show_always=True,
+                )
+            except Exception as exc:
+                connection_status = "Disconnected"
+                last_error_message = f"MeshInterface connect failed: {exc}"
+                clean_log(
+                    f"{last_error_message}; falling back to SerialInterface",
+                    "⚠️",
+                    show_always=True,
+                )
+            finally:
+                if mesh_candidate and not mesh_candidate.isConnected.is_set():
+                    with suppress(Exception):
+                        mesh_candidate.close()
 
         # 3️⃣  USB serial --------------------------------------------------
         # If a serial path is provided, retry opening it with backoff
@@ -17867,6 +20340,13 @@ def main():
     # Heartbeat thread for visibility
     threading.Thread(target=heartbeat_worker, args=(30,), daemon=True).start()
     threading.Thread(target=location_cleanup_worker, daemon=True).start()
+    # Offline wiki background fetcher
+    if OFFLINE_WIKI_ENABLED and OFFLINE_WIKI_STORE is not None and OFFLINE_WIKI_AUTOSAVE_FROM_WIKI:
+        try:
+            threading.Thread(target=_offline_wiki_download_worker, daemon=True).start()
+            clean_log("Offline wiki background worker ready", "📚")
+        except Exception:
+            pass
 
     while True:
         try:
